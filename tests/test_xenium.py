@@ -404,6 +404,52 @@ def test_xenium_other_feature_types(dataset: str, gex_only: bool) -> None:
 # ── CLI JSON kwargs tests (no real data needed) ───────────────────────────────
 
 
+def _spatialdata_supports_mudata() -> bool:
+    try:
+        import anndata as ad
+        from mudata import MuData
+        from spatialdata.models import TableModel
+
+        TableModel.validate(MuData({"rna": ad.AnnData(np.ones((1, 1)))}))
+    except (ImportError, TypeError):
+        return False
+    return True
+
+
+@skip_if_below_python_version()
+@pytest.mark.skipif(not _spatialdata_supports_mudata(), reason="SpatialData does not support MuData tables")
+@pytest.mark.parametrize("gex_only", [True, False])
+def test_xenium_multimodal(gex_only: bool, tmp_path: Path) -> None:
+    from mudata import MuData
+
+    f = Path("./data") / "Xenium_V1_Protein_Human_Kidney_tiny_outs"
+    assert f.is_dir()
+    reference = xenium(f, cells_as_circles=False, gex_only=False, transcripts=False)["table"]
+    sdata = xenium(f, cells_as_circles=False, gex_only=gex_only, multimodal=True, transcripts=False)
+    table = sdata["table"]
+    assert isinstance(table, MuData)
+    assert list(table.mod) == ["rna", "prot"]
+    assert set(table.mod["prot"].var["feature_types"]) == {"Protein Expression"}
+    rna_feature_types = set(table.mod["rna"].var["feature_types"])
+    if gex_only:
+        assert rna_feature_types == {"Gene Expression"}
+    else:
+        assert rna_feature_types == set(reference.var["feature_types"]) - {"Protein Expression"}
+    # same values as in the AnnData table, and the cell annotations and coordinates are global
+    for modality in table.mod.values():
+        np.testing.assert_allclose(modality.X.toarray(), reference[:, modality.var_names].X.toarray())
+    pd.testing.assert_frame_equal(table.obs, reference.obs)
+    np.testing.assert_array_equal(table.obsm["spatial"], reference.obsm["spatial"])
+    assert get_table_keys(table) == get_table_keys(reference)
+    # the protein feature tested above for the AnnData table
+    np.testing.assert_allclose(table.mod["prot"][0:3, "VISTA"].X.toarray().squeeze(), [0.7, 1.2, 0.0])
+
+    sdata.write(tmp_path / "data.zarr")
+    table_read = read_zarr(tmp_path / "data.zarr")["table"]
+    assert isinstance(table_read, MuData)
+    assert table_read.mod["prot"].shape == table.mod["prot"].shape
+
+
 @pytest.mark.parametrize(
     "kwarg_name",
     ["--imread-kwargs", "--image-models-kwargs", "--labels-models-kwargs"],

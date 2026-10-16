@@ -24,6 +24,7 @@ import pyarrow.parquet as pq
 import scanpy as sc
 import tifffile
 import zarr
+from anndata import AnnData
 from dask.dataframe import read_csv as dask_read_csv
 from dask.dataframe import read_parquet
 from dask_image.imread import imread
@@ -49,7 +50,7 @@ from spatialdata_io.readers._utils._utils import _initialize_raster_models_kwarg
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
-    from anndata import AnnData
+    from mudata import MuData
     from spatialdata._types import ArrayLike
 
 __all__ = ["xenium", "xenium_aligned_image", "xenium_explorer_selection"]
@@ -287,6 +288,7 @@ def xenium(
     cells_table: bool = True,
     n_jobs: int | None = None,
     gex_only: bool = True,
+    multimodal: bool = False,
     imread_kwargs: Mapping[str, Any] = MappingProxyType({}),
     image_models_kwargs: Mapping[str, Any] = MappingProxyType({}),
     labels_models_kwargs: Mapping[str, Any] = MappingProxyType({}),
@@ -343,7 +345,15 @@ def xenium(
             ``n_jobs`` is not used anymore and will be removed in a future release. The reading time of shapes is now
             greatly improved and does not require parallelization.
     gex_only
-        Whether to load only the "Gene Expression" feature type.
+        Whether to load only the "Gene Expression" feature type. With `multimodal=True`, whether the `"rna"`
+        modality holds only the "Gene Expression" features or also the control features (negative control probes and
+        codewords, genomic controls, unassigned codewords); the protein features are always read.
+    multimodal
+        Whether to read the table as a :class:`mudata.MuData` object with one modality per assay: `"rna"` for the
+        gene expression and `"prot"` for the protein expression (Xenium In Situ Gene and Protein Expression), named as
+        in :func:`muon.read_10x_h5`. The cell annotations, the cell centroids (`obsm["spatial"]`) and the annotation of
+        the spatial elements are stored in the global `obs`/`obsm`. Requires the `mudata` package and a version of
+        SpatialData supporting MuData tables.
     imread_kwargs
         Keyword arguments to pass to the image reader.
     image_models_kwargs
@@ -438,7 +448,7 @@ def xenium(
     table = None
     circles = None
     if cells_table:
-        table, circles = _get_tables_and_circles(path, specs, gex_only, cells_zarr_ctx)
+        table, circles = _get_tables_and_circles(path, specs, gex_only, cells_zarr_ctx, multimodal=multimodal)
         # Map the table to the cell_labels element when a label_index mapping exists, so the instance
         # key resolves against the raster labels instead of the circles. If any table cell lacks a
         # boundary (so has no label), warn and leave the table on circles rather than crash.
@@ -892,13 +902,50 @@ def _read_cell_feature_matrix(path: Path, gex_only: bool) -> AnnData:
     )
 
 
+def _split_modalities(adata: AnnData, gex_only: bool) -> MuData:
+    """
+    Split the cell feature matrix of a Xenium Gene and Protein Expression run into a MuData table.
+
+    The protein features go to the `"prot"` modality, the gene expression features (and the control features, unless
+    `gex_only`) to the `"rna"` modality; the cell annotations and coordinates are global.
+    """
+    try:
+        from mudata import MuData
+    except ImportError as e:
+        raise ImportError("Reading the table as a MuData object (`multimodal=True`) requires `mudata`.") from e
+
+    feature_types = adata.var["feature_types"].to_numpy()
+    is_protein = feature_types == "Protein Expression"
+    is_rna = feature_types == "Gene Expression" if gex_only else ~is_protein
+    if not is_protein.any():
+        warnings.warn(
+            "`multimodal=True` but the cell feature matrix has no protein features: the table only has an 'rna' "
+            "modality.",
+            UserWarning,
+            stacklevel=3,
+        )
+    x = adata.X
+    if x is None:
+        raise ValueError("The cell feature matrix holds no values.")
+    modalities = {
+        name: AnnData(X=x[:, mask], obs=pd.DataFrame(index=adata.obs_names), var=adata.var[mask].copy())
+        for name, mask in (("rna", is_rna), ("prot", is_protein))
+        if mask.any()
+    }
+    mdata = MuData(modalities, obs=adata.obs.copy(), obsm={"spatial": adata.obsm["spatial"]})
+    # MuData converts the dtypes of the global obs when it is constructed
+    mdata.obs = adata.obs.copy()
+    return mdata
+
+
 def _get_tables_and_circles(
     path: Path,
     specs: dict[str, Any],
     gex_only: bool,
     cells_zarr_ctx: _XeniumCells | None,
-) -> tuple[AnnData, GeoDataFrame]:
-    adata = _read_cell_feature_matrix(path, gex_only)
+    multimodal: bool = False,
+) -> tuple[AnnData | MuData, GeoDataFrame]:
+    adata = _read_cell_feature_matrix(path, gex_only=gex_only and not multimodal)
     # get_cell_metadata decodes cell_id and cross-checks it against cells.zarr.zip; without the
     # zarr (pre-1.3.0 / CSV-only bundles) read the metadata directly from parquet or CSV.
     if cells_zarr_ctx is not None:
@@ -914,7 +961,7 @@ def _get_tables_and_circles(
     adata.obs = metadata
     adata.obs["region"] = pd.Series(specs["region"], index=adata.obs_names, dtype="category")
     table = TableModel.parse(
-        adata,
+        _split_modalities(adata, gex_only) if multimodal else adata,
         region=specs["region"],
         region_key="region",
         instance_key=str(XeniumKeys.CELL_ID),
@@ -932,7 +979,9 @@ def _get_tables_and_circles(
     cell_summary = cells_zarr_ctx.get_cell_summary() if cells_zarr_ctx is not None else None
     if cell_summary is not None:
         try:
-            _assert_arrays_equal_sampled(cell_summary[XeniumKeys.CELL_ID].values, table.obs[XeniumKeys.CELL_ID].values)
+            _assert_arrays_equal_sampled(
+                cell_summary[XeniumKeys.CELL_ID].values, np.asarray(table.obs[XeniumKeys.CELL_ID])
+            )
         except AssertionError:
             warnings.warn(
                 'The "cell_id" column in the cells metadata table does not match the "cell_id" column in the annotation'

@@ -731,6 +731,12 @@ def visium_hd_wrapper(
     help="If `True`, only load gene expression features. [default: True]",
 )
 @click.option(
+    "--multimodal",
+    type=bool,
+    default=False,
+    help="If `True`, read the table as a MuData object with 'rna' and 'prot' modalities. [default: False]",
+)
+@click.option(
     "--imread-kwargs",
     type=str,
     default="{}",
@@ -763,6 +769,7 @@ def xenium_wrapper(
     aligned_images: bool = True,
     cells_table: bool = True,
     gex_only: bool = True,
+    multimodal: bool = False,
     imread_kwargs: str = "{}",
     image_models_kwargs: str = "{}",
     labels_models_kwargs: str = "{}",
@@ -783,6 +790,7 @@ def xenium_wrapper(
         aligned_images=aligned_images,
         cells_table=cells_table,
         gex_only=gex_only,
+        multimodal=multimodal,
         imread_kwargs=_parse_json_param(imread_kwargs, "imread_kwargs"),
         image_models_kwargs=_parse_json_param(image_models_kwargs, "image_models_kwargs"),
         labels_models_kwargs=_parse_json_param(labels_models_kwargs, "labels_models_kwargs"),

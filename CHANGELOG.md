@@ -15,6 +15,10 @@ Release notes for `v0.7.1` and earlier are available on the [Releases][] page.
 
 ### Added
 
+- `xenium(..., multimodal=True)` reads the table of a Xenium In Situ Gene and Protein Expression run as a
+  `mudata.MuData` object with an `"rna"` and a `"prot"` modality (with `gex_only=False`, the control features stay in
+  `"rna"`); the cell annotations, the centroids and the annotation of the spatial elements are global. Also available as
+  `--multimodal` in the CLI. Requires `mudata` and a SpatialData version supporting MuData tables.
 - `spatialdata_io` ships a `py.typed` marker, so downstream type checkers use its annotations.
 - `xenium` reads pre-1.3.0 (XOA < 1.3.0) and CSV-only bundles: when the parquet files and
   `cells.zarr.zip` are absent, the table, boundaries, and transcripts are read from the `cells.csv`,
