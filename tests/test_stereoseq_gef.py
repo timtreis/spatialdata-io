@@ -171,7 +171,8 @@ def test_resolution_default(tmp_path: Path) -> None:
 
 def test_resolution_scalar_and_other_value(tmp_path: Path) -> None:
     path = _three_cells(tmp_path, attrs={"resolution": 715})
-    assert _resolution_nm(h5py.File(path, "r")) == (715, "header")
+    with h5py.File(path, "r") as f:
+        assert _resolution_nm(f) == (715, "header")
 
 
 def test_resolution_conflict_across_files(tmp_path: Path) -> None:
@@ -216,7 +217,7 @@ def test_rejections(tmp_path: Path) -> None:
         stereoseq_gef(cellbin_gef=nocell)
 
 
-def test_gene_s32_and_u4_coordinates(tmp_path: Path) -> None:
+def test_gene_s32_names(tmp_path: Path) -> None:
     path = write_cellbin(
         tmp_path / "x.cellbin.gef",
         cells=[{"x": 1, "y": 2}],
@@ -582,3 +583,152 @@ def test_dataset_id_mismatch_ok(tmp_path: Path) -> None:
     assert set(sdata.shapes) == {"TISSCHIP_cell_boundaries", "TISSCHIP_square_025um"}
     sdata = stereoseq_gef(gef=tissue, cellbin_gef=cellbin, dataset_id="X")
     assert set(sdata.shapes) == {"X_cell_boundaries", "X_square_025um"}
+
+
+def _centres(shapes: Any) -> np.ndarray:
+    return np.stack([shapes.geometry.centroid.x, shapes.geometry.centroid.y], axis=1)
+
+
+def test_obsm_spatial_cells(tmp_path: Path) -> None:
+    sdata = stereoseq_gef(cellbin_gef=_three_cells(tmp_path))
+    table = sdata.tables["table"]
+    np.testing.assert_allclose(table.obsm["spatial"], [[100, 200], [300, 400], [500, 600]])
+    np.testing.assert_allclose(table.obsm["spatial"], _centres(sdata.shapes["CHIP_cell_boundaries"]))
+
+
+def test_obsm_spatial_and_array_index_bins(tmp_path: Path) -> None:
+    sdata = stereoseq_gef(gef=_tissue(tmp_path), bin_size=2)
+    table = sdata.tables["table"]
+    np.testing.assert_allclose(table.obsm["spatial"], _centres(sdata.shapes["CHIP_square_001um"]))
+    np.testing.assert_allclose(table.obsm["spatial"], [[1, 1], [3, 1], [3, 3], [5, 5]])
+    assert list(table.obs["array_row"]) == [0, 0, 1, 2]
+    assert list(table.obs["array_col"]) == [0, 1, 1, 2]
+
+
+def test_pair_obsm_and_shared_scale(tmp_path: Path) -> None:
+    tissue, cellbin = _pair(tmp_path)
+    sdata = stereoseq_gef(gef=tissue, cellbin_gef=cellbin)
+    np.testing.assert_allclose(
+        sdata.tables["table"].obsm["spatial"], _centres(sdata.shapes["TISSCHIP_cell_boundaries"])
+    )
+    np.testing.assert_allclose(
+        sdata.tables["square_025um"].obsm["spatial"], _centres(sdata.shapes["TISSCHIP_square_025um"])
+    )
+    scales = [get_transformation(s, "global") for s in sdata.shapes.values()]
+    assert all(isinstance(s, Scale) for s in scales)
+    np.testing.assert_allclose(scales[0].scale, [0.5, 0.5])  # type: ignore[union-attr]
+    np.testing.assert_allclose(scales[0].scale, scales[1].scale)  # type: ignore[union-attr]
+
+
+def test_precomputed_misaligned_falls_back(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    import logging
+
+    from spatialdata._logging import logger
+
+    bad = [("G1", 1, 1, 99), ("G2", 3, 5, 2)]  # not multiples of 2
+    path = _tissue(tmp_path, precomputed={2: bad})
+    old = logger.propagate
+    logger.propagate = True
+    try:
+        with caplog.at_level(logging.WARNING):
+            table, squares, kind, source = _bins(path, 2)
+    finally:
+        logger.propagate = old
+    assert (kind, source) == ("full", "aggregated_from_bin1")
+    assert any("multiple" in r.message for r in caplog.records)
+    ref, ref_squares, _, _ = _bins(_tissue(tmp_path, "ref.tissue.gef"), 2)
+    np.testing.assert_array_equal(table.X.toarray(), ref.X.toarray())
+    assert [g.bounds for g in squares.geometry] == [g.bounds for g in ref_squares.geometry]
+
+
+def test_precomputed_gene_list_differs_from_bin1(tmp_path: Path) -> None:
+    genes2 = ["G2", "G1"]
+    exp, gene = _compound(BIN2_ROWS[:2] + [("G2", 4, 4, 2)], genes2, "<i4", "u1", "S64")
+    path = _tissue(tmp_path)
+    with h5py.File(path, "a") as f:
+        g = f.create_group("geneExp/bin2")
+        g.create_dataset("expression", data=exp)
+        g.create_dataset("gene", data=gene)
+    table, _, _, source = _bins(path, 2)
+    assert source == "precomputed"
+    assert list(table.var_names) == genes2
+    np.testing.assert_array_equal(table.X.toarray(), [[0, 99], [0, 1], [2, 0]])
+
+
+def test_dataset_id_validated_up_front(tmp_path: Path) -> None:
+    path = _three_cells(tmp_path, "a b (1).gef")
+    with pytest.raises(ValueError, match=r"dataset_id.*a b \(1\)|a b \(1\).*dataset_id"):
+        stereoseq_gef(cellbin_gef=path)
+    assert "table" in stereoseq_gef(cellbin_gef=path, dataset_id="ok").tables
+
+
+def test_gef_given_cellbin_file(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="cellbin_gef"):
+        stereoseq_gef(gef=_three_cells(tmp_path))
+
+
+def test_border_pad_mid_row_uses_leading_points(tmp_path: Path) -> None:
+    border = np.array([[-2, -2], [2, -2], [2, 2], [-2, 2], [PAD, PAD], [9, 9], [8, 8]])
+    path = write_cellbin(
+        tmp_path / "GSM1_CHIP.cellbin.gef",
+        cells=[{"x": 10, "y": 20, "area": 16}],
+        borders=[border],
+        cell_exp=[[(0, 1)]],
+        genes=["G1"],
+        attrs={"resolution": [500]},
+    )
+    geom = stereoseq_gef(cellbin_gef=path).shapes["CHIP_cell_boundaries"].geometry.iloc[0]
+    assert geom.area == pytest.approx(16)
+    assert geom.bounds == (8, 18, 12, 22)
+
+
+def test_border_all_valid_row(tmp_path: Path) -> None:
+    ang = np.linspace(0, 2 * np.pi, 32, endpoint=False)
+    border = np.round(np.stack([10 * np.cos(ang), 10 * np.sin(ang)], axis=1)).astype(int)
+    path = write_cellbin(
+        tmp_path / "GSM1_CHIP.cellbin.gef",
+        cells=[{"x": 10, "y": 20}],
+        borders=[border],
+        cell_exp=[[(0, 1)]],
+        genes=["G1"],
+        attrs={"resolution": [500]},
+    )
+    sdata = stereoseq_gef(cellbin_gef=path)
+    assert sdata.tables["table"].uns["spatialdata_io"]["n_cells_fallback_geometry"] == 0
+
+
+def test_resolution_invalid(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="resolution"):
+        stereoseq_gef(cellbin_gef=_three_cells(tmp_path, attrs={"resolution": 0}))
+    multi = _three_cells(tmp_path, "m.cellbin.gef", {"resolution": np.array([500, 500])})
+    with pytest.raises(ValueError, match="resolution"):
+        stereoseq_gef(cellbin_gef=multi)
+
+
+def test_zero_counts_eliminated(tmp_path: Path) -> None:
+    rows = [("G1", 0, 0, 1), ("G1", 4, 4, 0), ("G2", 4, 4, 0), ("G2", 2, 0, 3)]
+    path = write_tissue_gef(tmp_path / "z.tissue.gef", rows, ["G1", "G2"], {"resolution": [500]})
+    table, squares, _, _ = _bins(path, 2)
+    np.testing.assert_array_equal(table.X.toarray(), [[1, 0], [0, 3]])
+    assert table.X.nnz == 2
+    assert len(squares) == 2 and list(table.obs["bin_id"]) == [0, 1]
+    cells = write_cellbin(
+        tmp_path / "GSM1_CHIP.cellbin.gef",
+        cells=[{"x": 1, "y": 1}],
+        borders=[np.array([[0, 0], [2, 0], [2, 2]])],
+        cell_exp=[[(0, 0), (1, 4)]],
+        genes=["G1", "G2"],
+        attrs={"resolution": [500]},
+    )
+    assert stereoseq_gef(cellbin_gef=cells).tables["table"].X.nnz == 1
+
+
+def test_uns_roundtrip(tmp_path: Path) -> None:
+    sdata = stereoseq_gef(cellbin_gef=_three_cells(tmp_path))
+    before = dict(sdata.tables["table"].uns["spatialdata_io"])
+    sdata.write(tmp_path / "u.zarr")
+    after = read_zarr(tmp_path / "u.zarr").tables["table"].uns["spatialdata_io"]
+    assert after.keys() == before.keys()
+    for k, v in before.items():
+        if v is not None:  # None values may not survive zarr; documented by the key check above
+            assert after[k] == v
