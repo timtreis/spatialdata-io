@@ -589,12 +589,12 @@ def _chunk_pairs(
     y = chunk["y"].astype(np.int64)
     if x.min() < 0 or y.min() < 0:
         raise ValueError("Negative bin coordinates in the GEF expression table are not supported.")
-    if aligned and (np.any(x % bin_size) or np.any(y % bin_size)):
-        raise _MisalignedBinsError
     rows = np.arange(lo, hi, dtype=np.int64)
     slot = np.searchsorted(starts, rows, side="right") - 1
     # slot is -1 before the first gene; clip it for the lookup, `slot >= 0` excludes those rows
     covered = (slot >= 0) & (rows < ends[np.maximum(slot, 0)])
+    if aligned and (np.any(x[covered] % bin_size) or np.any(y[covered] % bin_size)):
+        raise _MisalignedBinsError
     key = ((y // bin_size) << 32) | (x // bin_size)
     uniq, inv = np.unique(key[covered], return_inverse=True)
     pair_id = inv.astype(np.int64) * n_genes + order[slot[covered]]
@@ -659,7 +659,9 @@ def _bin_chunks(
     x_mat.sort_indices()
     x_mat.eliminate_zeros()
     occupied = np.diff(x_mat.indptr) > 0
-    return keys[occupied], x_mat[occupied]
+    if not occupied.all():
+        keys, x_mat = keys[occupied], x_mat[occupied]
+    return keys, x_mat
 
 
 def _read_bins(
