@@ -265,7 +265,8 @@ def _read_wide(
 
 _FEATURE_NAMES = ("features", "genes", "feats")
 _BARCODE_NAMES = ("barcodes", "cells", "obs")
-_SIBLING_SUFFIXES = (".tsv", ".tsv.gz", ".txt", ".txt.gz", ".csv", ".csv.gz")
+_FEATURE_SUFFIXES = (".tsv", ".tsv.gz", ".txt", ".txt.gz", ".csv", ".csv.gz")
+_BARCODE_SUFFIXES = _FEATURE_SUFFIXES[:4]  # no .csv: a cells.csv next to the matrix is usually the coordinates
 
 
 def _mtx_stem(path: Path) -> str:
@@ -276,9 +277,13 @@ def _mtx_stem(path: Path) -> str:
     return path.stem
 
 
-def _find_sibling(path: Path, bases: tuple[str, ...], stem_suffix: str) -> Path | None:
-    candidates = [f"{base}{ext}" for base in bases for ext in _SIBLING_SUFFIXES]
-    candidates += [f"{_mtx_stem(path)}_{stem_suffix}{ext}" for ext in _SIBLING_SUFFIXES]
+def _find_sibling(path: Path, bases: tuple[str, ...], stem_suffix: str, suffixes: tuple[str, ...]) -> Path | None:
+    stem = _mtx_stem(path)
+    prefixes = [""]
+    if stem.lower().endswith("matrix") and (len(stem) == 6 or stem[-7] in "_."):
+        prefixes.append(stem[:-6])  # GEO: <prefix>matrix.mtx.gz next to <prefix>features.tsv.gz
+    candidates = [f"{prefix}{base}{ext}" for prefix in prefixes for base in bases for ext in suffixes]
+    candidates += [f"{stem}_{stem_suffix}{ext}" for ext in suffixes]
     for cand in candidates:
         if (path.parent / cand).is_file():
             return path.parent / cand
@@ -330,8 +335,8 @@ def _read_counts(
     The cells x genes counts (dense frame or sparse matrix), the gene names and the string cell ids.
     """
     if path.name.lower().endswith((".mtx", ".mtx.gz")):
-        feats_path = _find_sibling(path, _FEATURE_NAMES, "feats")
-        obs_path = _find_sibling(path, _BARCODE_NAMES, "obs")
+        feats_path = _find_sibling(path, _FEATURE_NAMES, "feats", _FEATURE_SUFFIXES)
+        obs_path = _find_sibling(path, _BARCODE_NAMES, "obs", _BARCODE_SUFFIXES)
         if feats_path is None or obs_path is None:
             raise ValueError(
                 f"Could not find the label files next to {path.name}: expected features.tsv(.gz) or genes.tsv(.gz) "

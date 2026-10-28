@@ -756,3 +756,29 @@ def test_h5ad_keeps_var_columns(tmp_path: Path) -> None:
 def test_split_sanitized_prefix(tmp_path: Path) -> None:
     sdata = cell_table(_split_csv(tmp_path, ["s 1", "s2"], ids=["c1", "c1"]), unit="um", split_by="sample")
     assert set(sdata["table"].obs.index) == {"s_1_c1", "s2_c1"}
+
+
+def test_mtx_geo_prefixed_names(tmp_path: Path) -> None:
+    _, coords, mat = _split_files(tmp_path)
+    mtx = tmp_path / "GSM123_sample_matrix.mtx.gz"
+    with gzip.open(mtx, "wb") as f:
+        scipy.io.mmwrite(f, sp.coo_matrix(mat.T))  # type: ignore[arg-type]  # genes x cells
+    for name, labels in (
+        ("GSM123_sample_features.tsv.gz", GENES),
+        ("GSM123_sample_barcodes.tsv.gz", [f"c{i}" for i in range(20)]),
+    ):
+        with gzip.open(tmp_path / name, "wt") as f:
+            f.write("\n".join(labels) + "\n")
+    table = cell_table(mtx, coords, unit="um", x="X", y="Y", cell_id="cells")["table"]
+    np.testing.assert_array_equal(_dense(table.X), mat[:, :2])
+
+
+def test_mtx_does_not_take_coordinates_as_barcodes(tmp_path: Path) -> None:
+    _, _, mat = _split_files(tmp_path)
+    mtx = tmp_path / "matrix.mtx"
+    scipy.io.mmwrite(str(mtx), sp.coo_matrix(mat.T))
+    (tmp_path / "features.tsv").write_text("\n".join(GENES) + "\n")
+    cells = tmp_path / "cells.csv"
+    cells.write_text("cell,x,y\n" + "\n".join(f"c{i},{i},1" for i in range(20)) + "\n")
+    with pytest.raises(ValueError, match="barcodes"):
+        cell_table(mtx, cells, unit="um", x="x", y="y", cell_id="cell")
