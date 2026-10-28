@@ -506,3 +506,79 @@ def test_negative_coordinates_raise(tmp_path: Path) -> None:
     path = write_tissue_gef(tmp_path / "n.tissue.gef", [("G1", -1, 0, 1)], ["G1"], {"resolution": [500]})
     with pytest.raises(ValueError, match="Negative"):
         _bins(path, 2)
+
+
+def _pair(tmp_path: Path, cell_attrs: Any = "default", tissue_attrs: Any = None) -> tuple[Path, Path]:
+    cellbin = _three_cells(tmp_path, "GSM1_CELLCHIP.cellbin.gef", cell_attrs)
+    tissue = _tissue(tmp_path, "GSM2_TISSCHIP.tissue.gef", **({} if tissue_attrs is None else {"attrs": tissue_attrs}))
+    return tissue, cellbin
+
+
+def test_pair_names_and_tables(tmp_path: Path) -> None:
+    tissue, cellbin = _pair(tmp_path)
+    sdata = stereoseq_gef(gef=tissue, cellbin_gef=cellbin, dataset_id="CHIP")
+    assert set(sdata.tables) == {"table", "square_025um"}
+    assert set(sdata.shapes) == {"CHIP_cell_boundaries", "CHIP_square_025um"}
+    for table_name, region, key in [
+        ("table", "CHIP_cell_boundaries", "cell_id"),
+        ("square_025um", "CHIP_square_025um", "bin_id"),
+    ]:
+        table = sdata.tables[table_name]
+        attrs = table.uns["spatialdata_attrs"]
+        assert attrs["region"] == region
+        assert attrs["instance_key"] == key
+        assert list(table.obs["region"].unique()) == [region]
+        assert list(table.obs[key]) == list(sdata.shapes[region].index)
+    cells_meta = sdata.tables["table"].uns["spatialdata_io"]
+    bins_meta = sdata.tables["square_025um"].uns["spatialdata_io"]
+    assert (cells_meta["gef_kind"], cells_meta["source_bins"]) == (None, None)
+    assert cells_meta["n_cells_fallback_geometry"] == 0
+    assert bins_meta["n_cells_fallback_geometry"] is None
+    assert (bins_meta["gef_kind"], bins_meta["source_bins"]) == ("bin1_only", "aggregated_from_bin1")
+    for meta in (cells_meta, bins_meta):
+        assert (meta["resolution_nm"], meta["resolution_source"], meta["bin_size_dnb"]) == (500, "header", 50)
+        assert meta["bin_size_um"] == 25.0
+
+
+def test_pair_gene_lists_independent(tmp_path: Path) -> None:
+    tissue, cellbin = _pair(tmp_path)
+    sdata = stereoseq_gef(gef=tissue, cellbin_gef=cellbin)
+    assert list(sdata.tables["table"].var_names) == ["G1", "G2"]
+    assert list(sdata.tables["square_025um"].var_names) == GENES
+    assert list(sdata.tables["table"].var_names) != list(sdata.tables["square_025um"].var_names)
+
+
+def test_pair_resolution_conflict(tmp_path: Path) -> None:
+    tissue, cellbin = _pair(tmp_path, cell_attrs={"resolution": [715]}, tissue_attrs={"resolution": [500]})
+    with pytest.raises(ValueError, match="resolution"):
+        stereoseq_gef(gef=tissue, cellbin_gef=cellbin)
+
+
+def test_pair_resolution_shared_when_one_states_it(tmp_path: Path) -> None:
+    tissue, cellbin = _pair(tmp_path, cell_attrs={}, tissue_attrs={"resolution": [715]})
+    sdata = stereoseq_gef(gef=tissue, cellbin_gef=cellbin, bin_size=20)
+    assert set(sdata.tables) == {"table", "square_014p3um"}
+    for t in sdata.tables.values():
+        assert t.uns["spatialdata_io"]["resolution_nm"] == 715
+        assert t.uns["spatialdata_io"]["resolution_source"] == "header"
+
+
+def test_pair_roundtrip(tmp_path: Path) -> None:
+    tissue, cellbin = _pair(tmp_path)
+    sdata = stereoseq_gef(gef=tissue, cellbin_gef=cellbin)
+    sdata.write(tmp_path / "pair.zarr")
+    back = read_zarr(tmp_path / "pair.zarr")
+    assert back.tables["table"].shape == (3, 2)
+    assert back.tables["square_025um"].n_obs == sdata.tables["square_025um"].n_obs
+    assert set(back.shapes) == {"TISSCHIP_cell_boundaries", "TISSCHIP_square_025um"}
+    for name, key in [("table", "cell_id"), ("square_025um", "bin_id")]:
+        region = back.tables[name].uns["spatialdata_attrs"]["region"]
+        assert list(back.tables[name].obs[key]) == list(back.shapes[region].index)
+
+
+def test_dataset_id_mismatch_ok(tmp_path: Path) -> None:
+    tissue, cellbin = _pair(tmp_path)
+    sdata = stereoseq_gef(gef=tissue, cellbin_gef=cellbin)
+    assert set(sdata.shapes) == {"TISSCHIP_cell_boundaries", "TISSCHIP_square_025um"}
+    sdata = stereoseq_gef(gef=tissue, cellbin_gef=cellbin, dataset_id="X")
+    assert set(sdata.shapes) == {"X_cell_boundaries", "X_square_025um"}

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+from contextlib import ExitStack
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
@@ -719,11 +720,12 @@ def stereoseq_gef(
     gef
         Path to a ``tissue.gef`` or full ``.gef`` file (square bins).
     cellbin_gef
-        Path to a ``cellbin.gef`` file (segmented cells).
+        Path to a ``cellbin.gef`` file (segmented cells). At least one of ``gef`` and ``cellbin_gef`` is required.
     bin_size
         Bin size in DNB (positive integer) for the square-bin table.
     dataset_id
-        Dataset identifier. Defaults to the chip id parsed from the file name.
+        Dataset identifier. Defaults to the chip id parsed from the name of ``gef`` (or of ``cellbin_gef`` if
+        ``gef`` is not given).
 
     Returns
     -------
@@ -731,6 +733,16 @@ def stereoseq_gef(
 
     Notes
     -----
+    The elements depend on the inputs (``bin_name`` is e.g. ``square_025um``):
+
+    - ``cellbin_gef`` only: table ``"table"`` (cells x genes) annotating the shapes
+      ``"{dataset_id}_cell_boundaries"`` (cell polygons).
+    - ``gef`` only: table ``"table"`` (bins x genes) annotating the shapes ``"{dataset_id}_{bin_name}"``
+      (square bins of ``bin_size`` DNB, non-empty bins only).
+    - both: the cells table ``"table"`` with ``"{dataset_id}_cell_boundaries"``, and the bins table ``bin_name``
+      with ``"{dataset_id}_{bin_name}"``. Each table annotates its own shapes and has its own gene list. The
+      resolution is resolved once across both files and a conflict raises a ``ValueError``.
+
     Geometries keep the raw DNB coordinates; the ``global`` coordinate system is in micrometres through a scale of
     ``resolution_nm / 1000``. The resolution comes from the GEF header and defaults to 500 nm (recorded as
     ``resolution_source="platform_default"`` in ``table.uns["spatialdata_io"]``) if no header states it.
@@ -739,20 +751,19 @@ def stereoseq_gef(
         raise ValueError("Provide at least one of `gef` or `cellbin_gef`.")
     if isinstance(bin_size, bool) or not isinstance(bin_size, int | np.integer) or bin_size <= 0:
         raise ValueError(f"`bin_size` must be a positive integer, got {bin_size!r}.")
-    if gef is not None and cellbin_gef is not None:
-        raise NotImplementedError("Reading `gef` and `cellbin_gef` together is not implemented yet.")
-    source_file = gef if gef is not None else cellbin_gef
-    assert source_file is not None
-    path = Path(source_file)
+    primary = Path(gef if gef is not None else cellbin_gef)  # type: ignore[arg-type]
     if dataset_id is None:
-        dataset_id = _default_dataset_id(path)
+        dataset_id = _default_dataset_id(primary)
 
-    with h5py.File(path, "r") as f:
-        if "geneExp" not in f and "cellBin" not in f:
-            raise ValueError(f"{path} is not a GEF file: it has neither `geneExp` nor `cellBin`.")
-        if gef is None and "cellBin" not in f:
-            raise ValueError(f"`cellbin_gef` {path} has no `cellBin` group.")
-        resolution_nm, source = _resolution_nm(f)
+    with ExitStack() as stack:
+        gef_f = stack.enter_context(h5py.File(gef, "r")) if gef is not None else None
+        cell_f = stack.enter_context(h5py.File(cellbin_gef, "r")) if cellbin_gef is not None else None
+        for path, f in ((gef, gef_f), (cellbin_gef, cell_f)):
+            if f is not None and "geneExp" not in f and "cellBin" not in f:
+                raise ValueError(f"{path} is not a GEF file: it has neither `geneExp` nor `cellBin`.")
+        if cell_f is not None and "cellBin" not in cell_f:
+            raise ValueError(f"`cellbin_gef` {cellbin_gef} has no `cellBin` group.")
+        resolution_nm, source = _resolution_nm(*(f for f in (gef_f, cell_f) if f is not None))
         r = resolution_nm / 1000
         transform = {"global": Scale([r, r], axes=("x", "y"))}
         meta = {
@@ -765,18 +776,21 @@ def stereoseq_gef(
             "source_bins": None,
             "n_cells_fallback_geometry": None,
         }
-        if gef is None:
-            adata, cell_shapes, n_fallback = _read_cells(f, dataset_id=dataset_id, transform=transform)
+        tables: dict[str, ad.AnnData] = {}
+        shapes: dict[str, GeoDataFrame] = {}
+        if cell_f is not None:
+            adata, cell_shapes, n_fallback = _read_cells(cell_f, dataset_id=dataset_id, transform=transform)
             adata.uns["spatialdata_io"] = meta | {"n_cells_fallback_geometry": n_fallback}
             region = f"{dataset_id}_cell_boundaries"
-            table = TableModel.parse(adata, region=region, region_key="region", instance_key="cell_id")
-            return _set_reader_metadata(
-                SpatialData(tables={"table": table}, shapes={region: cell_shapes}), "stereoseq_gef"
+            tables["table"] = TableModel.parse(adata, region=region, region_key="region", instance_key="cell_id")
+            shapes[region] = cell_shapes
+        if gef_f is not None:
+            adata, squares, gef_kind, source_bins = _read_bins(
+                gef_f, bin_size=bin_size, dataset_id=dataset_id, transform=transform, resolution_nm=resolution_nm
             )
-        adata, squares, gef_kind, source_bins = _read_bins(
-            f, bin_size=bin_size, dataset_id=dataset_id, transform=transform, resolution_nm=resolution_nm
-        )
-    adata.uns["spatialdata_io"] = meta | {"gef_kind": gef_kind, "source_bins": source_bins}
-    region = str(adata.obs["region"].iloc[0])
-    table = TableModel.parse(adata, region=region, region_key="region", instance_key="bin_id")
-    return _set_reader_metadata(SpatialData(tables={"table": table}, shapes={region: squares}), "stereoseq_gef")
+            adata.uns["spatialdata_io"] = meta | {"gef_kind": gef_kind, "source_bins": source_bins}
+            region = str(adata.obs["region"].iloc[0])
+            name = _bin_name(bin_size, resolution_nm) if cell_f is not None else "table"
+            tables[name] = TableModel.parse(adata, region=region, region_key="region", instance_key="bin_id")
+            shapes[region] = squares
+    return _set_reader_metadata(SpatialData(tables=tables, shapes=shapes), "stereoseq_gef")
