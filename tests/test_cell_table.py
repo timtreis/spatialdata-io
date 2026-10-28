@@ -4,6 +4,7 @@ import gzip
 import logging
 from pathlib import Path
 
+import anndata as ad
 import numpy as np
 import pandas as pd
 import pytest
@@ -147,9 +148,9 @@ def test_metadata_columns_override(csv: Path) -> None:
     assert "min_x" in table.var_names
 
 
-def test_other_layouts_not_implemented(tmp_path: Path) -> None:
+def test_split_by_not_implemented(csv: Path) -> None:
     with pytest.raises(NotImplementedError):
-        cell_table(tmp_path / "x.h5ad", unit="um")
+        cell_table(csv, unit="um", split_by="fov")
 
 
 def test_roundtrip(csv: Path, tmp_path: Path) -> None:
@@ -387,3 +388,118 @@ def test_mtx_barcodes_leading_zero(tmp_path: Path) -> None:
     table = cell_table(mtx, coords, unit="um", x="x", y="y", cell_id="cell").tables["table"]
     assert list(table.obs.index) == ids
     assert list(table.var_names) == ["GeneA", "NA"]
+
+
+def _h5ad(
+    path: Path,
+    X: np.ndarray | None = None,
+    obs_cols: dict[str, list[float]] | None = None,
+    obsm: dict[str, np.ndarray] | None = None,
+    layers: dict[str, np.ndarray] | None = None,
+    raw: tuple[np.ndarray, list[str]] | None = None,
+) -> Path:
+    X = np.array([[1, 2, 0], [3, 0, 4]]) if X is None else X
+    obs = pd.DataFrame(obs_cols or {}, index=pd.Index(["c1", "c2"]))
+    adata = ad.AnnData(X=X, obs=obs, var=pd.DataFrame(index=["g1", "g2", "blank-1"]))
+    for k, v in (obsm or {}).items():
+        adata.obsm[k] = v
+    for k, v in (layers or {}).items():
+        adata.layers[k] = v
+    if raw is not None:
+        adata.raw = ad.AnnData(X=raw[0], var=pd.DataFrame(index=raw[1]), obs=obs)
+    adata.write_h5ad(path)
+    return path
+
+
+def test_h5ad_obs_coords(tmp_path: Path) -> None:
+    f = _h5ad(tmp_path / "a.h5ad", obs_cols={"center_x": [1.0, 2.0], "center_y": [3.0, 4.0]})
+    sdata = cell_table(f, unit="um")
+    table = sdata["table"]
+    assert list(table.obs.index) == ["c1", "c2"]
+    assert all(isinstance(i, str) for i in table.obs.index)
+    assert list(table.var_names) == ["g1", "g2"]
+    assert table.obsm["blank"].shape == (2, 1)
+    assert table.uns["spatialdata_io"]["coordinates"]["x"] == "center_x"
+    assert sdata["cells"].shape[0] == 2
+
+
+def test_h5ad_obsm_spatial(tmp_path: Path) -> None:
+    f = _h5ad(tmp_path / "a.h5ad", obsm={"spatial": np.array([[1.0, 3.0], [2.0, 4.0]])})
+    sdata = cell_table(f, unit="um")
+    uns = sdata["table"].uns["spatialdata_io"]["coordinates"]
+    assert uns["x"] == "obsm:spatial[0]"
+    assert uns["y"] == "obsm:spatial[1]"
+    assert list(sdata["cells"].geometry.x) == [1.0, 2.0]
+    assert list(sdata["cells"].geometry.y) == [3.0, 4.0]
+    assert "spatial" not in sdata["table"].obsm
+
+
+def test_h5ad_obsm_x_spatial(tmp_path: Path) -> None:
+    f = _h5ad(tmp_path / "a.h5ad", obsm={"X_spatial": np.array([[1.0, 3.0], [2.0, 4.0]])})
+    sdata = cell_table(f, unit="um")
+    assert sdata["table"].uns["spatialdata_io"]["coordinates"]["x"] == "obsm:X_spatial[0]"
+
+
+def test_h5ad_no_coordinates_rejected(tmp_path: Path) -> None:
+    f = _h5ad(tmp_path / "a.h5ad")
+    with pytest.raises(ValueError, match="center_x"):
+        cell_table(f, unit="um")
+
+
+def test_h5ad_lognorm_rejected(tmp_path: Path) -> None:
+    f = _h5ad(
+        tmp_path / "a.h5ad",
+        X=np.array([[0.5, 1.2, 0.0], [1.1, 0.0, 0.3]]),
+        obs_cols={"center_x": [1.0, 2.0], "center_y": [3.0, 4.0]},
+    )
+    with pytest.raises(ValueError, match="non-integer"):
+        cell_table(f, unit="um")
+
+
+def test_h5ad_layer_counts(tmp_path: Path) -> None:
+    f = _h5ad(
+        tmp_path / "a.h5ad",
+        X=np.array([[0.5, 1.2, 0.0], [1.1, 0.0, 0.3]]),
+        obs_cols={"center_x": [1.0, 2.0], "center_y": [3.0, 4.0]},
+        layers={"counts": np.array([[1, 2, 0], [3, 0, 4]])},
+    )
+    table = cell_table(f, unit="um", layer="counts")["table"]
+    assert table.X.toarray().tolist() == [[1, 2], [3, 0]]
+
+
+def test_h5ad_raw(tmp_path: Path) -> None:
+    f = _h5ad(
+        tmp_path / "a.h5ad",
+        X=np.array([[0.5, 1.2, 0.0], [1.1, 0.0, 0.3]]),
+        obs_cols={"center_x": [1.0, 2.0], "center_y": [3.0, 4.0]},
+        raw=(np.array([[5, 6, 0, 1], [7, 0, 8, 2]]), ["r1", "r2", "r3", "blank-9"]),
+    )
+    table = cell_table(f, unit="um", layer="raw")["table"]
+    assert list(table.var_names) == ["r1", "r2", "r3"]
+    assert table.X.toarray().tolist() == [[5, 6, 0], [7, 0, 8]]
+    assert list(table.obsm["blank"].columns) == ["blank-9"]
+
+
+def test_h5ad_missing_layer(tmp_path: Path) -> None:
+    f = _h5ad(
+        tmp_path / "a.h5ad",
+        obs_cols={"center_x": [1.0, 2.0], "center_y": [3.0, 4.0]},
+        layers={"counts": np.array([[1, 2, 0], [3, 0, 4]])},
+    )
+    with pytest.raises(ValueError, match="nope.*counts"):
+        cell_table(f, unit="um", layer="nope")
+    with pytest.raises(ValueError, match="raw"):
+        cell_table(f, unit="um", layer="raw")
+
+
+def test_h5ad_with_coordinates_file(tmp_path: Path) -> None:
+    f = _h5ad(tmp_path / "a.h5ad")
+    coords = tmp_path / "coords.csv"
+    coords.write_text("cell_id,center_x,center_y\nc1,1,2\nc2,3,4\nc3,5,6\n")
+    sdata = cell_table(f, coords, unit="um")
+    assert sdata["table"].uns["spatialdata_io"]["n_coordinates_unmatched"] == 1
+    assert list(sdata["cells"].geometry.x) == [1.0, 3.0]
+    other = tmp_path / "other.csv"
+    other.write_text("cell_id,center_x,center_y\nc1,1,2\n")
+    with pytest.raises(ValueError, match="no coordinates"):
+        cell_table(f, other, unit="um")

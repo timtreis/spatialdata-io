@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal
+from typing import TYPE_CHECKING, Any, Literal, cast
 
 import anndata as ad
 import numpy as np
@@ -333,18 +333,81 @@ def _read_split(
     X, var_names, cell_ids = _read_counts(
         counts, genes_as_rows=genes_as_rows, coord_ids=coords.index, skiprows=skiprows
     )
+    obs, n_unmatched = _join_coordinates(cell_ids, coords, counts.name, coordinates.name)
+    return X, var_names, obs, n_unmatched
+
+
+def _join_coordinates(
+    cell_ids: pd.Index, coords: pd.DataFrame, counts_name: str, coords_name: str
+) -> tuple[pd.DataFrame, int]:
+    """Reindex ``coords`` to ``cell_ids``; raise if a cell has none, count (and warn on) unused rows."""
     missing = ~cell_ids.isin(coords.index)
     if missing.any():
         examples = cell_ids[missing][:5].tolist()
         raise ValueError(
-            f"{int(missing.sum())} cells in {counts.name} have no coordinates in {coordinates.name}, "
+            f"{int(missing.sum())} cells in {counts_name} have no coordinates in {coords_name}, "
             f"for example {examples}. If the counts are oriented the other way, set genes_as_rows."
         )
     n_unmatched = int((~coords.index.isin(cell_ids)).sum())
     if n_unmatched > 0.1 * len(coords):
         logger.warning(f"Dropped {n_unmatched} of {len(coords)} coordinate rows that have no counts.")
-    obs = coords.reindex(cell_ids)
-    return X, var_names, obs, n_unmatched
+    return coords.reindex(cell_ids), n_unmatched
+
+
+_OBSM_COORDINATE_KEYS = ("spatial", "X_spatial")
+
+
+def _read_h5ad(
+    path: Path, *, layer: str | None, coordinates: Path | None, cell_id: str | None, x: str, y: str, skiprows: int
+) -> tuple[sp.spmatrix, pd.Index, pd.DataFrame, int, str, str, dict[str, str]]:
+    """Read counts, ``obs`` and a coordinate source from an h5ad file.
+
+    Only ``obs`` is kept; ``obsm`` is used solely as a coordinate source (``spatial`` or ``X_spatial``)
+    when ``x`` and ``y`` are not in ``obs`` and no ``coordinates`` file is given.
+
+    Returns
+    -------
+    The counts, gene names, ``obs``, the number of unmatched coordinate rows, the ``x`` / ``y`` column names and
+    the labels to record in ``uns`` for columns taken from ``obsm``.
+    """
+    adata = ad.read_h5ad(path)
+    if layer is None:
+        X, var_names = adata.X, adata.var_names
+    elif layer == "raw":
+        if adata.raw is None:
+            raise ValueError(f"{path.name} has no .raw; set layer to None or one of {list(adata.layers.keys())}.")
+        X, var_names = adata.raw.X, adata.raw.var_names
+    elif layer in adata.layers:
+        X, var_names = adata.layers[layer], adata.var_names
+    else:
+        raise ValueError(
+            f"Layer {layer!r} not found in {path.name}; available layers: {list(adata.layers.keys())} "
+            "(plus 'raw' for .raw.X, or None for X)."
+        )
+    if X is None:
+        raise ValueError(f"{path.name} has no counts matrix for layer={layer!r}.")
+    X = sp.csr_matrix(cast("Any", X))
+    obs: pd.DataFrame = cast("Any", adata.obs).copy()
+    obs.index = pd.Index(obs.index.astype(str))
+
+    n_unmatched = 0
+    labels: dict[str, str] = {}
+    if coordinates is not None:
+        coords = _read_coordinates(coordinates, cell_id=cell_id, skiprows=skiprows)
+        joined, n_unmatched = _join_coordinates(obs.index, coords, path.name, coordinates.name)
+        obs = pd.concat([obs.drop(columns=joined.columns.intersection(obs.columns)), joined], axis=1)
+    elif x not in obs.columns or y not in obs.columns:
+        key = next((k for k in _OBSM_COORDINATE_KEYS if k in adata.obsm), None)
+        if key is None:
+            raise ValueError(
+                f"Coordinate columns {x!r} / {y!r} not found in obs of {path.name} and obsm has none of "
+                f"{_OBSM_COORDINATE_KEYS}; available obs columns: {list(obs.columns)[:10]}."
+            )
+        xy = np.asarray(adata.obsm[key])
+        x, y = f"obsm_{key}_0", f"obsm_{key}_1"  # obs column names must be alphanumeric/underscore
+        obs[x], obs[y] = xy[:, 0], xy[:, 1]
+        labels = {x: f"obsm:{key}[0]", y: f"obsm:{key}[1]"}
+    return X, pd.Index(var_names.astype(str)), obs, n_unmatched, x, y, labels
 
 
 def cell_table(
@@ -403,7 +466,10 @@ def cell_table(
     skiprows
         Number of leading lines to skip before the header (of each delimited file).
     layer
-        Counts layer of an h5ad file. Not implemented yet.
+        Counts source of an h5ad file: ``None`` reads ``X``, ``"raw"`` reads ``.raw.X`` (with ``.raw.var``),
+        any other value reads ``layers[layer]``. There is no automatic fallback. Only ``obs`` is kept; ``obsm``
+        is used only as a coordinate source (``spatial`` or ``X_spatial``) when ``x`` / ``y`` are not in ``obs``
+        and no ``coordinates`` file is given, and the columns are then named ``obsm:<key>[0]`` and ``obsm:<key>[1]``.
     cell_radius
         Circle radius in µm. If ``None`` and ``unit="um"``, it is derived per cell from ``obs["volume"]``
         as the radius of the sphere of equal volume, ``(3V / 4π)^(1/3)``, or else from ``obs["area"]``
@@ -423,7 +489,7 @@ def cell_table(
         If ``unit`` is invalid, ``unit="px"`` has no ``pixel_size``, the counts are not integral, cell ids
         are duplicated, or the id, ``x`` or ``y`` columns are missing.
     NotImplementedError
-        For h5ad input.
+        If ``split_by`` is given (not implemented yet).
     """
     if unit not in _UNITS:
         raise ValueError(f"unit must be one of {_UNITS}, got {unit!r}.")
@@ -432,9 +498,19 @@ def cell_table(
     counts = Path(counts)
     name = counts.name.lower()
     n_unmatched = 0
+    labels: dict[str, str] = {}
+    genes: pd.DataFrame | sp.spmatrix
     if name.endswith(".h5ad"):
-        raise NotImplementedError("h5ad input is not supported yet.")
-    if coordinates is not None:
+        genes, var_names, obs, n_unmatched, x, y, labels = _read_h5ad(
+            counts,
+            layer=layer,
+            coordinates=Path(coordinates) if coordinates is not None else None,
+            cell_id=cell_id,
+            x=x,
+            y=y,
+            skiprows=skiprows,
+        )
+    elif coordinates is not None:
         genes, var_names, obs, n_unmatched = _read_split(
             counts, Path(coordinates), cell_id=cell_id, genes_as_rows=genes_as_rows, skiprows=skiprows
         )
@@ -451,7 +527,7 @@ def cell_table(
             skiprows=skiprows,
         )
     logger.info(f"Read {len(obs)} cells x {len(var_names)} columns from {counts.name}.")
-    return _build(
+    sdata = _build(
         genes,
         var_names,
         obs,
@@ -463,3 +539,6 @@ def cell_table(
         cell_radius=cell_radius,
         n_coordinates_unmatched=n_unmatched,
     )
+    if labels:
+        sdata["table"].uns["spatialdata_io"]["coordinates"].update(x=labels[x], y=labels[y])
+    return sdata
