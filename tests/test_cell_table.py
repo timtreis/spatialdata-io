@@ -1,9 +1,14 @@
 from __future__ import annotations
 
+import gzip
+import logging
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pytest
+import scipy.io
+import scipy.sparse as sp
 from spatialdata import SpatialData
 from spatialdata.transformations import Identity, Scale, get_transformation
 
@@ -142,9 +147,7 @@ def test_metadata_columns_override(csv: Path) -> None:
     assert "min_x" in table.var_names
 
 
-def test_other_layouts_not_implemented(csv: Path, tmp_path: Path) -> None:
-    with pytest.raises(NotImplementedError):
-        cell_table(csv, csv, unit="um")
+def test_other_layouts_not_implemented(tmp_path: Path) -> None:
     with pytest.raises(NotImplementedError):
         cell_table(tmp_path / "x.h5ad", unit="um")
 
@@ -182,3 +185,141 @@ def test_build_sparse() -> None:
     assert table.shape == (2, 2)
     assert table.obsm["blank"].shape == (2, 1)
     assert sp.issparse(table.X)
+
+
+GENES = ["GeneA", "GeneB", "Blank-1"]
+
+
+def _split_files(
+    tmp_path: Path,
+    n: int = 20,
+    extra: int = 0,
+    *,
+    genes_as_rows: bool = True,
+    sep: str = "\t",
+    ids: list[str] | None = None,
+) -> tuple[Path, Path, np.ndarray]:
+    ids = ids or [f"c{i}" for i in range(n)]
+    rng = np.random.default_rng(0)
+    mat = rng.integers(0, 5, size=(n, len(GENES)))
+    df = pd.DataFrame(mat, index=ids, columns=GENES)
+    if genes_as_rows:
+        df = df.T
+    counts = tmp_path / "count.tsv"
+    df.to_csv(counts, sep=sep, index_label="gene" if genes_as_rows else "cells")
+    coord_ids = ids + [f"extra{i}" for i in range(extra)]
+    coords = pd.DataFrame({"cells": coord_ids, "X": np.arange(len(coord_ids), dtype=float), "Y": 2.0, "area": 10.0})
+    cpath = tmp_path / "coordinates.tsv"
+    coords.sample(frac=1, random_state=1).to_csv(cpath, sep="\t", index=False)
+    return counts, cpath, mat
+
+
+def test_split_genes_by_cells(tmp_path: Path) -> None:
+    counts, coords, mat = _split_files(tmp_path)
+    table = cell_table(counts, coords, unit="um", x="X", y="Y", cell_id="cells").tables["table"]
+    assert table.shape == (20, 2)
+    assert table.obsm["blank"].shape == (20, 1)
+    np.testing.assert_array_equal(np.asarray(table.X), mat[:, :2])
+    assert list(table.obs["X"]) == list(np.arange(20.0))
+
+
+def test_split_cells_by_genes(tmp_path: Path) -> None:
+    counts, coords, mat = _split_files(tmp_path, genes_as_rows=False)
+    table = cell_table(counts, coords, unit="um", x="X", y="Y", cell_id="cells").tables["table"]
+    np.testing.assert_array_equal(np.asarray(table.X), mat[:, :2])
+
+
+def test_explicit_orientation_wins(tmp_path: Path) -> None:
+    counts, coords, _ = _split_files(tmp_path)
+    with pytest.raises(ValueError, match="have no coordinates"):
+        cell_table(counts, coords, unit="um", x="X", y="Y", cell_id="cells", genes_as_rows=False)
+
+
+def test_ambiguous_orientation_rejected(tmp_path: Path) -> None:
+    counts, coords, _ = _split_files(tmp_path)
+    coords.write_text("cells\tX\tY\nzzz\t1\t2\n")
+    with pytest.raises(ValueError, match="genes_as_rows"):
+        cell_table(counts, coords, unit="um", x="X", y="Y", cell_id="cells")
+
+
+def test_mtx_triplet(tmp_path: Path) -> None:
+    counts, coords, mat = _split_files(tmp_path)
+    mtx = tmp_path / "exp.mtx.gz"
+    with gzip.open(mtx, "wb") as f:
+        scipy.io.mmwrite(f, sp.coo_matrix(mat.T))  # type: ignore[arg-type]  # genes x cells
+    for name, labels in (("feats.txt.gz", GENES), ("obs.txt.gz", [f"c{i}" for i in range(20)])):
+        with gzip.open(tmp_path / name, "wt") as f:
+            f.write("\n".join(labels) + "\n")
+    table = cell_table(mtx, coords, unit="um", x="X", y="Y", cell_id="cells").tables["table"]
+    assert sp.issparse(table.X)
+    assert table.shape == (20, 2)
+    np.testing.assert_array_equal(table.X.toarray(), mat[:, :2])  # type: ignore[attr-defined]
+    assert table.obsm["blank"].shape == (20, 1)
+
+
+def test_mtx_missing_siblings(tmp_path: Path) -> None:
+    _, coords, mat = _split_files(tmp_path)
+    mtx = tmp_path / "lonely.mtx"
+    scipy.io.mmwrite(str(mtx), sp.coo_matrix(mat))
+    with pytest.raises(ValueError, match="features"):
+        cell_table(mtx, coords, unit="um", x="X", y="Y", cell_id="cells")
+
+
+def test_gzip_tsv_counts(tmp_path: Path) -> None:
+    counts, coords, mat = _split_files(tmp_path)
+    gz = tmp_path / "count.tsv.gz"
+    with gzip.open(gz, "wb") as f:
+        f.write(counts.read_bytes())
+    table = cell_table(gz, coords, unit="um", x="X", y="Y", cell_id="cells").tables["table"]
+    np.testing.assert_array_equal(np.asarray(table.X), mat[:, :2])
+
+
+def test_join_numeric_vs_string_ids(tmp_path: Path) -> None:
+    counts, coords, mat = _split_files(tmp_path, ids=[str(i) for i in range(20)])
+    table = cell_table(counts, coords, unit="um", x="X", y="Y", cell_id="cells").tables["table"]
+    assert list(table.obs.index) == [str(i) for i in range(20)]
+    np.testing.assert_array_equal(np.asarray(table.X), mat[:, :2])
+
+
+def test_unnamed_index_column(tmp_path: Path) -> None:
+    counts, _, _ = _split_files(tmp_path)
+    cpath = tmp_path / "centroids.csv"
+    lines = [",cell,x,y"] + [f"{i},c{i},{i}.5,1.5" for i in range(20)]
+    cpath.write_text("\n".join(lines) + "\n")
+    table = cell_table(counts, cpath, unit="um", x="x", y="y", cell_id="cell").tables["table"]
+    assert table.shape == (20, 2)
+    assert not any(c.startswith("Unnamed") for c in table.obs.columns)
+
+
+def test_counts_cell_without_coords_rejected(tmp_path: Path) -> None:
+    counts, coords, _ = _split_files(tmp_path)
+    lines = coords.read_text().splitlines()
+    coords.write_text("\n".join(lines[:-8]) + "\n")  # drop 8 rows
+    with pytest.raises(ValueError, match=r"8 cells.*\['c") as exc:
+        cell_table(counts, coords, unit="um", x="X", y="Y", cell_id="cells")
+    assert exc.value.args[0].count("'c") <= 5
+
+
+def test_extra_coord_rows_dropped(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    from spatialdata._logging import logger
+
+    logger.propagate = True
+    counts, coords, _ = _split_files(tmp_path, extra=1)
+    with caplog.at_level(logging.WARNING):
+        sdata = cell_table(counts, coords, unit="um", x="X", y="Y", cell_id="cells")
+    assert sdata.tables["table"].uns["spatialdata_io"]["n_coordinates_unmatched"] == 1
+    assert sdata.tables["table"].shape[0] == 20
+    assert "Dropped" not in caplog.text
+
+    counts, coords, _ = _split_files(tmp_path, extra=5)
+    with caplog.at_level(logging.WARNING):
+        sdata = cell_table(counts, coords, unit="um", x="X", y="Y", cell_id="cells")
+    assert sdata.tables["table"].uns["spatialdata_io"]["n_coordinates_unmatched"] == 5
+    assert "Dropped 5 of 25" in caplog.text
+
+
+def test_coord_metadata_into_obs(tmp_path: Path) -> None:
+    counts, coords, _ = _split_files(tmp_path)
+    sdata = cell_table(counts, coords, unit="um", x="X", y="Y", cell_id="cells")
+    assert "area" in sdata.tables["table"].obs.columns
+    assert sdata.tables["table"].uns["spatialdata_io"]["radius"]["source"] == "derived:area"

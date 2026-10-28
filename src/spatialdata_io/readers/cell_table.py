@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, Literal
 import anndata as ad
 import numpy as np
 import pandas as pd
+import scipy.io
 import scipy.sparse as sp
 from spatialdata import SpatialData
 from spatialdata._logging import logger
@@ -200,6 +201,146 @@ def _read_wide(
     return genes, pd.Index(gene_cols), obs
 
 
+_FEATURE_NAMES = ("features", "genes", "feats")
+_BARCODE_NAMES = ("barcodes", "cells", "obs")
+_SIBLING_SUFFIXES = (".tsv", ".tsv.gz", ".txt", ".txt.gz", ".csv", ".csv.gz")
+
+
+def _mtx_stem(path: Path) -> str:
+    name = path.name
+    for ext in (".mtx.gz", ".mtx"):
+        if name.lower().endswith(ext):
+            return name[: -len(ext)]
+    return path.stem
+
+
+def _find_sibling(path: Path, bases: tuple[str, ...], stem_suffix: str) -> Path | None:
+    candidates = [f"{base}{ext}" for base in bases for ext in _SIBLING_SUFFIXES]
+    candidates += [f"{_mtx_stem(path)}_{stem_suffix}{ext}" for ext in _SIBLING_SUFFIXES]
+    for cand in candidates:
+        if (path.parent / cand).is_file():
+            return path.parent / cand
+    return None
+
+
+def _read_names(path: Path) -> pd.Index:
+    """Read the first column of a header-less name list."""
+    sep = "," if path.name.lower().replace(".gz", "").endswith(".csv") else "\t"
+    return pd.Index(pd.read_csv(path, sep=sep, header=None, usecols=[0]).iloc[:, 0].astype(str))
+
+
+def _infer_rows_are_genes(
+    row_ids: pd.Index, col_ids: pd.Index, coord_ids: pd.Index, genes_as_rows: bool | None
+) -> bool:
+    if genes_as_rows is not None:
+        return genes_as_rows
+    rows_hit = bool(row_ids.isin(coord_ids).any())
+    cols_hit = bool(col_ids.isin(coord_ids).any())
+    if rows_hit == cols_hit:
+        reason = "both axes" if rows_hit else "neither axis"
+        raise ValueError(
+            f"Cannot infer the orientation of the counts: {reason} match the coordinate cell ids. "
+            "Set genes_as_rows=True (genes in rows) or genes_as_rows=False (cells in rows)."
+        )
+    return cols_hit
+
+
+def _read_counts(
+    path: Path, *, genes_as_rows: bool | None, coord_ids: pd.Index, skiprows: int
+) -> tuple[pd.DataFrame | sp.spmatrix, pd.Index, pd.Index]:
+    """Read a counts file with its own axis labels and return cells x genes.
+
+    Parameters
+    ----------
+    path
+        Delimited file (either orientation, first column holds the row labels) or ``.mtx(.gz)``. For
+        ``.mtx`` the labels come from sibling files named ``{features,genes}`` and ``{barcodes,cells}``
+        with a ``.tsv``/``.txt``/``.csv`` suffix (optionally ``.gz``), or ``<stem>_feats`` and ``<stem>_obs``.
+    genes_as_rows
+        Orientation; ``None`` infers it from the overlap of the axis labels with ``coord_ids``.
+    coord_ids
+        String cell ids of the coordinates file.
+    skiprows
+        Leading lines to skip in a delimited file.
+
+    Returns
+    -------
+    The cells x genes counts (dense frame or sparse matrix), the gene names and the string cell ids.
+    """
+    if path.name.lower().endswith((".mtx", ".mtx.gz")):
+        feats_path = _find_sibling(path, _FEATURE_NAMES, "feats")
+        obs_path = _find_sibling(path, _BARCODE_NAMES, "obs")
+        if feats_path is None or obs_path is None:
+            raise ValueError(
+                f"Could not find the label files next to {path.name}: expected features.tsv(.gz) or genes.tsv(.gz) "
+                f"and barcodes.tsv(.gz) or cells.tsv(.gz) (or {_mtx_stem(path)}_feats.* and {_mtx_stem(path)}_obs.*) "
+                f"in {path.parent}."
+            )
+        feats, barcodes = _read_names(feats_path), _read_names(obs_path)
+        mat = sp.csr_matrix(scipy.io.mmread(path, spmatrix=True))
+        shape = mat.shape
+        if genes_as_rows is None and len(feats) != len(barcodes):
+            genes_as_rows = shape == (len(feats), len(barcodes))
+        if genes_as_rows is None:
+            genes_as_rows = _infer_rows_are_genes(feats, barcodes, coord_ids, None)
+        rows, cols = (feats, barcodes) if genes_as_rows else (barcodes, feats)
+        if shape != (len(rows), len(cols)):
+            raise ValueError(
+                f"{path.name} has shape {shape} but the label files give {len(rows)} rows x {len(cols)} columns."
+            )
+        return (mat.T.tocsr(), feats, barcodes) if genes_as_rows else (mat, feats, barcodes)
+
+    df = _read_delimited(path, skiprows)
+    if isinstance(df.index, pd.RangeIndex):
+        df = df.set_index(df.columns[0])
+    df.index = df.index.astype(str)
+    df.columns = df.columns.astype(str)
+    rows_are_genes = _infer_rows_are_genes(df.index, df.columns, coord_ids, genes_as_rows)
+    if rows_are_genes:
+        df = df.T
+    return df, pd.Index(df.columns), pd.Index(df.index)
+
+
+def _read_coordinates(path: Path, *, cell_id: str | None, skiprows: int) -> pd.DataFrame:
+    df = _read_delimited(path, skiprows)
+    id_col = cell_id if cell_id is not None else df.columns[0]
+    if id_col not in df.columns:
+        raise ValueError(f"Column {id_col!r} not found in {path.name}; available columns: {list(df.columns)[:10]}.")
+    df = df.loc[:, [c for c in df.columns if c == id_col or not str(c).startswith("Unnamed:")]]
+    df.index = pd.Index(df[id_col].astype(str))
+    df = df.drop(columns=id_col)
+    if not df.index.is_unique:
+        dup = df.index[df.index.duplicated()].unique()[:5].tolist()
+        raise ValueError(f"Found duplicate cell ids in {path.name}, for example {dup}.")
+    return df
+
+
+def _read_split(
+    counts: Path,
+    coordinates: Path,
+    *,
+    cell_id: str | None,
+    genes_as_rows: bool | None,
+    skiprows: int,
+) -> tuple[pd.DataFrame | sp.spmatrix, pd.Index, pd.DataFrame, int]:
+    coords = _read_coordinates(coordinates, cell_id=cell_id, skiprows=skiprows)
+    X, var_names, cell_ids = _read_counts(
+        counts, genes_as_rows=genes_as_rows, coord_ids=coords.index, skiprows=skiprows
+    )
+    missing = ~cell_ids.isin(coords.index)
+    if missing.any():
+        examples = cell_ids[missing][:5].tolist()
+        raise ValueError(
+            f"{int(missing.sum())} cells in {counts.name} have no coordinates in {coordinates.name}, "
+            f"for example {examples}. If the counts are oriented the other way, set genes_as_rows."
+        )
+    n_unmatched = int((~coords.index.isin(cell_ids)).sum())
+    if n_unmatched > 0.1 * len(coords):
+        logger.warning(f"Dropped {n_unmatched} of {len(coords)} coordinate rows that have no counts.")
+    obs = coords.reindex(cell_ids)
+    return X, var_names, obs, n_unmatched
+
+
 def cell_table(
     counts: str | Path,
     coordinates: str | Path | None = None,
@@ -218,8 +359,9 @@ def cell_table(
 ) -> SpatialData:
     """Read a cell x gene counts table with per-cell centroids.
 
-    Currently reads a single wide delimited file holding the id, the centroids, optional metadata
-    and one column per gene (cells x genes). The raw integer counts go to ``table.X``, columns whose
+    Reads either a single wide delimited file holding the id, the centroids, optional metadata and one
+    column per gene (cells x genes), or a counts file (delimited in either orientation, or ``.mtx(.gz)``
+    with label files next to it) plus a separate ``coordinates`` file. The raw integer counts go to ``table.X``, columns whose
     name contains ``blank`` (case-insensitive) go to ``table.obsm["blank"]``, and each cell becomes a
     circle in the ``cells`` shapes element.
 
@@ -229,7 +371,9 @@ def cell_table(
         Path to a ``.csv``, ``.tsv`` or ``.txt`` file (``.gz`` allowed). The delimiter follows the
         extension; ``.txt`` means tab.
     coordinates
-        Separate coordinates file. Not implemented yet; leave as ``None``.
+        Separate delimited coordinates file with one row per cell. Its ``cell_id`` column is joined to
+        the counts (ids compared as strings); all other columns go to ``obs``. Counts cells without
+        coordinates raise; coordinate rows without counts are dropped (a warning is logged above 10%).
     unit
         Unit of the coordinate columns: ``"um"``, ``"mm"`` or ``"px"``. Required, never inferred. The
         values are kept as deposited; the ``global`` coordinate system is in µm via a ``Scale``
@@ -239,16 +383,17 @@ def cell_table(
     x, y
         Names of the centroid columns.
     cell_id
-        Name of the id column. Defaults to the first column.
+        Name of the id column (of the wide file, or of the coordinates file). Defaults to the first column.
     genes_as_rows
-        Orientation of a separate counts file. Not used by the wide layout.
+        Orientation of a separate counts file (``True``: genes in rows). ``None`` infers it from which axis
+        matches the coordinate cell ids. Not used by the wide layout.
     split_by
         Column splitting the cells into several shapes elements. Not implemented yet.
     metadata_columns
         Non-gene columns, copied to ``obs``. Defaults to the Vizgen ``cell_metadata`` columns that are
         present; ``x``, ``y`` and ``split_by`` are always included. All other columns are genes.
     skiprows
-        Number of leading lines to skip before the header.
+        Number of leading lines to skip before the header (of each delimited file).
     layer
         Counts layer of an h5ad file. Not implemented yet.
     cell_radius
@@ -270,7 +415,7 @@ def cell_table(
         If ``unit`` is invalid, ``unit="px"`` has no ``pixel_size``, the counts are not integral, cell ids
         are duplicated, or the id, ``x`` or ``y`` columns are missing.
     NotImplementedError
-        For layouts other than a single wide delimited file.
+        For h5ad input.
     """
     if unit not in _UNITS:
         raise ValueError(f"unit must be one of {_UNITS}, got {unit!r}.")
@@ -278,18 +423,25 @@ def cell_table(
         raise ValueError("unit='px' requires pixel_size (micrometres per pixel).")
     counts = Path(counts)
     name = counts.name.lower()
-    if coordinates is not None or name.endswith((".h5ad", ".mtx", ".mtx.gz")):
-        raise NotImplementedError("Only a single wide delimited counts file is supported so far.")
-
-    genes, var_names, obs = _read_wide(
-        counts,
-        x=x,
-        y=y,
-        cell_id=cell_id,
-        split_by=split_by,
-        metadata_columns=metadata_columns,
-        skiprows=skiprows,
-    )
+    n_unmatched = 0
+    if name.endswith(".h5ad"):
+        raise NotImplementedError("h5ad input is not supported yet.")
+    if coordinates is not None:
+        genes, var_names, obs, n_unmatched = _read_split(
+            counts, Path(coordinates), cell_id=cell_id, genes_as_rows=genes_as_rows, skiprows=skiprows
+        )
+    elif name.endswith((".mtx", ".mtx.gz")):
+        raise ValueError("A .mtx counts file needs a separate coordinates file.")
+    else:
+        genes, var_names, obs = _read_wide(
+            counts,
+            x=x,
+            y=y,
+            cell_id=cell_id,
+            split_by=split_by,
+            metadata_columns=metadata_columns,
+            skiprows=skiprows,
+        )
     logger.info(f"Read {len(obs)} cells x {len(var_names)} columns from {counts.name}.")
     return _build(
         genes,
@@ -301,5 +453,5 @@ def cell_table(
         y=y,
         split_by=split_by,
         cell_radius=cell_radius,
-        n_coordinates_unmatched=0,
+        n_coordinates_unmatched=n_unmatched,
     )
