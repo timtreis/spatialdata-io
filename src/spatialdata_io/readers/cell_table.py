@@ -65,9 +65,7 @@ def _transformation(unit: str, pixel_size: float | None) -> tuple[BaseTransforma
     return Scale([factor, factor], axes=("x", "y")), factor
 
 
-def _resolve_radius(
-    obs: pd.DataFrame, unit: str, cell_radius: float | None
-) -> tuple[str, float | np.ndarray]:
+def _resolve_radius(obs: pd.DataFrame, unit: str, cell_radius: float | None) -> tuple[str, float | np.ndarray]:
     if cell_radius is not None:
         return "stated", float(cell_radius)
     if unit == "um":

@@ -108,7 +108,9 @@ def test_radius_sources(csv: Path) -> None:
 def test_radius_from_area(tmp_path: Path) -> None:
     rows = [r.replace(",523.6,", ",78.5398,", 1) for r in ROWS[:1]] + ROWS[1:]
     header = HEADER.replace("volume", "area")
-    sdata = cell_table(_write(tmp_path / "a.csv", rows, header), unit="um", metadata_columns=["area", "center_x", "center_y"])
+    sdata = cell_table(
+        _write(tmp_path / "a.csv", rows, header), unit="um", metadata_columns=["area", "center_x", "center_y"]
+    )
     radius = sdata.tables["table"].uns["spatialdata_io"]["radius"]
     assert radius["source"] == "derived:area"
     assert np.isclose(radius["value_um"][0], 5.0, atol=1e-3)
