@@ -305,9 +305,20 @@ def test_counts_ids_with_a_uniform_prefix_match_metadata(tmp_path: Path) -> None
     # more cells) does not. The table keeps the counted cells under their bare EntityID.
     region = _write_dataset(tmp_path, with_images_transform=False)
     counts = pd.read_csv(region / "cell_by_gene.csv", index_col=0)
-    counts.iloc[:3].rename(index=lambda i: f"AbxF_{i}").to_csv(region / "cell_by_gene.csv")
+    counts.iloc[:3].rename(index=lambda i: f"AbxF_{i}").to_csv(region / "cell_by_gene.csv", index_label="")  # GEO: no id header
     table = merscope(region, mosaic_images=False, cells_boundaries=False)["table"]
     assert list(table.obs_names) == [str(i) for i in CELL_IDS[:3]]
+    assert table.obs.index.name is None or isinstance(table.obs.index.name, str)  # anndata writes only str keys
+    table.write_zarr(tmp_path / "table.zarr")
+
+
+def test_strip_uniform_prefix_keeps_the_index_name() -> None:
+    # pandas 3.0 names `obs.loc[ids]` after `ids`; the rpartition column name (2) broke the zarr write.
+    from spatialdata_io.readers.merscope import _strip_uniform_prefix
+
+    assert _strip_uniform_prefix(pd.Index(["AbxF_1", "AbxF_2"], name="cell")).tolist() == ["1", "2"]
+    assert _strip_uniform_prefix(pd.Index(["AbxF_1", "AbxF_2"], name="cell")).name == "cell"
+    assert _strip_uniform_prefix(pd.Index(["AbxF_1", "AbxF_2"])).name is None
 
 
 def test_transcripts_fov_with_missing_values(tmp_path: Path) -> None:

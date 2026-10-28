@@ -394,7 +394,7 @@ def _strip_uniform_prefix(ids: pd.Index) -> pd.Index | None:
     parts = pd.Series(ids, dtype=str).str.rpartition("_")
     if (parts[0] == "").any() or parts[0].nunique() != 1:
         return None
-    return pd.Index(parts[2])
+    return pd.Index(parts[2]).rename(ids.name)
 
 
 def _read_csv_str_index(path: Path) -> pd.DataFrame:
