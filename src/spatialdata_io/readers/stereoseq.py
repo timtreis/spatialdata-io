@@ -536,44 +536,108 @@ def _cell_polygons(
     return geoms, bad
 
 
-def _bin_chunks(
-    expression: h5py.Dataset, gene: np.ndarray, bin_size: int, chunk_rows: int
-) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Stream a GEF ``expression`` dataset and aggregate it to square bins.
+def _gene_chunks(counts: np.ndarray, chunk_rows: int) -> list[tuple[int, int]]:
+    """Split genes (in row order) into runs of whole genes of at most ``chunk_rows`` rows; a larger gene is alone."""
+    cum = np.cumsum(counts)
+    runs = []
+    i0 = 0
+    while i0 < len(counts):
+        base = cum[i0 - 1] if i0 else 0
+        i1 = max(int(np.searchsorted(cum, base + chunk_rows, side="right")), i0 + 1)
+        runs.append((i0, i1))
+        i0 = i1
+    return runs
 
-    Rows are read ``chunk_rows`` at a time; a gene's rows are ``expression[offset : offset + count]``. Within each
-    chunk duplicate (bin, gene) entries are summed before being kept, so memory follows the number of occupied bins.
+
+def _chunk_pairs(
+    expression: h5py.Dataset,
+    order: np.ndarray,
+    starts: np.ndarray,
+    ends: np.ndarray,
+    bin_size: int,
+    n_genes: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """Aggregate the rows of whole genes to ``(bin, gene)`` pairs.
+
+    ``order``, ``starts`` and ``ends`` describe the genes of this chunk (gene index and row range, sorted by start).
 
     Returns
     -------
-    COO triplets ``(bin key, gene index, count)`` where ``key = (y // bin_size) << 32 | (x // bin_size)``.
+    The sorted keys ``(y // bin_size) << 32 | (x // bin_size)`` of the occupied bins, and for every ``(bin, gene)``
+    pair, sorted by bin then gene: the index into those keys, the gene index and the summed count.
     """
+    lo, hi = int(starts[0]), int(ends.max())
+    chunk = expression[lo:hi]
+    x = chunk["x"].astype(np.int64)
+    y = chunk["y"].astype(np.int64)
+    if x.min() < 0 or y.min() < 0:
+        raise ValueError("Negative bin coordinates in the GEF expression table are not supported.")
+    rows = np.arange(lo, hi, dtype=np.int64)
+    slot = np.searchsorted(starts, rows, side="right") - 1
+    # slot is -1 before the first gene; clip it for the lookup, `slot >= 0` excludes those rows
+    covered = (slot >= 0) & (rows < ends[np.maximum(slot, 0)])
+    key = ((y // bin_size) << 32) | (x // bin_size)
+    uniq, inv = np.unique(key[covered], return_inverse=True)
+    pair_id = inv.astype(np.int64) * n_genes + order[slot[covered]]
+    pairs, pair_inv = np.unique(pair_id, return_inverse=True)
+    counts = np.bincount(pair_inv, weights=chunk["count"][covered]).astype(np.int64)
+    return uniq, pairs // n_genes, pairs % n_genes, counts
+
+
+def _bin_chunks(
+    expression: h5py.Dataset, gene: np.ndarray, bin_size: int, chunk_rows: int
+) -> tuple[np.ndarray, csr_matrix]:
+    """Stream a GEF ``expression`` dataset into a bins x genes CSR matrix of square bins.
+
+    A gene's rows are ``expression[offset : offset + count]``. Whole genes are read ``chunk_rows`` rows at a time
+    (a gene larger than that is read alone). The file is read twice: the first pass counts the entries of every
+    bin, the second writes them straight into the final CSR arrays, so peak memory is the final matrix plus one
+    chunk. Memory of a chunk follows the number of occupied (bin, gene) pairs.
+
+    Returns
+    -------
+    The sorted keys of the occupied bins and the CSR matrix.
+    """
+    n_genes = len(gene)
     populated = np.flatnonzero(gene["count"] > 0)
     order = populated[np.argsort(gene["offset"][populated], kind="stable")]
     starts = gene["offset"][order].astype(np.int64)
     ends = starts + gene["count"][order].astype(np.int64)
-    n_rows = expression.shape[0]
-    keys: list[np.ndarray] = []
-    genes: list[np.ndarray] = []
-    counts: list[np.ndarray] = []
-    for lo in range(0, n_rows, chunk_rows):
-        hi = min(lo + chunk_rows, n_rows)
-        chunk = expression[lo:hi]
-        rows = np.arange(lo, hi, dtype=np.int64)
-        slot = np.searchsorted(starts, rows, side="right") - 1
-        covered = (slot >= 0) & (rows < ends[np.maximum(slot, 0)])
-        key = ((chunk["y"].astype(np.int64) // bin_size) << 32) | (chunk["x"].astype(np.int64) // bin_size)
-        uniq, inv = np.unique(key[covered], return_inverse=True)
-        m = coo_matrix(
-            (chunk["count"][covered].astype(np.int64), (inv, order[slot[covered]])), shape=(len(uniq), len(gene))
-        ).tocoo()
-        m.sum_duplicates()
-        keys.append(uniq[m.row])
-        genes.append(m.col.astype(np.int32))
-        counts.append(m.data)
-    if not keys:
-        return np.empty(0, np.int64), np.empty(0, np.int32), np.empty(0, np.int64)
-    return np.concatenate(keys), np.concatenate(genes), np.concatenate(counts)
+    runs = _gene_chunks(ends - starts, chunk_rows)
+
+    def pairs(run: tuple[int, int]) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        sl = slice(*run)
+        return _chunk_pairs(expression, order[sl], starts[sl], ends[sl], bin_size, n_genes)
+
+    keys = np.empty(0, dtype=np.int64)
+    per_row = np.empty(0, dtype=np.int64)
+    max_count = 0
+    for run in runs:
+        uniq, pair_bin, _, counts = pairs(run)
+        all_keys = np.union1d(keys, uniq)
+        merged = np.zeros(len(all_keys), dtype=np.int64)
+        merged[np.searchsorted(all_keys, keys)] = per_row
+        merged[np.searchsorted(all_keys, uniq)] += np.bincount(pair_bin, minlength=len(uniq))
+        keys, per_row = all_keys, merged
+        max_count = max(max_count, int(counts.max(initial=0)))
+
+    indptr = np.concatenate([[0], np.cumsum(per_row)])
+    nnz = int(indptr[-1])
+    indices = np.empty(nnz, dtype=np.int32)
+    data: np.ndarray[Any, Any] = np.empty(nnz, dtype=np.int32 if max_count <= np.iinfo(np.int32).max else np.int64)
+    filled = np.zeros(len(keys), dtype=np.int64)
+    for run in runs:
+        uniq, pair_bin, pair_gene, counts = pairs(run)
+        rows = np.searchsorted(keys, uniq)
+        per_bin = np.bincount(pair_bin, minlength=len(uniq))
+        first = np.cumsum(per_bin) - per_bin
+        pos = indptr[rows][pair_bin] + filled[rows][pair_bin] + (np.arange(len(pair_bin)) - first[pair_bin])
+        indices[pos] = pair_gene
+        data[pos] = counts
+        filled[rows] += per_bin
+    x_mat = csr_matrix((data, indices, indptr), shape=(len(keys), n_genes))
+    x_mat.sort_indices()
+    return keys, x_mat
 
 
 def _read_bins(
@@ -582,7 +646,7 @@ def _read_bins(
     bin_size: int,
     dataset_id: str,
     transform: Mapping[str, BaseTransformation],
-    chunk_rows: int = 2**24,
+    chunk_rows: int = 2**20,
     resolution_nm: int | None = None,
 ) -> tuple[ad.AnnData, GeoDataFrame, str, str]:
     """Read square bins from a tissue or full GEF file.
@@ -617,15 +681,15 @@ def _read_bins(
         resolution_nm = _resolution_nm(f)[0]
     gef_kind = "full" if any(f"geneExp/bin{n}" in f for n in range(2, 501)) else "bin1_only"
     precomputed = bin_size > 1 and f"geneExp/bin{bin_size}" in f
+    # precomputed bin{N} x/y are DNB-unit corners, all multiples of N, with the bin1 gene/offset/count semantics
+    # (checked on GSE315416 GSM9427230 bin50/bin100)
     group = f[f"geneExp/bin{bin_size if precomputed else 1}"]
     gene = group["gene"][:]
     var_names = np.char.decode(gene["gene"], "utf-8")
-    key, gene_idx, count = _bin_chunks(group["expression"], gene, bin_size, chunk_rows)
-
-    bins, inv = np.unique(key, return_inverse=True)
+    bins, x_mat = _bin_chunks(group["expression"], gene, bin_size, chunk_rows)
     n = len(bins)
-    dtype = np.int32 if count.size == 0 or count.max() <= np.iinfo(np.int32).max else np.int64
-    x_mat = coo_matrix((count, (inv, gene_idx)), shape=(n, len(gene))).tocsr().astype(dtype)
+    if n == 0:
+        raise ValueError(f"{f.filename}: `{group.name}/expression` has no rows with counts.")
 
     region = f"{dataset_id}_{_bin_name(bin_size, resolution_nm)}"
     bin_id = np.arange(n, dtype=np.int64)
@@ -713,6 +777,6 @@ def stereoseq_gef(
             f, bin_size=bin_size, dataset_id=dataset_id, transform=transform, resolution_nm=resolution_nm
         )
     adata.uns["spatialdata_io"] = meta | {"gef_kind": gef_kind, "source_bins": source_bins}
-    region = f"{dataset_id}_{_bin_name(bin_size, resolution_nm)}"
+    region = str(adata.obs["region"].iloc[0])
     table = TableModel.parse(adata, region=region, region_key="region", instance_key="bin_id")
     return _set_reader_metadata(SpatialData(tables={"table": table}, shapes={region: squares}), "stereoseq_gef")

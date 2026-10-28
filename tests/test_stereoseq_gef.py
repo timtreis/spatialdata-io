@@ -288,22 +288,32 @@ BIN1_ROWS = [
     ("G2", 3, 3, 5),
     ("G3", 0, 1, 7),
 ]
+# bin2 x/y are DNB-unit corners, multiples of 2 (as in real full .gef files, e.g. GSE315416 bin50/bin100)
 BIN2_ROWS = [("G1", 0, 0, 99), ("G1", 2, 2, 1), ("G2", 4, 4, 2)]
 
 
 def _compound(
-    rows: list[tuple[str, int, int, int]], genes: list[str], xy: str, count: str, gene_dtype: str
+    rows: list[tuple[str, int, int, int]],
+    genes: list[str],
+    xy: str,
+    count: str,
+    gene_dtype: str,
+    row_order: list[str] | None = None,
 ) -> tuple[np.ndarray, np.ndarray]:
-    ordered = [r for g in genes for r in rows if r[0] == g]
+    layout = row_order or genes
+    ordered = [r for g in layout for r in rows if r[0] == g]
     exp = np.zeros(len(ordered), dtype=[("x", xy), ("y", xy), ("count", count)])
     for i, (_, x, y, c) in enumerate(ordered):
         exp[i] = (x, y, c)
     gene = np.zeros(len(genes), dtype=[("gene", gene_dtype), ("offset", "<u4"), ("count", "<u4")])
-    offset = 0
+    offset = {}
+    pos = 0
+    for g in layout:
+        offset[g] = pos
+        pos += sum(r[0] == g for r in rows)
     for i, g in enumerate(genes):
         n = sum(r[0] == g for r in rows)
-        gene[i] = (g.encode(), offset if n else 0, n)
-        offset += n
+        gene[i] = (g.encode(), offset.get(g, 0) if n else 0, n)
     return exp, gene
 
 
@@ -319,6 +329,7 @@ def write_tissue_gef(
     gene_dtype: str = "S64",
     pre_count_dtype: str = "u1",
     extras: bool = False,
+    row_order: list[str] | None = None,
 ) -> Path:
     """Write a synthetic tissue/full GEF; ``rows`` are ``(gene, x, y, count)``."""
     with h5py.File(path, "w") as f:
@@ -326,11 +337,12 @@ def write_tissue_gef(
             f.attrs[k] = v
         groups = {1: (rows, "u1")} | {b: (r, pre_count_dtype) for b, r in (precomputed or {}).items()}
         for b, (r, count_dtype) in groups.items():
-            exp, gene = _compound(r, genes, xy_dtype, count_dtype, gene_dtype)
+            exp, gene = _compound(r, genes, xy_dtype, count_dtype, gene_dtype, row_order if b == 1 else None)
             g = f.create_group(f"geneExp/bin{b}")
             e = g.create_dataset("expression", data=exp)
-            e.attrs["minX"], e.attrs["maxX"] = int(exp["x"].min()), int(exp["x"].max())
-            e.attrs["minY"], e.attrs["maxY"] = int(exp["y"].min()), int(exp["y"].max())
+            if len(exp):
+                e.attrs["minX"], e.attrs["maxX"] = int(exp["x"].min()), int(exp["x"].max())
+                e.attrs["minY"], e.attrs["maxY"] = int(exp["y"].min()), int(exp["y"].max())
             if b == 1:
                 for k, v in (exp_attrs or {}).items():
                     e.attrs[k] = v
@@ -472,3 +484,25 @@ def test_gef_rejections(tmp_path: Path) -> None:
         f.create_group("something")
     with pytest.raises(ValueError, match="GEF"):
         stereoseq_gef(gef=other)
+
+
+def test_zero_count_gene_and_nonmonotone_offsets(tmp_path: Path) -> None:
+    genes = ["G1", "G0", "G2", "G3"]  # G0 has no rows; rows are laid out G3, G2, G1 (offsets decrease)
+    path = write_tissue_gef(
+        tmp_path / "o.tissue.gef", BIN1_ROWS, genes, {"resolution": [500]}, row_order=["G3", "G2", "G1"]
+    )
+    table, _, _, _ = _bins(path, 2, chunk_rows=3)
+    assert list(table.var_names) == genes
+    np.testing.assert_array_equal(table.X.toarray(), [[3, 0, 3, 7], [4, 0, 0, 0], [0, 0, 5, 0], [1, 0, 0, 0]])
+
+
+def test_empty_expression_raises(tmp_path: Path) -> None:
+    path = write_tissue_gef(tmp_path / "z.tissue.gef", [], ["G1"], {"resolution": [500]})
+    with pytest.raises(ValueError, match="no rows"):
+        _bins(path, 2)
+
+
+def test_negative_coordinates_raise(tmp_path: Path) -> None:
+    path = write_tissue_gef(tmp_path / "n.tissue.gef", [("G1", -1, 0, 1)], ["G1"], {"resolution": [500]})
+    with pytest.raises(ValueError, match="Negative"):
+        _bins(path, 2)
