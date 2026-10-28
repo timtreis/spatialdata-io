@@ -296,30 +296,37 @@ def _read_expr_mat_polars(
     lf = lf.with_columns(
         (pl.col("fov").cast(pl.Utf8) + "_" + pl.col("cell_ID").cast(pl.Utf8)).alias("fov_cellID")
     ).select(["fov", "cell_ID", "fov_cellID", *meta_cols, *expr_cols])
-    pdf = lf.collect().to_pandas()
 
-    # Separate background rows (cell_ID=0) before building the AnnData.
-    bg_mask = pdf["cell_ID"] == 0
+    # Stream the file in row batches and keep only the sparse X: a dense whole-transcriptome exprMat (~19k genes)
+    # is tens of GB per copy. Background rows (cell_ID=0) are split off per batch.
+    obs_cols = ["fov", "cell_ID", "fov_cellID", *meta_cols]
+    obs_parts, bg_parts, x_parts = [lf.clear().collect().select(obs_cols)], [], []
+    for batch in lf.collect_batches(chunk_size=_EXPR_BATCH_ROWS):
+        is_bg = batch["cell_ID"] == 0
+        if is_bg.any():
+            bg_parts.append(batch.filter(is_bg).select(["fov", *expr_cols]))
+            batch = batch.filter(~is_bg)
+        obs_parts.append(batch.select(obs_cols))
+        x_parts.append(scipy.sparse.csr_matrix(batch.select(expr_cols).to_numpy()))
+
     bg_df: pd.DataFrame | None = None
-    if bg_mask.any():
-        bg_rows = pdf.loc[bg_mask]
-        bg_df = bg_rows.set_index("fov")[expr_cols]
+    if bg_parts:
+        bg_df = pl.concat(bg_parts).to_pandas().set_index("fov")
         bg_df.index = bg_df.index.astype(int)
-        bg_df.index.name = "fov"
         logger.info(
             "Filtered %d background row(s) (cell_ID=0) from expression matrix across %d FOV(s).",
             len(bg_df),
             bg_df.index.nunique(),
         )
-        pdf = pdf.loc[~bg_mask]
 
-    obs = pdf[["fov", "cell_ID", "fov_cellID", *meta_cols]].set_index("fov_cellID", verify_integrity=True)  # type: ignore[call-overload]  # verify_integrity is deprecated in pandas 3, dropped from the stubs
-    X = scipy.sparse.csr_matrix(pdf[expr_cols].values)
+    obs = pl.concat(obs_parts).to_pandas().set_index("fov_cellID", verify_integrity=True)  # type: ignore[call-overload]  # verify_integrity is deprecated in pandas 3, dropped from the stubs
+    X = scipy.sparse.vstack(x_parts, format="csr") if x_parts else scipy.sparse.csr_matrix((0, len(expr_cols)))
     var = pd.DataFrame({"gene": expr_cols}).set_index("gene")
 
     return AnnData(X=X, obs=obs, var=var), bg_df
 
 
+_EXPR_BATCH_ROWS = 10_000  # dense batch of ~1.5 GB for 19k int64 genes
 _ATOMX_CELL_ID = r"^c_\d+_(\d+)_(\d+)$"  # c_<slide>_<fov>_<cell>
 
 
@@ -724,7 +731,9 @@ def _parquet_cache_for_tx(
 
 
 def _maybe_warn_big_file(src: Path, *, threshold_gb: float = 1.0) -> bool:
-    size_gb = src.stat().st_size / 1_073_741_824
+    # gzip packs CosMx transcript CSVs ~8x (GSM9843767: 0.88 GiB .gz, 92.7M rows, 37 GB as pandas), so compare the
+    # estimated CSV size.
+    size_gb = src.stat().st_size * (8 if src.suffix == ".gz" else 1) / 1_073_741_824
     if size_gb > threshold_gb:
         return True
     return False

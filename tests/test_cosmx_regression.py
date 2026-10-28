@@ -1730,6 +1730,15 @@ class TestImageNormalizationEndToEnd:
             _read(sdio, fixture_lowsig, fovs=[1], image_normalization_percentile=150.0)
 
 
+def test_big_tx_threshold_uses_uncompressed_estimate(tmp_path):
+    from spatialdata_io.readers.cosmx._io import _maybe_warn_big_file
+
+    gz, csv = tmp_path / "a_tx_file.csv.gz", tmp_path / "a_tx_file.csv"
+    for f in (gz, csv):
+        f.write_bytes(b"0" * 200_000)
+    assert _maybe_warn_big_file(gz, threshold_gb=0.001) and not _maybe_warn_big_file(csv, threshold_gb=0.001)
+
+
 class TestExprMatMetadataColumns:
     """Non-gene columns in exprMat files go to obs, not X (AtoMx ``cell`` column, R-exported GEO files)."""
 
@@ -1745,6 +1754,21 @@ class TestExprMatMetadataColumns:
         assert adata.obs["cell"].tolist() == ["c_1_1_1"]
         assert adata.X.toarray().tolist() == [[4]]
         assert bg.columns.tolist() == ["GENE1"]
+
+    def test_batched_read_matches_single_batch(self, tmp_path, monkeypatch):
+        from spatialdata_io.readers.cosmx import _io
+
+        # background rows (cell_ID 0) inside and across batches; the X blocks must stack in file order
+        p = tmp_path / "x_exprMat_file.csv"
+        pd.DataFrame(
+            {"fov": [1, 1, 1, 2, 2], "cell_ID": [0, 1, 2, 0, 1], "G1": [9, 0, 3, 8, 1], "G2": [7, 5, 0, 6, 2]}
+        ).to_csv(p, index=False)
+        full, full_bg = _io._read_expr_mat_polars(p)
+        monkeypatch.setattr(_io, "_EXPR_BATCH_ROWS", 2)
+        adata, bg = _io._read_expr_mat_polars(p)
+        assert adata.obs_names.tolist() == full.obs_names.tolist() == ["1_1", "1_2", "2_1"]
+        assert adata.X.toarray().tolist() == full.X.toarray().tolist() == [[0, 5], [3, 0], [1, 2]]
+        assert bg.equals(full_bg) and bg.loc[2].tolist() == [8, 6]
 
     def test_r_exported_rownames_and_metadata(self, tmp_path):
         from spatialdata_io.readers.cosmx._io import _read_expr_mat_polars
