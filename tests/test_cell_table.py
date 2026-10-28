@@ -3,6 +3,7 @@ from __future__ import annotations
 import gzip
 import logging
 from pathlib import Path
+from typing import Any
 
 import anndata as ad
 import numpy as np
@@ -31,7 +32,7 @@ def _write(path: Path, rows: list[str] = ROWS, header: str = HEADER, junk: bool 
     return path
 
 
-def _dense(X: object) -> np.ndarray:
+def _dense(X: Any) -> np.ndarray:
     return sp.csr_matrix(X).toarray()
 
 
@@ -501,7 +502,7 @@ def test_mtx_barcodes_leading_zero(tmp_path: Path) -> None:
 def _h5ad(
     path: Path,
     X: np.ndarray | None = None,
-    obs_cols: dict[str, list[float]] | None = None,
+    obs_cols: dict[str, Any] | None = None,
     obsm: dict[str, np.ndarray] | None = None,
     layers: dict[str, np.ndarray] | None = None,
     raw: tuple[np.ndarray, list[str]] | None = None,
@@ -539,7 +540,7 @@ def test_h5ad_obsm_spatial(tmp_path: Path) -> None:
     assert uns["y"] == "obsm:spatial[1]"
     assert list(sdata["cells"].geometry.x) == [1.0, 2.0]
     assert list(sdata["cells"].geometry.y) == [3.0, 4.0]
-    assert "spatial" not in sdata["table"].obsm
+    np.testing.assert_array_equal(sdata["table"].obsm["spatial"], [[1.0, 3.0], [2.0, 4.0]])
     sdata.write(tmp_path / "out.zarr")
     back = SpatialData.read(tmp_path / "out.zarr")
     assert back["table"].uns["spatialdata_io"]["coordinates"]["x"] == "obsm:spatial[0]"
@@ -659,3 +660,99 @@ def test_wide_nan_count_rejected(tmp_path: Path) -> None:
     rows = [ROWS[0].replace(",1,2,0", ",1,,0"), *ROWS[1:]]
     with pytest.raises(ValueError, match="GeneB.*metadata_columns"):
         cell_table(_write(tmp_path / "n.csv", rows), unit="um")
+
+
+def test_obsm_spatial_holds_raw_coordinates(csv: Path) -> None:
+    table = cell_table(csv, unit="mm")["table"]
+    np.testing.assert_array_equal(table.obsm["spatial"], [[10.5, 20.5], [30.0, 40.0], [50.25, 60.75]])
+
+
+def test_h5ad_keeps_cell_id_and_region_columns(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(logger, "propagate", True)
+    f = _h5ad(
+        tmp_path / "a.h5ad",
+        obs_cols={"center_x": [1.0, 2.0], "center_y": [3.0, 4.0], "cell_id": ["u", "v"], "region": ["r1", "r2"]},
+    )
+    table = cell_table(f, unit="um")["table"]
+    assert list(table.obs["cell_id_original"]) == ["u", "v"]
+    assert list(table.obs["region_original"]) == ["r1", "r2"]
+    assert list(table.obs["cell_id"]) == [0, 1]
+    assert set(table.obs["region"]) == {"cells"}
+
+
+def test_wide_region_metadata_column_kept(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    f = _write(tmp_path / "r.csv", ["c1,north,1,2,3,4", "c2,south,5,6,7,8"], "id,region,center_x,center_y,GeneA,GeneB")
+    with caplog.at_level(logging.WARNING):
+        table = cell_table(f, unit="um", metadata_columns=["region"])["table"]
+    assert list(table.obs["region_original"]) == ["north", "south"]
+    assert set(table.obs["region"]) == {"cells"}
+    assert "region_original" in caplog.text
+
+
+def test_nan_coordinates_rejected(tmp_path: Path) -> None:
+    rows = [ROWS[0].replace(",10.5,", ",,"), *ROWS[1:]]
+    with pytest.raises(ValueError, match="1 .*NaN"):
+        cell_table(_write(tmp_path / "n.csv", rows), unit="um")
+
+
+@pytest.mark.parametrize("bad", ["", "0", "-5"])
+def test_bad_volume_for_radius_rejected(tmp_path: Path, bad: str) -> None:
+    rows = [ROWS[0].replace(",523.6,", f",{bad},"), *ROWS[1:]]
+    with pytest.raises(ValueError, match=r"volume.*cell_radius"):
+        cell_table(_write(tmp_path / "v.csv", rows), unit="um")
+    sdata = cell_table(_write(tmp_path / "v.csv", rows), unit="um", cell_radius=5.0)
+    assert sdata["table"].n_obs == 3
+
+
+def test_h5ad_only_one_coordinate_column_rejected(tmp_path: Path) -> None:
+    f = _h5ad(
+        tmp_path / "a.h5ad", obs_cols={"center_x": [1.0, 2.0]}, obsm={"spatial": np.array([[1.0, 3.0], [2.0, 4.0]])}
+    )
+    with pytest.raises(ValueError, match="center_y"):
+        cell_table(f, unit="um")
+
+
+def test_h5ad_obs_coordinates_win_over_obsm(tmp_path: Path) -> None:
+    f = _h5ad(
+        tmp_path / "a.h5ad",
+        obs_cols={"center_x": [1.0, 2.0], "center_y": [3.0, 4.0]},
+        obsm={"spatial": np.array([[9.0, 9.0], [9.0, 9.0]])},
+    )
+    sdata = cell_table(f, unit="um")
+    assert list(sdata["cells"].geometry.x) == [1.0, 2.0]
+    assert sdata["table"].uns["spatialdata_io"]["coordinates"]["x"] == "center_x"
+
+
+def test_ignored_kwargs_rejected(csv: Path, tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="layer"):
+        cell_table(csv, unit="um", layer="counts")
+    counts, coords, _ = _split_files(tmp_path)
+    with pytest.raises(ValueError, match="metadata_columns"):
+        cell_table(counts, coords, unit="um", x="X", y="Y", cell_id="cells", metadata_columns=["area"])
+
+
+def test_h5ad_keeps_var_columns(tmp_path: Path) -> None:
+    f = _h5ad(tmp_path / "a.h5ad", obs_cols={"center_x": [1.0, 2.0], "center_y": [3.0, 4.0]})
+    adata = ad.read_h5ad(f)
+    adata.var["symbol"] = ["A", "B", "C"]
+    adata.write_h5ad(f)
+    table = cell_table(f, unit="um")["table"]
+    assert list(table.var["symbol"]) == ["A", "B"]
+    f = _h5ad(
+        tmp_path / "b.h5ad",
+        obs_cols={"center_x": [1.0, 2.0], "center_y": [3.0, 4.0]},
+        raw=(np.array([[5, 6, 0], [7, 0, 8]]), ["r1", "r2", "r3"]),
+    )
+    adata = ad.read_h5ad(f)
+    assert adata.raw is not None
+    raw = ad.AnnData(
+        X=adata.raw.X, var=adata.raw.var.assign(symbol=["a", "b", "c"]), obs=pd.DataFrame(index=adata.obs_names)
+    )
+    adata.raw = raw
+    adata.write_h5ad(f)
+    assert list(cell_table(f, unit="um", layer="raw")["table"].var["symbol"]) == ["a", "b", "c"]
+
+
+def test_split_sanitized_prefix(tmp_path: Path) -> None:
+    sdata = cell_table(_split_csv(tmp_path, ["s 1", "s2"], ids=["c1", "c1"]), unit="um", split_by="sample")
+    assert set(sdata["table"].obs.index) == {"s_1_c1", "s2_c1"}

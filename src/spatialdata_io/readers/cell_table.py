@@ -70,15 +70,25 @@ def _transformation(unit: str, pixel_size: float | None) -> tuple[BaseTransforma
     return Scale([factor, factor], axes=("x", "y")), factor
 
 
+def _positive(obs: pd.DataFrame, column: str) -> np.ndarray:
+    values = obs[column].to_numpy(dtype=float)
+    if not np.all(values > 0):  # also catches NaN
+        raise ValueError(
+            f"Column {column!r} has missing or non-positive values, so no cell radius can be derived from it; "
+            "pass cell_radius."
+        )
+    return values
+
+
 def _resolve_radius(obs: pd.DataFrame, unit: str, cell_radius: float | None) -> tuple[str, float | np.ndarray]:
     if cell_radius is not None:
         return "stated", float(cell_radius)
     if unit == "um":
         if "volume" in obs.columns:
-            volume = obs["volume"].to_numpy(dtype=float)
+            volume = _positive(obs, "volume")
             return "derived:volume", np.cbrt(3 * volume / (4 * np.pi))
         if "area" in obs.columns:
-            area = obs["area"].to_numpy(dtype=float)
+            area = _positive(obs, "area")
             return "derived:area", np.sqrt(area / np.pi)
     return "default", _DEFAULT_RADIUS_UM
 
@@ -96,6 +106,7 @@ def _build(
     cell_radius: float | None,
     n_coordinates_unmatched: int,
     coordinate_labels: tuple[str, str] | None = None,
+    var: pd.DataFrame | None = None,
 ) -> SpatialData:
     """Validate counts and assemble the SpatialData object.
 
@@ -113,10 +124,16 @@ def _build(
         Number of coordinate rows dropped because they have no counts; recorded in ``uns``.
     coordinate_labels
         Names recorded in ``uns`` for ``x`` and ``y`` instead of the column names (e.g. for ``obsm`` sources).
+    var
+        Per-gene metadata indexed by ``var_names`` (e.g. from an h5ad file); gene rows are kept in ``table.var``.
     """
     for col in (x, y):
         if col not in obs.columns:
             raise ValueError(f"Coordinate column {col!r} not found; available columns: {list(obs.columns)[:10]}.")
+
+    n_nan = int(obs[[x, y]].isna().to_numpy().any(axis=1).sum())
+    if n_nan:
+        raise ValueError(f"{n_nan} cells have NaN (missing) coordinates in columns {x!r} / {y!r}.")
 
     # Element name per cell; ids only need to be unique within a split.
     region_of = np.full(len(obs), "cells", dtype=object)
@@ -142,6 +159,10 @@ def _build(
             dup = ids[ids.duplicated()].unique()[:5].tolist()
             raise ValueError(f"Found duplicate cell ids, for example {dup}.")
     obs = obs.copy()
+    for col in (_INSTANCE_KEY, _REGION_KEY):
+        if col in obs.columns:
+            logger.warning(f"Column {col!r} in the input is reserved by cell_table(); renamed to '{col}_original'.")
+            obs = obs.rename(columns={col: f"{col}_original"})
     if not obs.index.is_unique:  # same id in several splits: keep AnnData's index unique
         prefix = region_of.astype(str)
         obs.index = pd.Index([f"{r[len('cells_') :]}_{i}" for r, i in zip(prefix, obs.index, strict=True)])
@@ -149,7 +170,7 @@ def _build(
             dup = obs.index[obs.index.duplicated()].unique()[:5].tolist()
             raise ValueError(f"Cell ids are not unique after prefixing them with the split value, for example {dup}.")
 
-    csr = sp.csr_matrix(X.to_numpy() if isinstance(X, pd.DataFrame) else X)
+    csr = sp.csr_matrix(cast("Any", X.to_numpy() if isinstance(X, pd.DataFrame) else X))
     if not np.all(np.mod(csr.data, 1) == 0):
         raise ValueError(
             "Found non-integer values in the counts; this looks like a normalized matrix. "
@@ -164,7 +185,9 @@ def _build(
     transformation, factor = _transformation(unit, pixel_size)
     source, radius_um = _resolve_radius(obs, unit, cell_radius)
 
-    adata = ad.AnnData(X=genes, obs=obs, var=pd.DataFrame(index=var_names[is_gene]))
+    var_frame = var.loc[is_gene] if var is not None else pd.DataFrame(index=var_names[is_gene])
+    adata = ad.AnnData(X=genes, obs=obs, var=var_frame)
+    adata.obsm["spatial"] = obs[[x, y]].to_numpy(dtype=float)
     adata.obsm["blank"] = blank
 
     adata.obs[_REGION_KEY] = pd.Categorical(region_of)
@@ -394,7 +417,7 @@ _OBSM_COORDINATE_KEYS = ("spatial", "X_spatial")
 
 def _read_h5ad(
     path: Path, *, layer: str | None, coordinates: Path | None, cell_id: str | None, x: str, y: str, skiprows: int
-) -> tuple[sp.spmatrix, pd.Index, pd.DataFrame, int, str, str, dict[str, str]]:
+) -> tuple[sp.spmatrix, pd.DataFrame, pd.DataFrame, int, str, str, dict[str, str]]:
     """Read counts, ``obs`` and a coordinate source from an h5ad file.
 
     Only ``obs`` is kept; ``obsm`` is used solely as a coordinate source (``spatial`` or ``X_spatial``)
@@ -402,18 +425,19 @@ def _read_h5ad(
 
     Returns
     -------
-    The counts, gene names, ``obs``, the number of unmatched coordinate rows, the ``x`` / ``y`` column names and
+    The counts, ``var`` (indexed by gene name), ``obs``, the number of unmatched coordinate rows, the ``x`` / ``y`` column names and
     the labels to record in ``uns`` for columns taken from ``obsm``.
     """
     adata = ad.read_h5ad(path)
+    var: pd.DataFrame
     if layer is None:
-        X, var_names = adata.X, adata.var_names
+        X, var = adata.X, cast("Any", adata.var)
     elif layer == "raw":
         if adata.raw is None:
             raise ValueError(f"{path.name} has no .raw; set layer to None or one of {list(adata.layers.keys())}.")
-        X, var_names = adata.raw.X, adata.raw.var_names
+        X, var = adata.raw.X, cast("Any", adata.raw.var)
     elif layer in adata.layers:
-        X, var_names = adata.layers[layer], adata.var_names
+        X, var = adata.layers[layer], cast("Any", adata.var)
     else:
         raise ValueError(
             f"Layer {layer!r} not found in {path.name}; available layers: {list(adata.layers.keys())} "
@@ -422,6 +446,8 @@ def _read_h5ad(
     if X is None:
         raise ValueError(f"{path.name} has no counts matrix for layer={layer!r}.")
     X = sp.csr_matrix(cast("Any", X))
+    var = var.copy()
+    var.index = pd.Index(var.index.astype(str))
     obs: pd.DataFrame = cast("Any", adata.obs).copy()
     obs.index = pd.Index(obs.index.astype(str))
 
@@ -431,7 +457,12 @@ def _read_h5ad(
         coords = _read_coordinates(coordinates, cell_id=cell_id, skiprows=skiprows)
         joined, n_unmatched = _join_coordinates(obs.index, coords, path.name, coordinates.name)
         obs = pd.concat([obs.drop(columns=joined.columns.intersection(obs.columns)), joined], axis=1)
-    elif x not in obs.columns or y not in obs.columns:
+    elif (x in obs.columns) != (y in obs.columns):
+        raise ValueError(
+            f"Only one of the coordinate columns {x!r} / {y!r} is in obs of {path.name}; "
+            f"available obs columns: {list(obs.columns)[:10]}."
+        )
+    elif x not in obs.columns:
         key = next((k for k in _OBSM_COORDINATE_KEYS if k in adata.obsm), None)
         if key is None:
             raise ValueError(
@@ -442,7 +473,7 @@ def _read_h5ad(
         x, y = f"obsm_{key}_0", f"obsm_{key}_1"  # obs column names must be alphanumeric/underscore
         obs[x], obs[y] = xy[:, 0], xy[:, 1]
         labels = {x: f"obsm:{key}[0]", y: f"obsm:{key}[1]"}
-    return X, pd.Index(var_names.astype(str)), obs, n_unmatched, x, y, labels
+    return X, var, obs, n_unmatched, x, y, labels
 
 
 def cell_table(
@@ -537,8 +568,15 @@ def cell_table(
     n_unmatched = 0
     labels: dict[str, str] = {}
     genes: pd.DataFrame | sp.spmatrix
+    var: pd.DataFrame | None = None
+    if layer is not None and not name.endswith(".h5ad"):
+        raise ValueError(f"layer={layer!r} only applies to .h5ad input, not {counts.name}.")
+    if metadata_columns is not None and coordinates is not None:
+        raise ValueError(
+            "metadata_columns only applies to a wide counts file; with coordinates, all its columns go to obs."
+        )
     if name.endswith(".h5ad"):
-        genes, var_names, obs, n_unmatched, x, y, labels = _read_h5ad(
+        genes, var, obs, n_unmatched, x, y, labels = _read_h5ad(
             counts,
             layer=layer,
             coordinates=Path(coordinates) if coordinates is not None else None,
@@ -563,6 +601,8 @@ def cell_table(
             metadata_columns=metadata_columns,
             skiprows=skiprows,
         )
+    if var is not None:
+        var_names = var.index
     logger.info(f"Read {len(obs)} cells x {len(var_names)} columns from {counts.name}.")
     sdata = _build(
         genes,
@@ -576,5 +616,6 @@ def cell_table(
         cell_radius=cell_radius,
         n_coordinates_unmatched=n_unmatched,
         coordinate_labels=(labels[x], labels[y]) if labels else None,
+        var=var,
     )
     return sdata
