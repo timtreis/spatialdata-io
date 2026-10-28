@@ -351,6 +351,8 @@ def stereoseq(
 
 _GEF_PLATFORM_RESOLUTION_NM = 500
 _GEF_BORDER_PAD = 32767
+_GEOMETRY_COLLECTION = 7
+_POLYGONAL = (3, 6)  # shapely type ids of Polygon, MultiPolygon
 
 
 def _gef_attr(obj: h5py.HLObject, key: str, default: Any = None) -> Any:
@@ -489,7 +491,7 @@ def _read_cells(
     n_fallback = int(is_fallback.sum())
     if n_fallback:
         logger.warning(
-            f"{n_fallback} of {n} cells have a degenerate border (fewer than 3 distinct points); "
+            f"{n_fallback} cells had fewer than 3 distinct border points or no valid polygon; "
             "using a fallback square of the cell area centred on the cell."
         )
     gdf = GeoDataFrame(geometry=geoms, index=pd.Index(cell_ids))
@@ -518,15 +520,125 @@ def _cell_polygons(
             polys = shapely.make_valid(shapely.polygons(pts[good]))
             geoms[rows[good]] = polys
             ok[rows[good]] = True
-    # make_valid can return lines or collections; those cells fall back as well
-    for i in np.flatnonzero(ok):
-        if geoms[i].geom_type not in ("Polygon", "MultiPolygon"):
+    # make_valid can return lines or collections: keep the polygonal part, else the cell falls back
+    type_id = shapely.get_type_id(geoms[ok])
+    for i in np.flatnonzero(ok)[type_id == _GEOMETRY_COLLECTION]:
+        parts = [p for p in shapely.get_parts(geoms[i]) if p.geom_type in ("Polygon", "MultiPolygon")]
+        if parts:
+            geoms[i] = shapely.union_all(parts)
+        else:
             ok[i] = False
+    ok[np.flatnonzero(ok)[~np.isin(shapely.get_type_id(geoms[ok]), _POLYGONAL)]] = False
     bad = ~ok
     if bad.any():
         half = np.sqrt(np.where(area[bad] > 0, area[bad], 1).astype(np.float64)) / 2
         geoms[bad] = shapely.box(cx[bad] - half, cy[bad] - half, cx[bad] + half, cy[bad] + half)
     return geoms, bad
+
+
+def _bin_chunks(
+    expression: h5py.Dataset, gene: np.ndarray, bin_size: int, chunk_rows: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Stream a GEF ``expression`` dataset and aggregate it to square bins.
+
+    Rows are read ``chunk_rows`` at a time; a gene's rows are ``expression[offset : offset + count]``. Within each
+    chunk duplicate (bin, gene) entries are summed before being kept, so memory follows the number of occupied bins.
+
+    Returns
+    -------
+    COO triplets ``(bin key, gene index, count)`` where ``key = (y // bin_size) << 32 | (x // bin_size)``.
+    """
+    populated = np.flatnonzero(gene["count"] > 0)
+    order = populated[np.argsort(gene["offset"][populated], kind="stable")]
+    starts = gene["offset"][order].astype(np.int64)
+    ends = starts + gene["count"][order].astype(np.int64)
+    n_rows = expression.shape[0]
+    keys: list[np.ndarray] = []
+    genes: list[np.ndarray] = []
+    counts: list[np.ndarray] = []
+    for lo in range(0, n_rows, chunk_rows):
+        hi = min(lo + chunk_rows, n_rows)
+        chunk = expression[lo:hi]
+        rows = np.arange(lo, hi, dtype=np.int64)
+        slot = np.searchsorted(starts, rows, side="right") - 1
+        covered = (slot >= 0) & (rows < ends[np.maximum(slot, 0)])
+        key = ((chunk["y"].astype(np.int64) // bin_size) << 32) | (chunk["x"].astype(np.int64) // bin_size)
+        uniq, inv = np.unique(key[covered], return_inverse=True)
+        m = coo_matrix(
+            (chunk["count"][covered].astype(np.int64), (inv, order[slot[covered]])), shape=(len(uniq), len(gene))
+        ).tocoo()
+        m.sum_duplicates()
+        keys.append(uniq[m.row])
+        genes.append(m.col.astype(np.int32))
+        counts.append(m.data)
+    if not keys:
+        return np.empty(0, np.int64), np.empty(0, np.int32), np.empty(0, np.int64)
+    return np.concatenate(keys), np.concatenate(genes), np.concatenate(counts)
+
+
+def _read_bins(
+    f: h5py.File,
+    *,
+    bin_size: int,
+    dataset_id: str,
+    transform: Mapping[str, BaseTransformation],
+    chunk_rows: int = 2**24,
+    resolution_nm: int | None = None,
+) -> tuple[ad.AnnData, GeoDataFrame, str, str]:
+    """Read square bins from a tissue or full GEF file.
+
+    Uses the precomputed ``geneExp/bin{bin_size}`` group when present (``bin_size > 1``), otherwise aggregates
+    ``geneExp/bin1`` on the fly, streaming ``chunk_rows`` expression rows at a time.
+
+    Parameters
+    ----------
+    f
+        Open GEF file with a ``geneExp/bin1`` group.
+    bin_size
+        Bin size in DNB.
+    dataset_id
+        Used to name the region the table annotates, ``{dataset_id}_{bin name}``.
+    transform
+        Transformations (coordinate system to transformation) attached to the shapes.
+    chunk_rows
+        Maximum number of expression rows held in memory at once.
+    resolution_nm
+        DNB pitch used for the bin name. Read from the file header if not given.
+
+    Returns
+    -------
+    The unparsed table (with ``bin_id`` and ``region`` in ``obs``), the parsed square shapes with the same index as
+    ``bin_id``, the file kind (``"full"`` or ``"bin1_only"``) and the bin source (``"precomputed"`` or
+    ``"aggregated_from_bin1"``). Only non-empty bins are returned.
+    """
+    if "geneExp/bin1" not in f:
+        raise ValueError(f"{f.filename} has no `geneExp/bin1` group; it is not a tissue or full GEF file.")
+    if resolution_nm is None:
+        resolution_nm = _resolution_nm(f)[0]
+    gef_kind = "full" if any(f"geneExp/bin{n}" in f for n in range(2, 501)) else "bin1_only"
+    precomputed = bin_size > 1 and f"geneExp/bin{bin_size}" in f
+    group = f[f"geneExp/bin{bin_size if precomputed else 1}"]
+    gene = group["gene"][:]
+    var_names = np.char.decode(gene["gene"], "utf-8")
+    key, gene_idx, count = _bin_chunks(group["expression"], gene, bin_size, chunk_rows)
+
+    bins, inv = np.unique(key, return_inverse=True)
+    n = len(bins)
+    dtype = np.int32 if count.size == 0 or count.max() <= np.iinfo(np.int32).max else np.int64
+    x_mat = coo_matrix((count, (inv, gene_idx)), shape=(n, len(gene))).tocsr().astype(dtype)
+
+    region = f"{dataset_id}_{_bin_name(bin_size, resolution_nm)}"
+    bin_id = np.arange(n, dtype=np.int64)
+    obs = pd.DataFrame(index=pd.Index(bin_id.astype(str)))
+    obs["bin_id"] = bin_id
+    obs["region"] = pd.Categorical([region] * n)
+    adata = ad.AnnData(X=x_mat, obs=obs, var=pd.DataFrame(index=pd.Index(var_names.astype(str))))
+
+    cx = ((bins & 0xFFFFFFFF) * bin_size).astype(np.float64)
+    cy = ((bins >> 32) * bin_size).astype(np.float64)
+    gdf = GeoDataFrame(geometry=shapely.box(cx, cy, cx + bin_size, cy + bin_size), index=pd.Index(bin_id))
+    squares = ShapesModel.parse(gdf, transformations=dict(transform))
+    return adata, squares, gef_kind, "precomputed" if precomputed else "aggregated_from_bin1"
 
 
 def stereoseq_gef(
@@ -541,7 +653,7 @@ def stereoseq_gef(
     Parameters
     ----------
     gef
-        Path to a ``tissue.gef`` or full ``.gef`` file (square bins). Not supported yet.
+        Path to a ``tissue.gef`` or full ``.gef`` file (square bins).
     cellbin_gef
         Path to a ``cellbin.gef`` file (segmented cells).
     bin_size
@@ -563,36 +675,44 @@ def stereoseq_gef(
         raise ValueError("Provide at least one of `gef` or `cellbin_gef`.")
     if isinstance(bin_size, bool) or not isinstance(bin_size, int | np.integer) or bin_size <= 0:
         raise ValueError(f"`bin_size` must be a positive integer, got {bin_size!r}.")
-    if gef is not None:
-        raise NotImplementedError("Reading `gef` is not implemented yet.")
-    assert cellbin_gef is not None
-    cellbin_gef = Path(cellbin_gef)
+    if gef is not None and cellbin_gef is not None:
+        raise NotImplementedError("Reading `gef` and `cellbin_gef` together is not implemented yet.")
+    source_file = gef if gef is not None else cellbin_gef
+    assert source_file is not None
+    path = Path(source_file)
     if dataset_id is None:
-        dataset_id = _default_dataset_id(cellbin_gef)
+        dataset_id = _default_dataset_id(path)
 
-    tables: dict[str, ad.AnnData] = {}
-    shapes: dict[str, GeoDataFrame] = {}
-    with h5py.File(cellbin_gef, "r") as f:
+    with h5py.File(path, "r") as f:
         if "geneExp" not in f and "cellBin" not in f:
-            raise ValueError(f"{cellbin_gef} is not a GEF file: it has neither `geneExp` nor `cellBin`.")
-        if "cellBin" not in f:
-            raise ValueError(f"`cellbin_gef` {cellbin_gef} has no `cellBin` group.")
+            raise ValueError(f"{path} is not a GEF file: it has neither `geneExp` nor `cellBin`.")
+        if gef is None and "cellBin" not in f:
+            raise ValueError(f"`cellbin_gef` {path} has no `cellBin` group.")
         resolution_nm, source = _resolution_nm(f)
         r = resolution_nm / 1000
         transform = {"global": Scale([r, r], axes=("x", "y"))}
-        adata, cell_shapes, n_fallback = _read_cells(f, dataset_id=dataset_id, transform=transform)
-
-    region = f"{dataset_id}_cell_boundaries"
-    adata.uns["spatialdata_io"] = {
-        "reader": "stereoseq_gef",
-        "resolution_nm": resolution_nm,
-        "resolution_source": source,
-        "bin_size_dnb": int(bin_size),
-        "bin_size_um": bin_size * resolution_nm / 1000,
-        "gef_kind": None,
-        "source_bins": None,
-        "n_cells_fallback_geometry": n_fallback,
-    }
-    tables["table"] = TableModel.parse(adata, region=region, region_key="region", instance_key="cell_id")
-    shapes[region] = cell_shapes
-    return _set_reader_metadata(SpatialData(tables=tables, shapes=shapes), "stereoseq_gef")
+        meta = {
+            "reader": "stereoseq_gef",
+            "resolution_nm": resolution_nm,
+            "resolution_source": source,
+            "bin_size_dnb": int(bin_size),
+            "bin_size_um": bin_size * resolution_nm / 1000,
+            "gef_kind": None,
+            "source_bins": None,
+            "n_cells_fallback_geometry": None,
+        }
+        if gef is None:
+            adata, cell_shapes, n_fallback = _read_cells(f, dataset_id=dataset_id, transform=transform)
+            adata.uns["spatialdata_io"] = meta | {"n_cells_fallback_geometry": n_fallback}
+            region = f"{dataset_id}_cell_boundaries"
+            table = TableModel.parse(adata, region=region, region_key="region", instance_key="cell_id")
+            return _set_reader_metadata(
+                SpatialData(tables={"table": table}, shapes={region: cell_shapes}), "stereoseq_gef"
+            )
+        adata, squares, gef_kind, source_bins = _read_bins(
+            f, bin_size=bin_size, dataset_id=dataset_id, transform=transform, resolution_nm=resolution_nm
+        )
+    adata.uns["spatialdata_io"] = meta | {"gef_kind": gef_kind, "source_bins": source_bins}
+    region = f"{dataset_id}_{_bin_name(bin_size, resolution_nm)}"
+    table = TableModel.parse(adata, region=region, region_key="region", instance_key="bin_id")
+    return _set_reader_metadata(SpatialData(tables={"table": table}, shapes={region: squares}), "stereoseq_gef")
