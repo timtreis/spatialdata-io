@@ -780,6 +780,25 @@ def stereoseq_gef(
     Geometries keep the raw DNB coordinates; the ``global`` coordinate system is in micrometres through a scale of
     ``resolution_nm / 1000``. The resolution comes from the GEF header and defaults to 500 nm (recorded as
     ``resolution_source="platform_default"`` in ``table.uns["spatialdata_io"]``) if no header states it.
+
+    Every table has ``obsm["spatial"]`` in raw DNB units (cell centre, or bin centre ``corner + bin_size / 2``).
+
+    - Cells table ``obs``: ``area``, ``dnbCount``, ``geneCount``, ``expCount``, ``clusterID``, ``cellTypeID``,
+      ``cell_id`` (instance key) and ``region``.
+    - Bins table ``obs``: ``bin_id`` (instance key), ``region``, and ``array_row`` / ``array_col``, the bin indices
+      ``y // bin_size`` and ``x // bin_size``.
+    - ``uns["spatialdata_io"]``: ``reader``, ``resolution_nm``, ``resolution_source``, ``bin_size_dnb``,
+      ``bin_size_um``, ``gef_kind`` (``"full"`` or ``"bin1_only"``, bins table only), ``source_bins``
+      (``"precomputed"`` or ``"aggregated_from_bin1"``, bins table only) and ``n_cells_fallback_geometry``
+      (cells table only). Fields that do not apply are ``None``.
+
+    Full ``.gef`` bins are not tissue-masked, unlike ``tissue.gef``, so they include off-tissue bins. If a precomputed
+    ``geneExp/bin{bin_size}`` group has coordinates that are not multiples of ``bin_size``, a warning is logged and
+    ``geneExp/bin1`` is aggregated instead.
+
+    The cell ``obs`` counters (``expCount``, ``area``, ...) are ``uint16`` in GEF and saturate at 65535; use
+    ``X.sum(1)`` for totals. ``bin_size=1`` on large chips is memory-heavy, and aggregation at small bin sizes
+    (1 and 5) is slow because the occupied bins are merged across chunks.
     """
     if gef is None and cellbin_gef is None:
         raise ValueError("Provide at least one of `gef` or `cellbin_gef`.")
