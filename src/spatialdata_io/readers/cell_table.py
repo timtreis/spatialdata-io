@@ -321,8 +321,9 @@ def _read_counts(
     ----------
     path
         Delimited file (either orientation, first column holds the row labels) or ``.mtx(.gz)``. For
-        ``.mtx`` the labels come from sibling files named ``{features,genes}`` and ``{barcodes,cells}``
-        with a ``.tsv``/``.txt``/``.csv`` suffix (optionally ``.gz``), or ``<stem>_feats`` and ``<stem>_obs``.
+        ``.mtx`` the labels come from sibling files named ``{features,genes}`` (``.tsv``/``.txt``/``.csv``) and
+        ``{barcodes,cells}`` (``.tsv``/``.txt``), optionally ``.gz`` and optionally behind the prefix of a
+        ``<prefix>matrix.mtx`` name, or ``<stem>_feats`` and ``<stem>_obs``.
     genes_as_rows
         Orientation; ``None`` infers it from the overlap of the axis labels with ``coord_ids``.
     coord_ids
@@ -430,8 +431,8 @@ def _read_h5ad(
 
     Returns
     -------
-    The counts, ``var`` (indexed by gene name), ``obs``, the number of unmatched coordinate rows, the ``x`` / ``y`` column names and
-    the labels to record in ``uns`` for columns taken from ``obsm``.
+    The counts, ``var`` (indexed by gene name), ``obs``, the number of unmatched coordinate rows, the ``x`` / ``y``
+    column names and the labels to record in ``uns`` for columns taken from ``obsm``.
     """
     adata = ad.read_h5ad(path)
     var: pd.DataFrame
@@ -499,17 +500,18 @@ def cell_table(
 ) -> SpatialData:
     """Read a cell x gene counts table with per-cell centroids.
 
-    Reads either a single wide delimited file holding the id, the centroids, optional metadata and one
-    column per gene (cells x genes), or a counts file (delimited in either orientation, or ``.mtx(.gz)``
-    with label files next to it) plus a separate ``coordinates`` file. The raw integer counts go to ``table.X``, columns whose
-    name contains ``blank`` (case-insensitive) go to ``table.obsm["blank"]``, and each cell becomes a
-    circle in the ``cells`` shapes element.
+    Reads a single wide delimited file holding the id, the centroids, optional metadata and one column per
+    gene (cells x genes); a counts file (delimited in either orientation, or ``.mtx(.gz)`` with label files
+    next to it) plus a separate ``coordinates`` file; or an ``.h5ad`` file. The raw integer counts go to
+    ``table.X`` (CSR), columns whose name contains ``blank`` (case-insensitive) go to ``table.obsm["blank"]``,
+    the deposited centroids to ``table.obsm["spatial"]``, and each cell becomes a circle in the ``cells``
+    shapes element.
 
     Parameters
     ----------
     counts
-        Path to a ``.csv``, ``.tsv`` or ``.txt`` file (``.gz`` allowed). The delimiter follows the
-        extension; ``.txt`` means tab.
+        Path to a ``.csv``, ``.tsv`` or ``.txt`` file (``.gz`` allowed), a ``.mtx(.gz)`` file (needs
+        ``coordinates``) or an ``.h5ad`` file. The delimiter follows the extension; ``.txt`` means tab.
     coordinates
         Separate delimited coordinates file with one row per cell. Its ``cell_id`` column is joined to
         the counts (ids compared as strings); all other columns go to ``obs``. Counts cells without
@@ -532,18 +534,22 @@ def cell_table(
     split_by
         Column splitting the cells into several shapes elements ``cells_<value>`` (characters other than
         letters, digits and ``_`` in the value become ``_``), all annotated by the single ``table``
-        (``region`` lists them). Cell ids need only be unique within a split; when an id repeats across splits
-        the ``table.obs`` index is prefixed with the split value.
+        (``region`` lists them). For a wide CSV or an h5ad file, cell ids need only be unique within a split;
+        when an id repeats across splits the ``table.obs`` index is prefixed with the split value. With a
+        ``coordinates`` file the ids must be globally unique.
     metadata_columns
         Non-gene columns, copied to ``obs``. Defaults to the Vizgen ``cell_metadata`` columns that are
-        present; ``x``, ``y`` and ``split_by`` are always included. All other columns are genes.
+        present; ``x``, ``y`` and ``split_by`` are always included. All other columns are genes and must be
+        numeric. Not allowed together with ``coordinates``.
     skiprows
         Number of leading lines to skip before the header (of each delimited file).
     layer
         Counts source of an h5ad file: ``None`` reads ``X``, ``"raw"`` reads ``.raw.X`` (with ``.raw.var``),
-        any other value reads ``layers[layer]``. There is no automatic fallback. Only ``obs`` is kept; ``obsm``
-        is used only as a coordinate source (``spatial`` or ``X_spatial``) when ``x`` / ``y`` are not in ``obs``
-        and no ``coordinates`` file is given, and the columns are then named ``obsm:<key>[0]`` and ``obsm:<key>[1]``.
+        any other value reads ``layers[layer]``. There is no automatic fallback. Only ``obs`` and ``var`` are
+        kept; ``obsm`` is used only as a coordinate source (``spatial`` or ``X_spatial``) when ``x`` / ``y`` are
+        not in ``obs`` and no ``coordinates`` file is given. The values are then added to ``obs`` as
+        ``obsm_<key>_0`` and ``obsm_<key>_1``, and recorded in ``uns`` as ``obsm:<key>[0]`` and ``obsm:<key>[1]``.
+        Only valid for ``.h5ad`` input.
     cell_radius
         Circle radius in µm. If ``None`` and ``unit="um"``, it is derived per cell from ``obs["volume"]``
         as the radius of the sphere of equal volume, ``(3V / 4π)^(1/3)``, or else from ``obs["area"]``
@@ -553,16 +559,20 @@ def cell_table(
 
     Returns
     -------
-    A :class:`spatialdata.SpatialData` with the table ``table`` (annotating the shapes ``cells``, or ``cells_<value>`` with ``split_by``;
-    ``region_key="region"``, ``instance_key="cell_id"``, an integer range equal to the shapes index; the
-    string cell id is ``table.obs.index``).
+    A :class:`spatialdata.SpatialData` with the table ``table`` (annotating the shapes ``cells``, or
+    ``cells_<value>`` with ``split_by``; ``region_key="region"``,
+    ``instance_key="cell_id"``, an integer range equal to the shapes index; the string cell id is
+    ``table.obs.index``).
 
     Raises
     ------
     ValueError
         If ``unit`` is invalid, ``unit="px"`` has no ``pixel_size``, the counts are not integral, cell ids
-        are duplicated, the id, ``x``, ``y`` or ``split_by`` columns are missing, ``split_by`` has missing values, or two
-        values map to the same element name.
+        are duplicated, the id, ``x``, ``y`` or ``split_by`` columns are missing, ``split_by`` has missing values,
+        two values map to the same element name, coordinates are NaN, a gene column is non-numeric or has missing
+        values, a derived radius is missing or non-positive, or ``layer`` / ``metadata_columns`` would be ignored.
+        Input columns named ``cell_id`` or ``region`` are renamed to ``cell_id_original`` / ``region_original``
+        with a warning.
     """
     if unit not in _UNITS:
         raise ValueError(f"unit must be one of {_UNITS}, got {unit!r}.")
