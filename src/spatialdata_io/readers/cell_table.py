@@ -42,8 +42,11 @@ _REGION_KEY = "region"
 _INSTANCE_KEY = "cell_id"
 
 
-def _read_delimited(path: str | Path, skiprows: int = 0) -> pd.DataFrame:
-    """Read a delimited text file; the delimiter follows the suffix (``.gz`` ignored)."""
+def _read_delimited(path: str | Path, skiprows: int = 0, **kwargs: Any) -> pd.DataFrame:
+    """Read a delimited text file; the delimiter follows the suffix (``.gz`` ignored).
+
+    Extra keyword arguments (e.g. ``dtype``, ``nrows``) go to :func:`pandas.read_csv`.
+    """
     path = Path(path)
     suffixes = [s.lower() for s in path.suffixes]
     if suffixes and suffixes[-1] == ".gz":
@@ -55,7 +58,7 @@ def _read_delimited(path: str | Path, skiprows: int = 0) -> pd.DataFrame:
         sep = "\t"
     else:
         raise ValueError(f"Unsupported file type {path.name!r}: expected .csv, .tsv or .txt (optionally .gz).")
-    return pd.read_csv(path, sep=sep, skiprows=skiprows)
+    return pd.read_csv(path, sep=sep, skiprows=skiprows, **kwargs)
 
 
 def _transformation(unit: str, pixel_size: float | None) -> tuple[BaseTransformation, float]:
@@ -179,8 +182,9 @@ def _read_wide(
     metadata_columns: Sequence[str] | None,
     skiprows: int,
 ) -> tuple[pd.DataFrame, pd.Index, pd.DataFrame]:
-    df = _read_delimited(counts, skiprows)
-    id_col = cell_id if cell_id is not None else df.columns[0]
+    header = _read_delimited(counts, skiprows, nrows=0).columns
+    id_col = cell_id if cell_id is not None else header[0]
+    df = _read_delimited(counts, skiprows, dtype={id_col: str} if id_col in header else None)
     required = [id_col, x, y] + ([split_by] if split_by is not None else [])
     for col in required:
         if col not in df.columns:
@@ -290,7 +294,7 @@ def _read_counts(
             )
         return (mat.T.tocsr(), feats, barcodes) if genes_as_rows else (mat, feats, barcodes)
 
-    df = _read_delimited(path, skiprows)
+    df = _read_delimited(path, skiprows, dtype={0: str})
     if isinstance(df.index, pd.RangeIndex):
         df = df.set_index(df.columns[0])
     df.index = df.index.astype(str)
@@ -302,10 +306,12 @@ def _read_counts(
 
 
 def _read_coordinates(path: Path, *, cell_id: str | None, skiprows: int) -> pd.DataFrame:
-    df = _read_delimited(path, skiprows)
-    id_col = cell_id if cell_id is not None else df.columns[0]
-    if id_col not in df.columns:
-        raise ValueError(f"Column {id_col!r} not found in {path.name}; available columns: {list(df.columns)[:10]}.")
+    header = _read_delimited(path, skiprows, nrows=0).columns
+    named = [c for c in header if not str(c).startswith("Unnamed:")]
+    id_col = cell_id if cell_id is not None else (named[0] if named else header[0])
+    if id_col not in header:
+        raise ValueError(f"Column {id_col!r} not found in {path.name}; available columns: {list(header)[:10]}.")
+    df = _read_delimited(path, skiprows, dtype={id_col: str})
     df = df.loc[:, [c for c in df.columns if c == id_col or not str(c).startswith("Unnamed:")]]
     df.index = pd.Index(df[id_col].astype(str))
     df = df.drop(columns=id_col)

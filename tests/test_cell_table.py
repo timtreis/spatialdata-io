@@ -300,10 +300,12 @@ def test_counts_cell_without_coords_rejected(tmp_path: Path) -> None:
     assert exc.value.args[0].count("'c") <= 5
 
 
-def test_extra_coord_rows_dropped(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+def test_extra_coord_rows_dropped(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
     from spatialdata._logging import logger
 
-    logger.propagate = True
+    monkeypatch.setattr(logger, "propagate", True)
     counts, coords, _ = _split_files(tmp_path, extra=1)
     with caplog.at_level(logging.WARNING):
         sdata = cell_table(counts, coords, unit="um", x="X", y="Y", cell_id="cells")
@@ -323,3 +325,39 @@ def test_coord_metadata_into_obs(tmp_path: Path) -> None:
     sdata = cell_table(counts, coords, unit="um", x="X", y="Y", cell_id="cells")
     assert "area" in sdata.tables["table"].obs.columns
     assert sdata.tables["table"].uns["spatialdata_io"]["radius"]["source"] == "derived:area"
+
+
+@pytest.mark.parametrize(
+    "ids", [["123456789012345678", "123456789012345679", "123456789012345680"], ["007", "008", "010"]]
+)
+def test_large_integer_and_leading_zero_ids(tmp_path: Path, ids: list[str]) -> None:
+    n = len(ids)
+    counts = tmp_path / "count.tsv"
+    counts.write_text(
+        "gene\t" + "\t".join(ids) + "\nGeneA\t" + "\t".join(["1"] * n) + "\nGeneB\t" + "\t".join(["2"] * n) + "\n"
+    )
+    coords = tmp_path / "coordinates.tsv"
+    coords.write_text("cells\tX\tY\n" + "\n".join(f"{i}\t{k}\t1" for k, i in enumerate(ids)) + "\n")
+    table = cell_table(counts, coords, unit="um", x="X", y="Y", cell_id="cells").tables["table"]
+    assert list(table.obs.index) == ids
+    assert list(table.obs["X"]) == list(range(n))
+
+
+def test_large_integer_ids(tmp_path: Path) -> None:
+    ids = ["123456789012345678", "123456789012345679"]
+    counts = tmp_path / "count.csv"
+    counts.write_text("," + ",".join(["GeneA", "GeneB"]) + "\n" + "\n".join(f"{i},1,2" for i in ids) + "\n")
+    coords = tmp_path / "coordinates.csv"
+    coords.write_text("cell,x,y\n" + "\n".join(f"{i},{k},1" for k, i in enumerate(ids)) + "\n,5,5\n")
+    table = cell_table(counts, coords, unit="um", x="x", y="y", cell_id="cell").tables["table"]
+    assert list(table.obs.index) == ids
+
+
+def test_unnamed_index_column_default(tmp_path: Path) -> None:
+    counts, _, _ = _split_files(tmp_path)
+    cpath = tmp_path / "centroids.csv"
+    cpath.write_text("\n".join([",cell,x,y"] + [f"{i},c{i},{i}.5,1.5" for i in range(20)]) + "\n")
+    table = cell_table(counts, cpath, unit="um", x="x", y="y").tables["table"]
+    assert table.shape == (20, 2)
+    assert list(table.obs.index)[:2] == ["c0", "c1"]
+    assert not any(c.startswith("Unnamed") for c in table.obs.columns)
