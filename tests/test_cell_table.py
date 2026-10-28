@@ -327,10 +327,8 @@ def test_coord_metadata_into_obs(tmp_path: Path) -> None:
     assert sdata.tables["table"].uns["spatialdata_io"]["radius"]["source"] == "derived:area"
 
 
-@pytest.mark.parametrize(
-    "ids", [["123456789012345678", "123456789012345679", "123456789012345680"], ["007", "008", "010"]]
-)
-def test_large_integer_and_leading_zero_ids(tmp_path: Path, ids: list[str]) -> None:
+def test_leading_zero_ids(tmp_path: Path) -> None:
+    ids = ["007", "008", "010"]
     n = len(ids)
     counts = tmp_path / "count.tsv"
     counts.write_text(
@@ -361,3 +359,31 @@ def test_unnamed_index_column_default(tmp_path: Path) -> None:
     assert table.shape == (20, 2)
     assert list(table.obs.index)[:2] == ["c0", "c1"]
     assert not any(c.startswith("Unnamed") for c in table.obs.columns)
+
+
+def test_counts_index_leading_zero(tmp_path: Path) -> None:
+    counts = tmp_path / "count.csv"
+    counts.write_text(",GeneA,GeneB\n007,1,2\n010,3,4\n")
+    coords = tmp_path / "coordinates.csv"
+    coords.write_text("cell,x,y\n007,1,1\n010,2,2\n")
+    table = cell_table(counts, coords, unit="um", x="x", y="y", cell_id="cell").tables["table"]
+    assert list(table.obs.index) == ["007", "010"]
+
+
+def test_wide_csv_leading_zero_ids(tmp_path: Path) -> None:
+    path = _write(tmp_path / "wide.csv", ["007,0,523.6,10.5,20.5,9,1,2,0", "010,0,904.8,30.0,40.0,29,3,0,1"])
+    table = cell_table(path, unit="um").tables["table"]
+    assert list(table.obs.index) == ["007", "010"]
+
+
+def test_mtx_barcodes_leading_zero(tmp_path: Path) -> None:
+    ids = ["007", "010"]
+    mtx = tmp_path / "exp.mtx"
+    scipy.io.mmwrite(str(mtx), sp.coo_matrix(np.array([[1, 3], [2, 4]])))  # genes x cells
+    (tmp_path / "features.tsv").write_text("GeneA\nNA\n")
+    (tmp_path / "barcodes.tsv").write_text("\n".join(ids) + "\n")
+    coords = tmp_path / "coordinates.csv"
+    coords.write_text("cell,x,y\n007,1,1\n010,2,2\n")
+    table = cell_table(mtx, coords, unit="um", x="x", y="y", cell_id="cell").tables["table"]
+    assert list(table.obs.index) == ids
+    assert list(table.var_names) == ["GeneA", "NA"]

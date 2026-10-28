@@ -230,7 +230,7 @@ def _find_sibling(path: Path, bases: tuple[str, ...], stem_suffix: str) -> Path 
 def _read_names(path: Path) -> pd.Index:
     """Read the first column of a header-less name list."""
     sep = "," if path.name.lower().replace(".gz", "").endswith(".csv") else "\t"
-    return pd.Index(pd.read_csv(path, sep=sep, header=None, usecols=[0]).iloc[:, 0].astype(str))
+    return pd.Index(pd.read_csv(path, sep=sep, header=None, usecols=[0], dtype=str, keep_default_na=False).iloc[:, 0])
 
 
 def _infer_rows_are_genes(
@@ -390,6 +390,8 @@ def cell_table(
         Names of the centroid columns.
     cell_id
         Name of the id column (of the wide file, or of the coordinates file). Defaults to the first column.
+        For the wide file the first column is used even if unnamed (Vizgen exports keep the EntityID there);
+        for a coordinates file unnamed index columns are skipped.
     genes_as_rows
         Orientation of a separate counts file (``True``: genes in rows). ``None`` infers it from which axis
         matches the coordinate cell ids. Not used by the wide layout.
