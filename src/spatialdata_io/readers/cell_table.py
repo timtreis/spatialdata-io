@@ -178,6 +178,10 @@ def _build(
         )
     is_gene = ~var_names.str.lower().str.contains("blank")
     genes = csr[:, np.flatnonzero(is_gene)]
+    i32 = np.iinfo(np.int32)
+    fits = genes.data.size == 0 or (genes.data.min() >= 0 and genes.data.max() <= i32.max)
+    x_dtype = "int32" if fits else "int64"
+    genes = sp.csr_matrix(genes.astype(x_dtype))
     blank = pd.DataFrame(csr[:, np.flatnonzero(~is_gene)].toarray(), index=obs.index, columns=var_names[~is_gene])
 
     n = len(obs)
@@ -212,8 +216,11 @@ def _build(
         "coordinates": {"x": xy_labels[0], "y": xy_labels[1], "unit": unit, "pixel_size": pixel_size},
         "radius": {
             "source": source,
-            "value_um": radius_um.tolist() if isinstance(radius_um, np.ndarray) else radius_um,
+            "median": float(np.median(radius_um)),
+            "min": float(np.min(radius_um)),
+            "max": float(np.max(radius_um)),
         },
+        "x_dtype": x_dtype,
         "n_coordinates_unmatched": n_coordinates_unmatched,
     }
     sdata = SpatialData(shapes=shapes_by_region, tables={"table": table})
@@ -555,7 +562,9 @@ def cell_table(
         as the radius of the sphere of equal volume, ``(3V / 4π)^(1/3)``, or else from ``obs["area"]``
         as the radius of the disc of equal area, ``sqrt(A / π)``. Otherwise 5 µm is used. The source
         (``stated``, ``derived:<column>`` or ``default``) is recorded in
-        ``table.uns["spatialdata_io"]["radius"]``.
+        ``table.uns["spatialdata_io"]["radius"]`` together with the median, minimum and maximum radius
+        over all cells in µm (``median``, ``min``, ``max``). The per-cell radius is the ``radius`` column
+        of the shapes.
 
     Returns
     -------

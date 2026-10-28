@@ -105,17 +105,61 @@ def test_radius_sources(csv: Path) -> None:
     sdata = cell_table(csv, unit="um")
     radius = sdata.tables["table"].uns["spatialdata_io"]["radius"]
     assert radius["source"] == "derived:volume"
-    assert len(radius["value_um"]) == 3
-    assert np.all(np.asarray(radius["value_um"]) > 0)
-    assert np.allclose(radius["value_um"][0], (3 * 523.6 / (4 * np.pi)) ** (1 / 3))
-    assert np.allclose(sdata["cells"]["radius"].to_numpy(), radius["value_um"])
+    per_cell = sdata["cells"]["radius"].to_numpy()
+    assert np.all(per_cell > 0)
+    assert np.allclose(per_cell[0], (3 * 523.6 / (4 * np.pi)) ** (1 / 3))
+    assert np.allclose(
+        [radius["median"], radius["min"], radius["max"]], [np.median(per_cell), per_cell.min(), per_cell.max()]
+    )
 
     sdata = cell_table(csv, unit="um", cell_radius=7.0)
-    assert sdata.tables["table"].uns["spatialdata_io"]["radius"] == {"source": "stated", "value_um": 7.0}
+    assert sdata.tables["table"].uns["spatialdata_io"]["radius"] == {
+        "source": "stated",
+        "median": 7.0,
+        "min": 7.0,
+        "max": 7.0,
+    }
 
     sdata = cell_table(csv, unit="mm")
-    assert sdata.tables["table"].uns["spatialdata_io"]["radius"] == {"source": "default", "value_um": 5.0}
+    assert sdata.tables["table"].uns["spatialdata_io"]["radius"] == {
+        "source": "default",
+        "median": 5.0,
+        "min": 5.0,
+        "max": 5.0,
+    }
     assert np.allclose(sdata["cells"]["radius"].to_numpy(), 5.0 / 1000)
+
+
+def test_radius_summary_keys_and_values(csv: Path) -> None:
+    sdata = cell_table(csv, unit="um")
+    radius = sdata.tables["table"].uns["spatialdata_io"]["radius"]
+    assert set(radius) == {"source", "median", "min", "max"}
+    assert all(type(radius[k]) is float for k in ("median", "min", "max"))
+    expected = np.cbrt(3 * np.array([523.6, 904.8, 113.1]) / (4 * np.pi))
+    assert radius["median"] == pytest.approx(np.median(expected))
+    assert radius["min"] == pytest.approx(expected.min())
+    assert radius["max"] == pytest.approx(expected.max())
+    assert sdata["cells"]["radius"].nunique() == 3  # shapes keep the per-cell radius
+    assert np.allclose(np.sort(sdata["cells"]["radius"].to_numpy()), np.sort(expected))
+
+
+def test_x_integer_dtype(csv: Path, tmp_path: Path) -> None:
+    sdata = cell_table(csv, unit="um")
+    table = sdata.tables["table"]
+    assert table.X.dtype == np.int32
+    assert table.uns["spatialdata_io"]["x_dtype"] == "int32"
+    sdata.write(tmp_path / "out.zarr")
+    back = SpatialData.read(tmp_path / "out.zarr").tables["table"]
+    assert back.X.dtype == np.int32
+    assert back.uns["spatialdata_io"]["x_dtype"] == "int32"
+
+
+def test_x_int64_when_values_exceed_int32(tmp_path: Path) -> None:
+    rows = [ROWS[0].replace(",1,2,0", f",{2**31},2,0"), *ROWS[1:]]
+    table = cell_table(_write(tmp_path / "big.csv", rows), unit="um").tables["table"]
+    assert table.X.dtype == np.int64
+    assert table.uns["spatialdata_io"]["x_dtype"] == "int64"
+    assert table.X.max() == 2**31
 
 
 def test_radius_from_area(tmp_path: Path) -> None:
@@ -126,7 +170,8 @@ def test_radius_from_area(tmp_path: Path) -> None:
     )
     radius = sdata.tables["table"].uns["spatialdata_io"]["radius"]
     assert radius["source"] == "derived:area"
-    assert np.isclose(radius["value_um"][0], 5.0, atol=1e-3)
+    assert np.isclose(sdata["cells"]["radius"].to_numpy()[0], 5.0, atol=1e-3)
+    assert np.isclose(radius["min"], 5.0, atol=1e-3)
 
 
 def test_uns_metadata(csv: Path) -> None:
@@ -177,8 +222,12 @@ def test_split_by(tmp_path: Path) -> None:
         ids = table.obs.loc[table.obs["region"] == name, "cell_id"]
         assert sorted(ids) == sorted(sdata[name].index)
     # per-cell radius stays aligned with the cell it came from
-    r = np.asarray(table.uns["spatialdata_io"]["radius"]["value_um"])
-    assert r.shape == (5,)
+    summary = table.uns["spatialdata_io"]["radius"]
+    all_r = np.concatenate([sdata[n]["radius"].to_numpy() for n in sdata.shapes])
+    assert all_r.shape == (5,)
+    assert np.allclose(
+        [summary["median"], summary["min"], summary["max"]], [np.median(all_r), all_r.min(), all_r.max()]
+    )
     assert np.allclose(
         sdata["cells_b"]["radius"].to_numpy(), np.cbrt(3 * np.array([101.0, 103.0, 104.0]) / (4 * np.pi))
     )
