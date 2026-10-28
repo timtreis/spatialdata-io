@@ -53,6 +53,7 @@ from ._discovery import (
 )
 from ._io import (
     COSMX_FOV_SIZE_PX,
+    NoFovCoordinatesError,
     _default_image_kwargs,
     _find_matching_fov_file,
     _get_cosmx_morphology_coords,
@@ -954,13 +955,20 @@ class CosMxDatasetReader:
 
         adata.obs["region_key"] = pd.Series(region, index=adata.obs.index, dtype="category")
 
+        if bg_df is not None:
+            # var-aligned (genes x FOVs): as an uns DataFrame its gene columns become zarr keys, and probe names
+            # like "Gstp1/2" are not valid keys. Set before sanitize_table so varm follows any var renaming.
+            missing = adata.var_names.difference(bg_df.columns)
+            if len(missing):
+                raise ValueError(f"Background rows lack {len(missing)} gene(s) of the table, e.g. {list(missing[:3])}")
+            adata.varm["fov_bg_signal"] = pd.DataFrame(
+                bg_df[adata.var_names].to_numpy().T, index=adata.var_names, columns=[f"fov_{f}" for f in bg_df.index]
+            )
+
         # Zarr-safe, case-insensitively unique obs/var keys (spatialdata core),
         # then categoricals → string (zarr cannot serialize categoricals).
         sanitize_table(adata)
         _pandas_categoricals_to_string(cast(pd.DataFrame, adata.obs))
-
-        if bg_df is not None:
-            adata.uns["fov_bg_signal"] = bg_df
 
         table = _parse_cell_table(adata, region=region)
         return {"cell_data": table}
@@ -1465,7 +1473,13 @@ def cosmx(
     fov_set = _normalize_fovs(fovs)
     image_models_kwargs, imread_kwargs = _default_image_kwargs(image_models_kwargs, imread_kwargs)
 
-    fov_locs = _read_fov_locs(dataset.fov_positions_file) if dataset.fov_positions_file else None
+    try:
+        fov_locs = _read_fov_locs(dataset.fov_positions_file) if dataset.fov_positions_file else None
+    except NoFovCoordinatesError as e:
+        # Nothing per-FOV (images, labels, polygons, transcripts, FOV boxes) can be placed without FOV origins.
+        logger.warning("%s Reading the cell tables only; cell positions stay in the metadata columns.", e)
+        fov_locs = pd.DataFrame({"xmin": [np.nan], "ymin": [np.nan]})
+        read_images = read_labels = read_polygons = read_transcripts = add_fovs_as_shapes = False
 
     if skip_empty_fovs and (read_images or read_labels):
         fov_locs = _prune_empty_fovs(dataset, fov_locs, fov_set)
