@@ -18,7 +18,7 @@ from dask import array as da
 from dask_image.imread import imread
 from scipy.sparse import csr_matrix
 from shapely.geometry import MultiPolygon
-from spatialdata import SpatialData
+from spatialdata import SpatialData, sanitize_table
 from spatialdata._logging import logger
 from spatialdata.models import Image2DModel, PointsModel, ShapesModel, TableModel
 from spatialdata.transformations import Affine, BaseTransformation, Identity
@@ -313,7 +313,8 @@ def _dask_image_load_merscope(
 
 
 def _get_points(transcript_path: Path, transformations: dict[str, BaseTransformation]) -> dd.DataFrame:
-    transcript_df = dd.read_csv(transcript_path)
+    # fov can be empty in later rows (GSE255892), which breaks dask's int64 inference from the first block.
+    transcript_df = dd.read_csv(transcript_path, dtype={"fov": "Int64"})
     # Make `gene` a categorical with *known* categories before parsing. Passing an object-dtype column
     # to `PointsModel.parse` leaves the dask categories "unknown": they then get inferred from a single
     # partition, which both forces repeated recomputation downstream and can silently turn genes that
@@ -388,6 +389,14 @@ def _get_polygons(boundaries_path: Path, transformations: dict[str, BaseTransfor
     return ShapesModel.parse(geo_df, transformations=transformations)
 
 
+def _strip_uniform_prefix(ids: pd.Index) -> pd.Index | None:
+    """Ids without a ``<prefix>_`` shared by all of them, or None when they don't share one."""
+    parts = pd.Series(ids, dtype=str).str.rpartition("_")
+    if (parts[0] == "").any() or parts[0].nunique() != 1:
+        return None
+    return pd.Index(parts[2])
+
+
 def _read_csv_str_index(path: Path) -> pd.DataFrame:
     """Read a cell table with its first column as a str index, whatever its header.
 
@@ -410,6 +419,10 @@ def _get_table(
     obs = _read_csv_str_index(obs_path)
     # cell_metadata may list the cells in another order than cell_by_gene (GEO re-exports): align by id.
     missing = data.index.difference(obs.index)
+    if len(missing) and (bare := _strip_uniform_prefix(data.index)) is not None and bare.isin(obs.index).all():
+        # GSE269617: counted ids carry a sample prefix ("AbxF_<EntityID>") the metadata lacks; keep the EntityID.
+        logger.warning(f"Matched {count_path.name} ids to {obs_path.name} after removing their shared prefix.")
+        data.index, missing = bare, bare[:0]
     if len(missing):
         raise ValueError(
             f"{len(missing)} cell(s) of {count_path.name} are missing from {obs_path.name}, e.g. {list(missing[:3])}"
@@ -432,6 +445,7 @@ def _get_table(
     adata.obs[MerscopeKeys.REGION_KEY] = pd.Series(region, index=adata.obs_names, dtype="category")
     adata.obs[MerscopeKeys.METADATA_CELL_KEY] = adata.obs.index
 
+    sanitize_table(adata)  # lab-added metadata columns such as "Custom cell groups" (GSE269617)
     table = TableModel.parse(
         adata,
         region_key=MerscopeKeys.REGION_KEY.value,

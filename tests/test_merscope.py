@@ -288,3 +288,36 @@ def test_boundaries_on_other_z_planes_are_kept(tmp_path: Path) -> None:
     assert (z[str(a)], z[str(b)], z[str(c)]) == (0, 2, 3)
     assert shapes.geometry[str(a)].area == pytest.approx(4.0)
     assert shapes.geometry[str(b)].area == pytest.approx(16.0)
+
+
+def test_metadata_column_names_are_sanitized(tmp_path: Path) -> None:
+    # GSE269617: lab-added cell_metadata columns with spaces ("Custom cell groups") made TableModel.parse raise.
+    region = _write_dataset(tmp_path, with_images_transform=False)
+    meta = pd.read_csv(region / "cell_metadata.csv", index_col=0)
+    meta["Custom cell groups"] = "R_CP"
+    meta.to_csv(region / "cell_metadata.csv")
+    table = merscope(region, mosaic_images=False, cells_boundaries=False)["table"]
+    assert "Custom_cell_groups" in table.obs.columns
+
+
+def test_counts_ids_with_a_uniform_prefix_match_metadata(tmp_path: Path) -> None:
+    # GSE269617: cell_by_gene ids carry a sample prefix ("AbxF_<EntityID>") that cell_metadata (unfiltered,
+    # more cells) does not. The table keeps the counted cells under their bare EntityID.
+    region = _write_dataset(tmp_path, with_images_transform=False)
+    counts = pd.read_csv(region / "cell_by_gene.csv", index_col=0)
+    counts.iloc[:3].rename(index=lambda i: f"AbxF_{i}").to_csv(region / "cell_by_gene.csv")
+    table = merscope(region, mosaic_images=False, cells_boundaries=False)["table"]
+    assert list(table.obs_names) == [str(i) for i in CELL_IDS[:3]]
+
+
+def test_transcripts_fov_with_missing_values(tmp_path: Path) -> None:
+    # GSE255892: `fov` is int in the first rows and empty later, so dask's dtype inference failed.
+    region = _write_dataset(tmp_path, with_images_transform=False)
+    tx = pd.read_csv(region / "detected_transcripts.csv", index_col=0)
+    tx["fov"] = tx["fov"].astype(object)
+    tx.loc[tx.index[-1], "fov"] = None
+    tx.to_csv(region / "detected_transcripts.csv")
+    sdata = merscope(region, mosaic_images=False, cells_boundaries=False, transcripts=True)
+    points = next(iter(sdata.points.values()))
+    assert str(points["fov"].dtype) == "Int64"  # read nullable up front, so later partitions can't disagree
+    assert points["fov"].compute().isna().sum() == 1
