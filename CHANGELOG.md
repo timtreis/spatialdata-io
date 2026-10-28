@@ -15,6 +15,8 @@ Release notes for `v0.7.1` and earlier are available on the [Releases][] page.
 
 ### Added
 
+- `stereoseq_gef` reads flat Stereo-seq GEF (HDF5) files as deposited on GEO. This release reads the cells from
+  `cellbin.gef` (table and polygons); square bins from `tissue.gef` follow.
 - `spatialdata_io` ships a `py.typed` marker, so downstream type checkers use its annotations.
 - `xenium` reads pre-1.3.0 (XOA < 1.3.0) and CSV-only bundles: when the parquet files and
   `cells.zarr.zip` are absent, the table, boundaries, and transcripts are read from the `cells.csv`,

@@ -10,12 +10,15 @@ import anndata as ad
 import h5py
 import numpy as np
 import pandas as pd
+import shapely
 from dask_image.imread import imread
 from geopandas import GeoDataFrame, GeoSeries
-from scipy.sparse import coo_matrix
+from scipy.sparse import coo_matrix, csr_matrix
 from shapely import Polygon
 from spatialdata import SpatialData
+from spatialdata._logging import logger
 from spatialdata.models import Image2DModel, PointsModel, ShapesModel, TableModel
+from spatialdata.transformations import BaseTransformation, Scale
 from tqdm import tqdm
 
 from spatialdata_io._constants._constants import StereoseqKeys as SK
@@ -25,7 +28,7 @@ from spatialdata_io.readers._utils._utils import _initialize_raster_models_kwarg
 if TYPE_CHECKING:
     from collections.abc import Mapping
 
-__all__ = ["stereoseq"]
+__all__ = ["stereoseq", "stereoseq_gef"]
 
 
 @inject_docs(xx=SK)
@@ -344,3 +347,252 @@ def stereoseq(
 
     sdata = SpatialData(images=images, tables=tables, shapes=shapes, points=points)
     return _set_reader_metadata(sdata, "stereoseq")
+
+
+_GEF_PLATFORM_RESOLUTION_NM = 500
+_GEF_BORDER_PAD = 32767
+
+
+def _gef_attr(obj: h5py.HLObject, key: str, default: Any = None) -> Any:
+    """Read an HDF5 attribute as a Python scalar.
+
+    Parameters
+    ----------
+    obj
+        HDF5 file, group or dataset.
+    key
+        Attribute name.
+    default
+        Returned when the attribute is missing or empty.
+
+    Returns
+    -------
+    The attribute, with scalars and 1-element arrays normalised to a Python scalar and bytes decoded as utf-8.
+    """
+    if key not in obj.attrs:
+        return default
+    value = obj.attrs[key]
+    if isinstance(value, np.ndarray):
+        if value.size == 0:
+            return default
+        if value.size > 1:
+            return value
+        value = value.reshape(-1)[0]
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, bytes):
+        value = value.decode("utf-8").rstrip("\x00")
+    return value
+
+
+def _resolution_nm(*files: h5py.File) -> tuple[int, str]:
+    """Resolve the DNB pitch in nm from the headers of one or more GEF files.
+
+    Parameters
+    ----------
+    *files
+        Open GEF files. Per file, the root ``resolution`` and ``geneExp/bin1/expression`` ``resolution`` are read.
+
+    Returns
+    -------
+    The resolution in nm and its source, ``"header"`` or ``"platform_default"`` (500 nm) if no file states one.
+
+    Raises
+    ------
+    ValueError
+        If two stated values disagree.
+    """
+    stated: dict[int, str] = {}
+    for f in files:
+        candidates = [(f, "root")]
+        if "geneExp/bin1/expression" in f:
+            candidates.append((f["geneExp/bin1/expression"], "geneExp/bin1/expression"))
+        for obj, where in candidates:
+            value = _gef_attr(obj, "resolution")
+            if value is not None:
+                stated[int(round(float(value)))] = f"{f.filename}:{where}"
+    if len(stated) > 1:
+        raise ValueError(f"Conflicting `resolution` values in the GEF header(s): {stated}.")
+    if stated:
+        return next(iter(stated)), "header"
+    return _GEF_PLATFORM_RESOLUTION_NM, "platform_default"
+
+
+def _bin_name(bin_size: int, resolution_nm: int) -> str:
+    """Name of a square bin, e.g. ``square_025um`` (bin 50 at 500 nm) or ``square_002p5um`` (bin 5)."""
+    nm = bin_size * resolution_nm
+    um, rem = divmod(nm, 1000)
+    if rem == 0:
+        return f"square_{um:03d}um"
+    frac = f"{rem:03d}".rstrip("0")
+    return f"square_{um:03d}p{frac}um"
+
+
+def _default_dataset_id(path: Path) -> str:
+    """Chip id from a GEF file name: first ``.``-separated token after a leading ``GSM<digits>_``."""
+    return re.sub(r"^GSM\d+_", "", Path(path).name).split(".")[0]
+
+
+def _read_cells(
+    f: h5py.File, *, dataset_id: str, transform: Mapping[str, BaseTransformation]
+) -> tuple[ad.AnnData, GeoDataFrame, int]:
+    """Read cells x genes and cell polygons from the ``cellBin`` group of a GEF file.
+
+    Parameters
+    ----------
+    f
+        Open GEF file with a ``cellBin`` group.
+    dataset_id
+        Used to name the region the table annotates, ``{dataset_id}_cell_boundaries``.
+    transform
+        Transformations (coordinate system to transformation) attached to the shapes.
+
+    Returns
+    -------
+    The unparsed table (with ``cell_id`` and ``region`` in ``obs``), the parsed shapes with the same index as
+    ``cell_id``, and the number of cells whose border was degenerate and got a fallback square.
+    """
+    g = f["cellBin"]
+    cell = g["cell"][:]
+    n = len(cell)
+
+    gene_names = np.char.decode(g["gene"][:]["geneName"], "utf-8")
+    exp = g["cellExp"][:]
+    gene_count = cell["geneCount"].astype(np.int64)
+    starts = cell["offset"].astype(np.int64)
+    indptr = np.concatenate([[0], np.cumsum(gene_count)])
+    take = np.repeat(starts - indptr[:-1], gene_count) + np.arange(indptr[-1])
+    data = exp["count"][take].astype(np.int64)
+    dtype = np.int32 if data.size == 0 or data.max() <= np.iinfo(np.int32).max else np.int64
+    x_mat = csr_matrix((data.astype(dtype), exp["geneID"][take].astype(np.int64), indptr), shape=(n, len(gene_names)))
+
+    cell_ids = cell["id"].astype(np.int64)
+    region = f"{dataset_id}_cell_boundaries"
+    obs = pd.DataFrame(
+        {
+            "area": cell["area"],
+            "dnbCount": cell["dnbCount"],
+            "geneCount": cell["geneCount"],
+            "expCount": cell["expCount"],
+            "clusterID": cell["clusterID"],
+            "cellTypeID": cell["cellTypeID"],
+        },
+        index=pd.Index(cell_ids.astype(str)),
+    )
+    obs["cell_id"] = cell_ids
+    obs["region"] = pd.Categorical([region] * n)
+    adata = ad.AnnData(X=x_mat, obs=obs, var=pd.DataFrame(index=pd.Index(gene_names.astype(str))))
+
+    cx = cell["x"].astype(np.float64)
+    cy = cell["y"].astype(np.float64)
+    geoms, is_fallback = _cell_polygons(g["cellBorder"][:], cx, cy, cell["area"])
+    n_fallback = int(is_fallback.sum())
+    if n_fallback:
+        logger.warning(
+            f"{n_fallback} of {n} cells have a degenerate border (fewer than 3 distinct points); "
+            "using a fallback square of the cell area centred on the cell."
+        )
+    gdf = GeoDataFrame(geometry=geoms, index=pd.Index(cell_ids))
+    shapes = ShapesModel.parse(gdf, transformations=dict(transform))
+    return adata, shapes, n_fallback
+
+
+def _cell_polygons(
+    border: np.ndarray, cx: np.ndarray, cy: np.ndarray, area: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build one polygon per cell from padded ``cellBorder`` offsets; degenerate cells get a fallback square."""
+    n = len(cx)
+    valid = (border != _GEF_BORDER_PAD).all(axis=2)
+    k = valid.sum(axis=1)
+    xy = border.astype(np.float64) + np.stack([cx, cy], axis=1)[:, None, :]
+    geoms = np.empty(n, dtype=object)
+    ok = np.zeros(n, dtype=bool)
+    for kk in np.unique(k[k >= 3]):
+        rows = np.flatnonzero(k == kk)
+        pts = xy[rows, :kk]  # valid points come first
+        key = (border[rows, :kk, 0].astype(np.int64) + 32768) * 65536 + (border[rows, :kk, 1].astype(np.int64) + 32768)
+        key.sort(axis=1)
+        distinct = 1 + (np.diff(key, axis=1) != 0).sum(axis=1)
+        good = distinct >= 3
+        if good.any():
+            polys = shapely.make_valid(shapely.polygons(pts[good]))
+            geoms[rows[good]] = polys
+            ok[rows[good]] = True
+    # make_valid can return lines or collections; those cells fall back as well
+    for i in np.flatnonzero(ok):
+        if geoms[i].geom_type not in ("Polygon", "MultiPolygon"):
+            ok[i] = False
+    bad = ~ok
+    if bad.any():
+        half = np.sqrt(np.where(area[bad] > 0, area[bad], 1).astype(np.float64)) / 2
+        geoms[bad] = shapely.box(cx[bad] - half, cy[bad] - half, cx[bad] + half, cy[bad] + half)
+    return geoms, bad
+
+
+def stereoseq_gef(
+    gef: str | Path | None = None,
+    cellbin_gef: str | Path | None = None,
+    *,
+    bin_size: int = 50,
+    dataset_id: str | None = None,
+) -> SpatialData:
+    """Read flat *Stereo-seq* GEF (HDF5) files as deposited on GEO.
+
+    Parameters
+    ----------
+    gef
+        Path to a ``tissue.gef`` or full ``.gef`` file (square bins). Not supported yet.
+    cellbin_gef
+        Path to a ``cellbin.gef`` file (segmented cells).
+    bin_size
+        Bin size in DNB (positive integer) for the square-bin table.
+    dataset_id
+        Dataset identifier. Defaults to the chip id parsed from the file name.
+
+    Returns
+    -------
+    :class:`spatialdata.SpatialData`
+
+    Notes
+    -----
+    Geometries keep the raw DNB coordinates; the ``global`` coordinate system is in micrometres through a scale of
+    ``resolution_nm / 1000``. The resolution comes from the GEF header and defaults to 500 nm (recorded as
+    ``resolution_source="platform_default"`` in ``table.uns["spatialdata_io"]``) if no header states it.
+    """
+    if gef is None and cellbin_gef is None:
+        raise ValueError("Provide at least one of `gef` or `cellbin_gef`.")
+    if isinstance(bin_size, bool) or not isinstance(bin_size, int | np.integer) or bin_size <= 0:
+        raise ValueError(f"`bin_size` must be a positive integer, got {bin_size!r}.")
+    if gef is not None:
+        raise NotImplementedError("Reading `gef` is not implemented yet.")
+    assert cellbin_gef is not None
+    cellbin_gef = Path(cellbin_gef)
+    if dataset_id is None:
+        dataset_id = _default_dataset_id(cellbin_gef)
+
+    tables: dict[str, ad.AnnData] = {}
+    shapes: dict[str, GeoDataFrame] = {}
+    with h5py.File(cellbin_gef, "r") as f:
+        if "geneExp" not in f and "cellBin" not in f:
+            raise ValueError(f"{cellbin_gef} is not a GEF file: it has neither `geneExp` nor `cellBin`.")
+        if "cellBin" not in f:
+            raise ValueError(f"`cellbin_gef` {cellbin_gef} has no `cellBin` group.")
+        resolution_nm, source = _resolution_nm(f)
+        r = resolution_nm / 1000
+        transform = {"global": Scale([r, r], axes=("x", "y"))}
+        adata, cell_shapes, n_fallback = _read_cells(f, dataset_id=dataset_id, transform=transform)
+
+    region = f"{dataset_id}_cell_boundaries"
+    adata.uns["spatialdata_io"] = {
+        "reader": "stereoseq_gef",
+        "resolution_nm": resolution_nm,
+        "resolution_source": source,
+        "bin_size_dnb": int(bin_size),
+        "bin_size_um": bin_size * resolution_nm / 1000,
+        "gef_kind": None,
+        "source_bins": None,
+        "n_cells_fallback_geometry": n_fallback,
+    }
+    tables["table"] = TableModel.parse(adata, region=region, region_key="region", instance_key="cell_id")
+    shapes[region] = cell_shapes
+    return _set_reader_metadata(SpatialData(tables=tables, shapes=shapes), "stereoseq_gef")
