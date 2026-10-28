@@ -126,22 +126,28 @@ def _build(
         split_values = obs[split_by]
         if split_values.isna().any():
             raise ValueError(f"split_by column {split_by!r} has {int(split_values.isna().sum())} missing values.")
-        names = {v: f"cells_{re.sub('[^A-Za-z0-9_]', '_', str(v))}" for v in split_values.unique()}
-        if len(set(names.values())) < len(names):
+        safe = {v: re.sub("[^A-Za-z0-9_]", "_", str(v)) for v in split_values.unique()}
+        by_name: dict[str, list[str]] = {}
+        for v, sv in safe.items():
+            by_name.setdefault(sv.lower(), []).append(str(v))  # case-insensitive: stores may lowercase paths
+        clash = [vs for vs in by_name.values() if len(vs) > 1]
+        if clash:
             raise ValueError(
-                f"Values of {split_by!r} {sorted(map(str, names))} map to the same element name after "
-                "replacing characters other than letters, digits and '_'."
+                f"Values of {split_by!r} {clash[0]} map to the same element name after replacing characters "
+                "other than letters, digits and '_' (compared case-insensitively)."
             )
-        region_of = split_values.map(names).to_numpy(dtype=object)
+        region_of = split_values.map({v: f"cells_{sv}" for v, sv in safe.items()}).to_numpy(dtype=object)
     for _, ids in obs.index.to_series().groupby(region_of):
         if not ids.is_unique:
             dup = ids[ids.duplicated()].unique()[:5].tolist()
             raise ValueError(f"Found duplicate cell ids, for example {dup}.")
     obs = obs.copy()
     if not obs.index.is_unique:  # same id in several splits: keep AnnData's index unique
-        obs.index = pd.Index(
-            [f"{v}_{i}" for v, i in zip(obs[cast("str", split_by)].astype(str), obs.index, strict=True)]
-        )
+        prefix = region_of.astype(str)
+        obs.index = pd.Index([f"{r[len('cells_') :]}_{i}" for r, i in zip(prefix, obs.index, strict=True)])
+        if not obs.index.is_unique:
+            dup = obs.index[obs.index.duplicated()].unique()[:5].tolist()
+            raise ValueError(f"Cell ids are not unique after prefixing them with the split value, for example {dup}.")
 
     genes: Any
     blank: pd.DataFrame

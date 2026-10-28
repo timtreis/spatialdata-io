@@ -190,6 +190,47 @@ def test_split_name_collision_rejected(tmp_path: Path) -> None:
         cell_table(_split_csv(tmp_path, ["a b", "a_b"]), unit="um", split_by="sample")
 
 
+@pytest.mark.parametrize("values", [["A", "a"], ["S1", "s1"]])
+def test_split_case_collision_rejected(tmp_path: Path, values: list[str]) -> None:
+    with pytest.raises(ValueError, match="same element name") as e:
+        cell_table(_split_csv(tmp_path, values), unit="um", split_by="sample")
+    assert values[0] in str(e.value)
+    assert values[1] in str(e.value)
+
+
+def test_split_prefix_collision_rejected(tmp_path: Path) -> None:
+    # "b_x" in split "a" and "x" in split "a_b" both become "a_b_x"; "x" repeats, so prefixing kicks in
+    rows = ["b_x,a,1,1,1,1,1", "x,a_b,1,2,2,1,1", "x,a,1,3,3,1,1"]
+    with pytest.raises(ValueError, match="not unique after prefixing"):
+        cell_table(_write(tmp_path / "q.csv", rows, SPLIT_HEADER), unit="um", split_by="sample")
+
+
+def test_split_by_roundtrip_join(tmp_path: Path) -> None:
+    from spatialdata import join_spatialelement_table
+
+    sdata = cell_table(_split_csv(tmp_path, ["a", "b", "a", "b", "b"]), unit="um", split_by="sample")
+    sdata.write(tmp_path / "out.zarr")
+    back = SpatialData.read(tmp_path / "out.zarr")
+    table = back["table"]
+    for name in ("cells_a", "cells_b"):
+        expected = table.obs.loc[table.obs["region"] == name, "cell_id"]
+        assert sorted(back[name].index) == sorted(expected)
+        _, joined = join_spatialelement_table(back, name, table_name="table", how="inner")
+        assert joined.n_obs == len(expected)
+        assert sorted(joined.obs["cell_id"]) == sorted(expected)
+
+
+def test_split_by_in_coordinates_file(tmp_path: Path) -> None:
+    counts, coords, _ = _split_files(tmp_path, n=6)
+    df = pd.read_csv(coords, sep="\t")
+    df["sample"] = ["s 1" if int(c[1:]) % 2 else "s2" for c in df["cells"]]
+    df.to_csv(coords, sep="\t", index=False)
+    sdata = cell_table(counts, coords, unit="um", x="X", y="Y", split_by="sample")
+    assert set(sdata.shapes) == {"cells_s_1", "cells_s2"}
+    assert sdata["table"].n_obs == 6
+    assert len(sdata["cells_s_1"]) == 3
+
+
 def test_split_by_missing_column(csv: Path) -> None:
     with pytest.raises(ValueError, match="nope"):
         cell_table(csv, unit="um", split_by="nope")
