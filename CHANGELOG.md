@@ -21,6 +21,9 @@ Release notes for `v0.7.1` and earlier are available on the [Releases][] page.
   The coordinate `unit` is required and mapped to micrometres with a `Scale` transformation; unit,
   radius provenance (source, median, min and max in µm) and the integer dtype of `X` (`int32`, or `int64`
   if a count exceeds the `int32` range) are stored in `table.uns["spatialdata_io"]`.
+- `stereoseq_gef` reads flat Stereo-seq GEF (HDF5) files as deposited on GEO. It reads the cells from
+  `cellbin.gef` (table and polygons), the square bins from `tissue.gef` or a full `.gef` at a chosen `bin_size`,
+  or both together as two tables, each annotating its own shapes.
 - `spatialdata_io` ships a `py.typed` marker, so downstream type checkers use its annotations.
 - `xenium` reads pre-1.3.0 (XOA < 1.3.0) and CSV-only bundles: when the parquet files and
   `cells.zarr.zip` are absent, the table, boundaries, and transcripts are read from the `cells.csv`,
