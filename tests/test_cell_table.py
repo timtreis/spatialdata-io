@@ -148,9 +148,79 @@ def test_metadata_columns_override(csv: Path) -> None:
     assert "min_x" in table.var_names
 
 
-def test_split_by_not_implemented(csv: Path) -> None:
-    with pytest.raises(NotImplementedError):
-        cell_table(csv, unit="um", split_by="fov")
+SPLIT_HEADER = "id,sample,volume,center_x,center_y,GeneA,GeneB"
+
+
+def _split_csv(tmp_path: Path, samples: list[str], ids: list[str] | None = None) -> Path:
+    ids = ids or [f"c{i}" for i in range(len(samples))]
+    rows = [f"{i},{s},{100.0 + k},{k}.5,{k}.25,{k},1" for k, (i, s) in enumerate(zip(ids, samples, strict=True))]
+    return _write(tmp_path / "split.csv", rows, SPLIT_HEADER)
+
+
+def test_split_by(tmp_path: Path) -> None:
+    sdata = cell_table(_split_csv(tmp_path, ["a", "b", "a", "b", "b"]), unit="um", split_by="sample")
+    assert set(sdata.shapes) == {"cells_a", "cells_b"}
+    assert list(sdata.tables) == ["table"]
+    table = sdata["table"]
+    assert set(table.obs["region"].cat.categories) == {"cells_a", "cells_b"}
+    attrs = table.uns["spatialdata_attrs"]
+    assert set(attrs["region"]) == {"cells_a", "cells_b"}
+    assert (len(sdata["cells_a"]), len(sdata["cells_b"])) == (2, 3)
+    for name in sdata.shapes:
+        ids = table.obs.loc[table.obs["region"] == name, "cell_id"]
+        assert sorted(ids) == sorted(sdata[name].index)
+    # per-cell radius stays aligned with the cell it came from
+    r = np.asarray(table.uns["spatialdata_io"]["radius"]["value_um"])
+    assert r.shape == (5,)
+    assert np.allclose(
+        sdata["cells_b"]["radius"].to_numpy(), np.cbrt(3 * np.array([101.0, 103.0, 104.0]) / (4 * np.pi))
+    )
+
+
+def test_split_sanitizes_names(tmp_path: Path) -> None:
+    sdata = cell_table(_split_csv(tmp_path, ["slice 1", "x/y", "slice 1"]), unit="um", split_by="sample")
+    assert set(sdata.shapes) == {"cells_slice_1", "cells_x_y"}
+    sdata.write(tmp_path / "out.zarr")
+    back = SpatialData.read(tmp_path / "out.zarr")
+    assert set(back["table"].obs["region"].cat.categories) == {"cells_slice_1", "cells_x_y"}
+
+
+def test_split_name_collision_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="same element name"):
+        cell_table(_split_csv(tmp_path, ["a b", "a_b"]), unit="um", split_by="sample")
+
+
+def test_split_by_missing_column(csv: Path) -> None:
+    with pytest.raises(ValueError, match="nope"):
+        cell_table(csv, unit="um", split_by="nope")
+
+
+def test_duplicate_ids_across_splits_allowed(tmp_path: Path) -> None:
+    sdata = cell_table(_split_csv(tmp_path, ["a", "b"], ids=["c1", "c1"]), unit="um", split_by="sample")
+    table = sdata["table"]
+    assert table.obs.index.is_unique
+    assert table.n_obs == 2
+    assert set(table.obs.index) == {"a_c1", "b_c1"}
+
+
+def test_duplicate_ids_within_split_rejected(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="duplicate"):
+        cell_table(_split_csv(tmp_path, ["a", "a"], ids=["c1", "c1"]), unit="um", split_by="sample")
+
+
+def test_split_by_missing_values_rejected(tmp_path: Path) -> None:
+    f = _write(tmp_path / "s.csv", ["c1,a,1,1,1,1,1", "c2,,1,2,2,1,1"], SPLIT_HEADER)
+    with pytest.raises(ValueError, match="missing"):
+        cell_table(f, unit="um", split_by="sample")
+
+
+def test_split_by_h5ad(tmp_path: Path) -> None:
+    f = _h5ad(tmp_path / "a.h5ad", obsm={"spatial": np.array([[1.0, 3.0], [2.0, 4.0]])})
+    adata = ad.read_h5ad(f)
+    adata.obs["batch"] = ["p", "q"]
+    adata.write_h5ad(f)
+    sdata = cell_table(f, unit="um", split_by="batch")
+    assert set(sdata.shapes) == {"cells_p", "cells_q"}
 
 
 def test_roundtrip(csv: Path, tmp_path: Path) -> None:
@@ -432,6 +502,9 @@ def test_h5ad_obsm_spatial(tmp_path: Path) -> None:
     assert list(sdata["cells"].geometry.x) == [1.0, 2.0]
     assert list(sdata["cells"].geometry.y) == [3.0, 4.0]
     assert "spatial" not in sdata["table"].obsm
+    sdata.write(tmp_path / "out.zarr")
+    back = SpatialData.read(tmp_path / "out.zarr")
+    assert back["table"].uns["spatialdata_io"]["coordinates"]["x"] == "obsm:spatial[0]"
 
 
 def test_h5ad_obsm_x_spatial(tmp_path: Path) -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Literal, cast
 
@@ -94,6 +95,7 @@ def _build(
     split_by: str | None,
     cell_radius: float | None,
     n_coordinates_unmatched: int,
+    coordinate_labels: tuple[str, str] | None = None,
 ) -> SpatialData:
     """Validate counts and assemble the SpatialData object.
 
@@ -109,13 +111,37 @@ def _build(
         See :func:`cell_table`.
     n_coordinates_unmatched
         Number of coordinate rows dropped because they have no counts; recorded in ``uns``.
+    coordinate_labels
+        Names recorded in ``uns`` for ``x`` and ``y`` instead of the column names (e.g. for ``obsm`` sources).
     """
-    if not obs.index.is_unique:
-        dup = obs.index[obs.index.duplicated()].unique()[:5].tolist()
-        raise ValueError(f"Found duplicate cell ids, for example {dup}.")
     for col in (x, y):
         if col not in obs.columns:
             raise ValueError(f"Coordinate column {col!r} not found; available columns: {list(obs.columns)[:10]}.")
+
+    # Element name per cell; ids only need to be unique within a split.
+    region_of = np.full(len(obs), "cells", dtype=object)
+    if split_by is not None:
+        if split_by not in obs.columns:
+            raise ValueError(f"split_by column {split_by!r} not found; available columns: {list(obs.columns)[:10]}.")
+        split_values = obs[split_by]
+        if split_values.isna().any():
+            raise ValueError(f"split_by column {split_by!r} has {int(split_values.isna().sum())} missing values.")
+        names = {v: f"cells_{re.sub('[^A-Za-z0-9_]', '_', str(v))}" for v in split_values.unique()}
+        if len(set(names.values())) < len(names):
+            raise ValueError(
+                f"Values of {split_by!r} {sorted(map(str, names))} map to the same element name after "
+                "replacing characters other than letters, digits and '_'."
+            )
+        region_of = split_values.map(names).to_numpy(dtype=object)
+    for _, ids in obs.index.to_series().groupby(region_of):
+        if not ids.is_unique:
+            dup = ids[ids.duplicated()].unique()[:5].tolist()
+            raise ValueError(f"Found duplicate cell ids, for example {dup}.")
+    obs = obs.copy()
+    if not obs.index.is_unique:  # same id in several splits: keep AnnData's index unique
+        obs.index = pd.Index(
+            [f"{v}_{i}" for v, i in zip(obs[cast("str", split_by)].astype(str), obs.index, strict=True)]
+        )
 
     genes: Any
     blank: pd.DataFrame
@@ -135,7 +161,6 @@ def _build(
             "cell_table() only reads raw integer counts."
         )
 
-    obs = obs.copy()
     n = len(obs)
     obs[_INSTANCE_KEY] = np.arange(n)
     transformation, factor = _transformation(unit, pixel_size)
@@ -144,31 +169,33 @@ def _build(
     adata = ad.AnnData(X=genes, obs=obs, var=pd.DataFrame(index=var_names[is_gene]))
     adata.obsm["blank"] = blank
 
-    if split_by is not None:
-        raise NotImplementedError("split_by is not implemented yet.")
-    region = "cells"
-    adata.obs[_REGION_KEY] = pd.Categorical([region] * n)
+    adata.obs[_REGION_KEY] = pd.Categorical(region_of)
 
     coords = obs[[x, y]].to_numpy(dtype=float)
-    shapes = ShapesModel.parse(
-        coords,
-        geometry=0,
-        radius=np.asarray(radius_um) / factor,
-        index=pd.RangeIndex(n),
-        transformations={"global": transformation},
-    )
+    radius = np.broadcast_to(np.asarray(radius_um) / factor, (n,))
+    shapes_by_region: dict[str, Any] = {}
+    for region in adata.obs[_REGION_KEY].cat.categories:
+        pos = np.flatnonzero(region_of == region)
+        shapes_by_region[region] = ShapesModel.parse(
+            coords[pos],
+            geometry=0,
+            radius=radius[pos],
+            index=pd.Index(pos),
+            transformations={"global": transformation},
+        )
 
-    table = TableModel.parse(adata, region=region, region_key=_REGION_KEY, instance_key=_INSTANCE_KEY)
+    table = TableModel.parse(adata, region=list(shapes_by_region), region_key=_REGION_KEY, instance_key=_INSTANCE_KEY)
+    xy_labels = coordinate_labels or (x, y)
     table.uns["spatialdata_io"] = {
         "reader": "cell_table",
-        "coordinates": {"x": x, "y": y, "unit": unit, "pixel_size": pixel_size},
+        "coordinates": {"x": xy_labels[0], "y": xy_labels[1], "unit": unit, "pixel_size": pixel_size},
         "radius": {
             "source": source,
             "value_um": radius_um.tolist() if isinstance(radius_um, np.ndarray) else radius_um,
         },
         "n_coordinates_unmatched": n_coordinates_unmatched,
     }
-    sdata = SpatialData(shapes={region: shapes}, tables={"table": table})
+    sdata = SpatialData(shapes=shapes_by_region, tables={"table": table})
     return _set_reader_metadata(sdata, "cell_table")
 
 
@@ -459,7 +486,10 @@ def cell_table(
         Orientation of a separate counts file (``True``: genes in rows). ``None`` infers it from which axis
         matches the coordinate cell ids. Not used by the wide layout.
     split_by
-        Column splitting the cells into several shapes elements. Not implemented yet.
+        Column splitting the cells into several shapes elements ``cells_<value>`` (characters other than
+        letters, digits and ``_`` in the value become ``_``), all annotated by the single ``table``
+        (``region`` lists them). Cell ids need only be unique within a split; when an id repeats across splits
+        the ``table.obs`` index is prefixed with the split value.
     metadata_columns
         Non-gene columns, copied to ``obs``. Defaults to the Vizgen ``cell_metadata`` columns that are
         present; ``x``, ``y`` and ``split_by`` are always included. All other columns are genes.
@@ -479,7 +509,7 @@ def cell_table(
 
     Returns
     -------
-    A :class:`spatialdata.SpatialData` with the table ``table`` (annotating the shapes ``cells``;
+    A :class:`spatialdata.SpatialData` with the table ``table`` (annotating the shapes ``cells``, or ``cells_<value>`` with ``split_by``;
     ``region_key="region"``, ``instance_key="cell_id"``, an integer range equal to the shapes index; the
     string cell id is ``table.obs.index``).
 
@@ -487,9 +517,8 @@ def cell_table(
     ------
     ValueError
         If ``unit`` is invalid, ``unit="px"`` has no ``pixel_size``, the counts are not integral, cell ids
-        are duplicated, or the id, ``x`` or ``y`` columns are missing.
-    NotImplementedError
-        If ``split_by`` is given (not implemented yet).
+        are duplicated, the id, ``x``, ``y`` or ``split_by`` columns are missing, ``split_by`` has missing values, or two
+        values map to the same element name.
     """
     if unit not in _UNITS:
         raise ValueError(f"unit must be one of {_UNITS}, got {unit!r}.")
@@ -538,7 +567,6 @@ def cell_table(
         split_by=split_by,
         cell_radius=cell_radius,
         n_coordinates_unmatched=n_unmatched,
+        coordinate_labels=(labels[x], labels[y]) if labels else None,
     )
-    if labels:
-        sdata["table"].uns["spatialdata_io"]["coordinates"].update(x=labels[x], y=labels[y])
     return sdata
