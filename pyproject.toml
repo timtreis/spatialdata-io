@@ -27,6 +27,7 @@ dynamic = [
 dependencies = [
   "anndata",
   "click",
+  "dask",
   "dask-image",
   "flowio>=1.4",
   "h5py",
@@ -34,6 +35,7 @@ dependencies = [
   "joblib",
   "numpy",
   "ome-types",
+  "polars",
   "pyarrow",
   "readfcs",
   "scanpy",
