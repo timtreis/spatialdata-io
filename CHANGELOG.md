@@ -15,6 +15,11 @@ Release notes for `v0.7.1` and earlier are available on the [Releases][] page.
 
 ### Added
 
+- `cell_table` reads a cells x genes table of raw integer counts with centroids into a CSR table and
+  `cells` circle shapes, from a wide CSV/TSV, a counts file (delimited or `.mtx`) plus a `coordinates`
+  file, or an `.h5ad` file (`layer` picks the counts). `split_by` creates one shapes element per section.
+  The coordinate `unit` is required and mapped to micrometres with a `Scale` transformation; unit and
+  radius provenance are stored in `table.uns["spatialdata_io"]`.
 - `spatialdata_io` ships a `py.typed` marker, so downstream type checkers use its annotations.
 - `xenium` reads pre-1.3.0 (XOA < 1.3.0) and CSV-only bundles: when the parquet files and
   `cells.zarr.zip` are absent, the table, boundaries, and transcripts are read from the `cells.csv`,

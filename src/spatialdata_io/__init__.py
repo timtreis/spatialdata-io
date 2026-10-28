@@ -6,6 +6,7 @@ __version__ = version("spatialdata-io")
 
 _LAZY_IMPORTS: dict[str, str] = {
     # readers
+    "cell_table": "spatialdata_io.readers.cell_table",
     "codex": "spatialdata_io.readers.codex",
     "cosmx": "spatialdata_io.readers.cosmx",
     "curio": "spatialdata_io.readers.curio",
@@ -32,6 +33,7 @@ _LAZY_IMPORTS: dict[str, str] = {
 
 __all__ = [
     # readers
+    "cell_table",
     "codex",
     "cosmx",
     "curio",
@@ -80,6 +82,7 @@ if TYPE_CHECKING:
     from spatialdata_io.converters.generic_to_zarr import generic_to_zarr
 
     # readers
+    from spatialdata_io.readers.cell_table import cell_table
     from spatialdata_io.readers.codex import codex
     from spatialdata_io.readers.cosmx import cosmx
     from spatialdata_io.readers.curio import curio
