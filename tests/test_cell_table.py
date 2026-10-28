@@ -10,10 +10,12 @@ import pandas as pd
 import pytest
 import scipy.io
 import scipy.sparse as sp
-from spatialdata import SpatialData
+from spatialdata import SpatialData, join_spatialelement_table
+from spatialdata._logging import logger
 from spatialdata.transformations import Identity, Scale, get_transformation
 
 from spatialdata_io import cell_table
+from spatialdata_io.readers.cell_table import _build
 
 HEADER = ",fov,volume,center_x,center_y,min_x,GeneA,GeneB,Blank-1"
 ROWS = [
@@ -27,6 +29,10 @@ def _write(path: Path, rows: list[str] = ROWS, header: str = HEADER, junk: bool 
     lines = ([] if not junk else ["junk title"]) + [header, *rows]
     path.write_text("\n".join(lines) + "\n")
     return path
+
+
+def _dense(X: object) -> np.ndarray:
+    return sp.csr_matrix(X).toarray()
 
 
 @pytest.fixture
@@ -136,7 +142,7 @@ def test_skiprows(tmp_path: Path, csv: Path) -> None:
     b = cell_table(junk, unit="um", skiprows=1).tables["table"]
     assert a.shape == b.shape
     assert list(a.obs.index) == list(b.obs.index)
-    assert np.array_equal(a.X, b.X)
+    assert np.array_equal(_dense(a.X), _dense(b.X))
 
 
 def test_metadata_columns_override(csv: Path) -> None:
@@ -206,8 +212,6 @@ def test_split_prefix_collision_rejected(tmp_path: Path) -> None:
 
 
 def test_split_by_roundtrip_join(tmp_path: Path) -> None:
-    from spatialdata import join_spatialelement_table
-
     sdata = cell_table(_split_csv(tmp_path, ["a", "b", "a", "b", "b"]), unit="um", split_by="sample")
     sdata.write(tmp_path / "out.zarr")
     back = SpatialData.read(tmp_path / "out.zarr")
@@ -274,11 +278,6 @@ def test_roundtrip(csv: Path, tmp_path: Path) -> None:
 
 
 def test_build_sparse() -> None:
-    import pandas as pd
-    import scipy.sparse as sp
-
-    from spatialdata_io.readers.cell_table import _build
-
     obs = pd.DataFrame({"center_x": [1.0, 2.0], "center_y": [3.0, 4.0]}, index=["a", "b"])
     X = sp.csr_matrix(np.array([[1, 0, 2], [0, 3, 0]]))
     sdata = _build(
@@ -331,14 +330,14 @@ def test_split_genes_by_cells(tmp_path: Path) -> None:
     table = cell_table(counts, coords, unit="um", x="X", y="Y", cell_id="cells").tables["table"]
     assert table.shape == (20, 2)
     assert table.obsm["blank"].shape == (20, 1)
-    np.testing.assert_array_equal(np.asarray(table.X), mat[:, :2])
+    np.testing.assert_array_equal(_dense(table.X), mat[:, :2])
     assert list(table.obs["X"]) == list(np.arange(20.0))
 
 
 def test_split_cells_by_genes(tmp_path: Path) -> None:
     counts, coords, mat = _split_files(tmp_path, genes_as_rows=False)
     table = cell_table(counts, coords, unit="um", x="X", y="Y", cell_id="cells").tables["table"]
-    np.testing.assert_array_equal(np.asarray(table.X), mat[:, :2])
+    np.testing.assert_array_equal(_dense(table.X), mat[:, :2])
 
 
 def test_explicit_orientation_wins(tmp_path: Path) -> None:
@@ -383,14 +382,14 @@ def test_gzip_tsv_counts(tmp_path: Path) -> None:
     with gzip.open(gz, "wb") as f:
         f.write(counts.read_bytes())
     table = cell_table(gz, coords, unit="um", x="X", y="Y", cell_id="cells").tables["table"]
-    np.testing.assert_array_equal(np.asarray(table.X), mat[:, :2])
+    np.testing.assert_array_equal(_dense(table.X), mat[:, :2])
 
 
 def test_join_numeric_vs_string_ids(tmp_path: Path) -> None:
     counts, coords, mat = _split_files(tmp_path, ids=[str(i) for i in range(20)])
     table = cell_table(counts, coords, unit="um", x="X", y="Y", cell_id="cells").tables["table"]
     assert list(table.obs.index) == [str(i) for i in range(20)]
-    np.testing.assert_array_equal(np.asarray(table.X), mat[:, :2])
+    np.testing.assert_array_equal(_dense(table.X), mat[:, :2])
 
 
 def test_unnamed_index_column(tmp_path: Path) -> None:
@@ -415,8 +414,6 @@ def test_counts_cell_without_coords_rejected(tmp_path: Path) -> None:
 def test_extra_coord_rows_dropped(
     tmp_path: Path, caplog: pytest.LogCaptureFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    from spatialdata._logging import logger
-
     monkeypatch.setattr(logger, "propagate", True)
     counts, coords, _ = _split_files(tmp_path, extra=1)
     with caplog.at_level(logging.WARNING):
@@ -617,3 +614,48 @@ def test_h5ad_with_coordinates_file(tmp_path: Path) -> None:
     other.write_text("cell_id,center_x,center_y\nc1,1,2\n")
     with pytest.raises(ValueError, match="no coordinates"):
         cell_table(f, other, unit="um")
+
+
+def _mtx_files(tmp_path: Path, mat: np.ndarray) -> Path:
+    mtx = tmp_path / "exp.mtx.gz"
+    with gzip.open(mtx, "wb") as f:
+        scipy.io.mmwrite(f, sp.coo_matrix(mat.T))  # type: ignore[arg-type]  # genes x cells
+    for name, labels in (("features.tsv", GENES), ("barcodes.tsv", [f"c{i}" for i in range(len(mat))])):
+        (tmp_path / name).write_text("\n".join(labels) + "\n")
+    return mtx
+
+
+def test_x_is_csr_on_every_path(csv: Path, tmp_path: Path) -> None:
+    counts, coords, mat = _split_files(tmp_path)
+    mtx = _mtx_files(tmp_path, mat)
+    h5 = _h5ad(tmp_path / "a.h5ad", obsm={"spatial": np.array([[1.0, 3.0], [2.0, 4.0]])})
+    tables = [
+        cell_table(csv, unit="um")["table"],
+        cell_table(counts, coords, unit="um", x="X", y="Y", cell_id="cells")["table"],
+        cell_table(mtx, coords, unit="um", x="X", y="Y", cell_id="cells")["table"],
+        cell_table(h5, unit="um")["table"],
+    ]
+    for table in tables:
+        assert type(table.X) is sp.csr_matrix
+    np.testing.assert_array_equal(tables[0].X.toarray(), [[1, 2], [3, 0], [0, 5]])  # type: ignore[union-attr]
+    np.testing.assert_array_equal(tables[0].obsm["blank"], [[0], [1], [2]])
+
+
+def test_wide_string_column_rejected(tmp_path: Path) -> None:
+    rows = [f"{r},T{i}" for i, r in enumerate(ROWS)]
+    with pytest.raises(ValueError, match="cell_type.*metadata_columns"):
+        cell_table(_write(tmp_path / "s.csv", rows, HEADER + ",cell_type"), unit="um")
+
+
+def test_wide_trailing_comma(tmp_path: Path) -> None:
+    f = _write(tmp_path / "t.csv", [r + "," for r in ROWS], HEADER + ",")
+    table = cell_table(f, unit="um")["table"]
+    assert list(table.var_names) == ["GeneA", "GeneB"]
+    assert list(table.obs.columns).count("fov") == 1
+    assert not any(c.startswith("Unnamed") for c in table.obs.columns)
+
+
+def test_wide_nan_count_rejected(tmp_path: Path) -> None:
+    rows = [ROWS[0].replace(",1,2,0", ",1,,0"), *ROWS[1:]]
+    with pytest.raises(ValueError, match="GeneB.*metadata_columns"):
+        cell_table(_write(tmp_path / "n.csv", rows), unit="um")

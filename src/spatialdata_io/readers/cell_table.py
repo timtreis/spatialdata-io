@@ -149,23 +149,15 @@ def _build(
             dup = obs.index[obs.index.duplicated()].unique()[:5].tolist()
             raise ValueError(f"Cell ids are not unique after prefixing them with the split value, for example {dup}.")
 
-    genes: Any
-    blank: pd.DataFrame
-    is_gene = ~var_names.str.lower().str.contains("blank")
-    if isinstance(X, pd.DataFrame):
-        values = X.to_numpy()
-        genes = values[:, is_gene]
-        blank = pd.DataFrame(values[:, ~is_gene], index=obs.index, columns=var_names[~is_gene])
-    else:
-        csr = X.tocsr()  # type: ignore[attr-defined]  # stub lacks tocsr on spmatrix
-        values = csr.data
-        genes = csr[:, np.flatnonzero(is_gene)]
-        blank = pd.DataFrame(csr[:, np.flatnonzero(~is_gene)].toarray(), index=obs.index, columns=var_names[~is_gene])
-    if not np.all(np.mod(values, 1) == 0):
+    csr = sp.csr_matrix(X.to_numpy() if isinstance(X, pd.DataFrame) else X)
+    if not np.all(np.mod(csr.data, 1) == 0):
         raise ValueError(
             "Found non-integer values in the counts; this looks like a normalized matrix. "
             "cell_table() only reads raw integer counts."
         )
+    is_gene = ~var_names.str.lower().str.contains("blank")
+    genes = csr[:, np.flatnonzero(is_gene)]
+    blank = pd.DataFrame(csr[:, np.flatnonzero(~is_gene)].toarray(), index=obs.index, columns=var_names[~is_gene])
 
     n = len(obs)
     obs[_INSTANCE_KEY] = np.arange(n)
@@ -230,7 +222,17 @@ def _read_wide(
     missing = [c for c in meta if c not in df.columns]
     if missing:
         raise ValueError(f"Metadata columns {missing} not found in {counts.name}.")
-    gene_cols = [c for c in df.columns if c != id_col and c not in meta]
+    gene_cols = [
+        c
+        for i, c in enumerate(df.columns)
+        if c != id_col and c not in meta and not (i > 0 and str(c).startswith("Unnamed:"))
+    ]
+    bad = [c for c in gene_cols if not pd.api.types.is_numeric_dtype(df[c]) or df[c].isna().any()]
+    if bad:
+        raise ValueError(
+            f"Gene columns {bad[:5]} in {counts.name} are non-numeric or contain missing values; "
+            "pass the non-gene columns in metadata_columns."
+        )
     ids = df[id_col].astype(str)
     obs = df[meta].copy()
     obs.index = pd.Index(ids, name=None)
