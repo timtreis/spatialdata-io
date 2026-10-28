@@ -1764,7 +1764,7 @@ class TestExprMatMetadataColumns:
             {"fov": [1, 1, 1, 2, 2], "cell_ID": [0, 1, 2, 0, 1], "G1": [9, 0, 3, 8, 1], "G2": [7, 5, 0, 6, 2]}
         ).to_csv(p, index=False)
         full, full_bg = _io._read_expr_mat_polars(p)
-        monkeypatch.setattr(_io, "_EXPR_BATCH_ROWS", 2)
+        monkeypatch.setattr(_io, "_EXPR_BLOCK_BYTES", 24)  # a few rows per block
         adata, bg = _io._read_expr_mat_polars(p)
         assert adata.obs_names.tolist() == full.obs_names.tolist() == ["1_1", "1_2", "2_1"]
         assert adata.X.toarray().tolist() == full.X.toarray().tolist() == [[0, 5], [3, 0], [1, 2]]

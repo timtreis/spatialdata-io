@@ -286,28 +286,44 @@ def _read_expr_mat_polars(
     expr_cols = [c for c in after if schema[c].is_numeric()]
     meta_cols = [c for c in schema if c not in ("fov", "cell_ID", id_col, "", *expr_cols)]
 
-    lf = pl.scan_csv(expr_path, n_rows=n_rows, schema_overrides=dict.fromkeys(meta_cols, pl.Utf8))
+    # Stream the file in blocks with pyarrow and keep only the sparse X: a dense whole-transcriptome exprMat (~19k
+    # genes) is tens of GB per copy, and polars' streaming engine is ~2x slower than one read. Column types are pinned
+    # from the first rows, as polars infers them; background rows (cell_ID=0) are split off per block.
+    types = pl.DataFrame(schema={**schema, **dict.fromkeys(meta_cols, pl.Utf8)}).to_arrow().schema
     if parse_ids:
-        lf = _parse_atomx_cell_ids(lf, id_col, expr_path.name)
         meta_cols = ["cell", *meta_cols]
-    if fovs is not None:
-        lf = lf.filter(pl.col("fov").is_in(fovs))
-
-    lf = lf.with_columns(
-        (pl.col("fov").cast(pl.Utf8) + "_" + pl.col("cell_ID").cast(pl.Utf8)).alias("fov_cellID")
-    ).select(["fov", "cell_ID", "fov_cellID", *meta_cols, *expr_cols])
-
-    # Stream the file in row batches and keep only the sparse X: a dense whole-transcriptome exprMat (~19k genes)
-    # is tens of GB per copy. Background rows (cell_ID=0) are split off per batch.
     obs_cols = ["fov", "cell_ID", "fov_cellID", *meta_cols]
-    obs_parts, bg_parts, x_parts = [lf.clear().collect().select(obs_cols)], [], []
-    for batch in lf.collect_batches(chunk_size=_EXPR_BATCH_ROWS):
-        is_bg = batch["cell_ID"] == 0
-        if is_bg.any():
-            bg_parts.append(batch.filter(is_bg).select(["fov", *expr_cols]))
-            batch = batch.filter(~is_bg)
-        obs_parts.append(batch.select(obs_cols))
-        x_parts.append(scipy.sparse.csr_matrix(batch.select(expr_cols).to_numpy()))
+
+    def prep(df: pl.DataFrame) -> pl.DataFrame:
+        lf = _parse_atomx_cell_ids(df.lazy(), id_col, expr_path.name) if parse_ids else df.lazy()
+        if fovs is not None:
+            lf = lf.filter(pl.col("fov").is_in(fovs))
+        return (
+            lf.with_columns((pl.col("fov").cast(pl.Utf8) + "_" + pl.col("cell_ID").cast(pl.Utf8)).alias("fov_cellID"))
+            .select([*obs_cols, *expr_cols])
+            .collect()
+        )
+
+    obs_parts, bg_parts, x_parts = [prep(pl.DataFrame(types.empty_table())).select(obs_cols)], [], []
+    with gzip.open(expr_path, "rb") if expr_path.suffix == ".gz" else open(expr_path, "rb") as fin:
+        reader = pacsv.open_csv(
+            fin,
+            read_options=pacsv.ReadOptions(block_size=_EXPR_BLOCK_BYTES),
+            convert_options=pacsv.ConvertOptions(column_types=types),
+        )
+        seen = 0
+        for block in reader:
+            if n_rows is not None:
+                block, seen = block.slice(0, n_rows - seen), seen + block.num_rows
+            batch = prep(pl.DataFrame(pa.Table.from_batches([block])))
+            is_bg = batch["cell_ID"] == 0
+            if is_bg.any():
+                bg_parts.append(batch.filter(is_bg).select(["fov", *expr_cols]))
+                batch = batch.filter(~is_bg)
+            obs_parts.append(batch.select(obs_cols))
+            x_parts.append(scipy.sparse.csr_matrix(batch.select(expr_cols).to_numpy()))
+            if n_rows is not None and seen >= n_rows:
+                break
 
     bg_df: pd.DataFrame | None = None
     if bg_parts:
@@ -326,7 +342,7 @@ def _read_expr_mat_polars(
     return AnnData(X=X, obs=obs, var=var), bg_df
 
 
-_EXPR_BATCH_ROWS = 10_000  # dense batch of ~1.5 GB for 19k int64 genes
+_EXPR_BLOCK_BYTES = 16 << 20  # CSV text per block: ~0.5 GB dense for 19k int64 genes
 _ATOMX_CELL_ID = r"^c_\d+_(\d+)_(\d+)$"  # c_<slide>_<fov>_<cell>
 
 
