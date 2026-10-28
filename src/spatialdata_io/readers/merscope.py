@@ -369,6 +369,16 @@ def _get_polygons(boundaries_path: Path, transformations: dict[str, BaseTransfor
     return ShapesModel.parse(geo_df, transformations=transformations)
 
 
+def _read_csv_str_index(path: Path) -> pd.DataFrame:
+    """Read a cell table with its first column as a str index, whatever its header.
+
+    GEO re-exports often leave the id header empty, so a dtype keyed by "cell"/"EntityID" never applies,
+    and 39-digit EntityIDs (beyond int64) would parse as Python ints.
+    """
+    first = pd.read_csv(path, nrows=0).columns[0]
+    return pd.read_csv(path, index_col=0, dtype={first: str})
+
+
 def _get_table(
     count_path: Path,
     obs_path: Path,
@@ -377,8 +387,15 @@ def _get_table(
     dataset_id: str,
     region: str,
 ) -> anndata.AnnData:
-    data = pd.read_csv(count_path, index_col=0, dtype={MerscopeKeys.COUNTS_CELL_KEY: str})
-    obs = pd.read_csv(obs_path, index_col=0, dtype={MerscopeKeys.METADATA_CELL_KEY: str})
+    data = _read_csv_str_index(count_path)
+    obs = _read_csv_str_index(obs_path)
+    # cell_metadata may list the cells in another order than cell_by_gene (GEO re-exports): align by id.
+    missing = data.index.difference(obs.index)
+    if len(missing):
+        raise ValueError(
+            f"{len(missing)} cell(s) of {count_path.name} are missing from {obs_path.name}, e.g. {list(missing[:3])}"
+        )
+    obs = obs.loc[data.index]
 
     is_gene = ~data.columns.str.lower().str.contains("blank")
     genes = data.loc[:, is_gene]

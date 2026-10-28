@@ -229,3 +229,33 @@ def test_channel_names_sorted_deterministic(tmp_path: Path) -> None:
             (images / f"mosaic_{stain}_z{z}.tif").touch()
     result = _get_channel_names(images)
     assert result == sorted(stains)
+
+
+def test_geo_export_unnamed_id_column_and_shuffled_metadata(tmp_path: Path) -> None:
+    # GEO re-exports (GSE329718, GSE202623): the id column has an empty header, ids are 39-digit
+    # EntityIDs (beyond int64), and cell_metadata lists the cells in another order than cell_by_gene.
+    region = _write_dataset(tmp_path, with_images_transform=False)
+    ids = ["102900918346939267033741478067796675139", "103451196512055018926220489218674221826"]
+    ids += [str(10**38 + i) for i in range(len(CELL_IDS) - 2)]
+    counts = pd.read_csv(region / "cell_by_gene.csv", index_col=0)
+    counts.index = pd.Index(ids, name=None)
+    counts.to_csv(region / "cell_by_gene.csv")
+    meta = pd.read_csv(region / "cell_metadata.csv", index_col=0)
+    meta.index = pd.Index(ids, name=None)
+    meta.iloc[::-1].to_csv(region / "cell_metadata.csv")
+    (region / "cell_boundaries.parquet").unlink()
+
+    sdata = merscope(region, mosaic_images=False, cells_boundaries=False)
+    table = sdata["table"]
+    assert list(table.obs_names) == ids
+    np.testing.assert_array_equal(table.obs["center_x"].to_numpy(), meta["center_x"].to_numpy())
+    np.testing.assert_array_equal(table.to_df()[GENES].to_numpy(), counts[GENES].to_numpy())
+    assert list(table.obsm["blank"].index) == ids
+
+
+def test_counts_cells_missing_from_metadata_raise(tmp_path: Path) -> None:
+    region = _write_dataset(tmp_path, with_images_transform=False)
+    meta = pd.read_csv(region / "cell_metadata.csv", index_col=0)
+    meta.iloc[1:].to_csv(region / "cell_metadata.csv")
+    with pytest.raises(ValueError, match="cell_metadata"):
+        merscope(region, mosaic_images=False, cells_boundaries=False)
