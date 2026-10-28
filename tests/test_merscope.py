@@ -259,3 +259,32 @@ def test_counts_cells_missing_from_metadata_raise(tmp_path: Path) -> None:
     meta.iloc[1:].to_csv(region / "cell_metadata.csv")
     with pytest.raises(ValueError, match="cell_metadata"):
         merscope(region, mosaic_images=False, cells_boundaries=False)
+
+
+def test_boundaries_on_other_z_planes_are_kept(tmp_path: Path) -> None:
+    # GSE307719: 3D segmentation, so each z-plane has its own polygon set and many cells have no
+    # z=0 polygon. Cells keep z=0 when it exists, else their largest polygon from another plane.
+    import geopandas as gpd
+
+    region = _write_dataset(tmp_path, with_images_transform=False)
+    a, b, c = CELL_IDS[0], CELL_IDS[1], CELL_IDS[2]
+    rows = [
+        (a, 0, _square(0, 0, 1.0)),
+        (a, 1, _square(0, 0, 3.0)),  # bigger, but a has z=0: keep z=0
+        (b, 1, _square(5, 5, 1.0)),
+        (b, 2, _square(5, 5, 2.0)),  # b has no z=0: take the largest (z=2)
+        (c, 0, Polygon()),  # empty at z=0
+        (c, 3, _square(9, 9, 1.0)),
+    ]
+    rows += [(i, 0, _square(20, 20)) for i in CELL_IDS[3:]]
+    gdf = gpd.GeoDataFrame(
+        {"EntityID": [r[0] for r in rows], "ZIndex": [r[1] for r in rows]}, geometry=[r[2] for r in rows]
+    ).rename_geometry("Geometry")
+    gdf.to_parquet(region / "cell_boundaries.parquet")
+
+    shapes = next(iter(merscope(region, mosaic_images=False).shapes.values()))
+    assert set(shapes.index) == {str(i) for i in CELL_IDS}
+    z = shapes["ZIndex"]
+    assert (z[str(a)], z[str(b)], z[str(c)]) == (0, 2, 3)
+    assert shapes.geometry[str(a)].area == pytest.approx(4.0)
+    assert shapes.geometry[str(b)].area == pytest.approx(16.0)

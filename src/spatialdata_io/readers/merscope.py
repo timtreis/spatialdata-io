@@ -353,10 +353,29 @@ def _as_multipolygon(geom: Any) -> MultiPolygon:
     return MultiPolygon(polys)
 
 
+def _one_boundary_per_cell(geo_df: geopandas.GeoDataFrame) -> geopandas.GeoDataFrame:
+    """Keep one boundary per cell across z-planes.
+
+    Standard Vizgen output repeats each 2D boundary on every z-plane, so z=0 is kept. With 3D segmentation
+    each plane has its own polygons and many cells have none at z=0 (GSE307719): those cells take their
+    largest non-empty polygon from another plane. The ``ZIndex`` column records the plane used.
+    """
+    geo_df = geo_df[~geo_df.geometry.is_empty]
+    z = geo_df[MerscopeKeys.Z_INDEX]
+    cell = geo_df[MerscopeKeys.METADATA_CELL_KEY]
+    at_z0 = geo_df[z == 0]
+    rest = geo_df[(z != 0) & ~cell.isin(at_z0[MerscopeKeys.METADATA_CELL_KEY])]
+    if rest.empty:
+        return at_z0
+    rest = rest.loc[rest.geometry.area.groupby(rest[MerscopeKeys.METADATA_CELL_KEY]).idxmax()]
+    logger.info(f"{len(rest)} cell(s) have no z=0 boundary; using their largest boundary from another z-plane.")
+    return pd.concat([at_z0, rest])
+
+
 def _get_polygons(boundaries_path: Path, transformations: dict[str, BaseTransformation]) -> geopandas.GeoDataFrame:
     geo_df = geopandas.read_parquet(boundaries_path)
     geo_df = geo_df.rename_geometry("geometry")
-    geo_df = geo_df[geo_df[MerscopeKeys.Z_INDEX] == 0]  # Avoid duplicate boundaries on all z-levels
+    geo_df = _one_boundary_per_cell(geo_df)
     # Repair invalid (e.g. self-intersecting) boundaries instead of dropping them: a dropped polygon leaves
     # its cell in the table annotating a shape that does not exist.
     geo_df.geometry = geo_df.geometry.map(_as_multipolygon)
