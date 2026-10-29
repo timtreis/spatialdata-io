@@ -732,3 +732,9 @@ def test_uns_roundtrip(tmp_path: Path) -> None:
     for k, v in before.items():
         if v is not None:  # None values may not survive zarr; documented by the key check above
             assert after[k] == v
+
+
+def test_omics_header_recorded(tmp_path: Path) -> None:
+    adt = _tissue(tmp_path, "GSM1_CHIP_Stereo-CITE_ADT.tissue.gef", attrs={"omics": [b"Proteomics"], "resolution": 500})
+    assert stereoseq_gef(gef=adt, bin_size=2)["table"].uns["spatialdata_io"]["omics"] == "Proteomics"
+    assert stereoseq_gef(gef=_tissue(tmp_path), bin_size=2)["table"].uns["spatialdata_io"]["omics"] is None

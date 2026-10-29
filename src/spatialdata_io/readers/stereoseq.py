@@ -792,7 +792,8 @@ def stereoseq_gef(
     - ``uns["spatialdata_io"]``: ``reader``, ``resolution_nm``, ``resolution_source``, ``bin_size_dnb``,
       ``bin_size_um``, ``gef_kind`` (``"full"`` or ``"bin1_only"``, bins table only), ``source_bins``
       (``"precomputed"`` or ``"aggregated_from_bin1"``, bins table only) and ``n_cells_fallback_geometry``
-      (cells table only). Fields that do not apply are ``None``.
+      (cells table only), and ``omics``, the files' ``omics`` header (``"Transcriptomics"``, or ``"Proteomics"`` for
+      Stereo-CITE ADT GEFs, whose features are antibodies). Fields that do not apply are ``None``.
 
     Full ``.gef`` bins are not tissue-masked, unlike ``tissue.gef``, so they include off-tissue bins. If a precomputed
     ``geneExp/bin{bin_size}`` group has coordinates that are not multiples of ``bin_size``, a warning is logged and
@@ -841,6 +842,8 @@ def stereoseq_gef(
             "gef_kind": None,
             "source_bins": None,
             "n_cells_fallback_geometry": None,
+            # "Transcriptomics" or "Proteomics" (Stereo-CITE ADT GEFs, whose "genes" are antibodies)
+            "omics": next((o for f in (gef_f, cell_f) if f is not None and (o := _gef_attr(f, "omics"))), None),
         }
         tables: dict[str, ad.AnnData] = {}
         shapes: dict[str, GeoDataFrame] = {}
