@@ -23,6 +23,7 @@ I/O for the `spatialdata` project.
     cosmx
     curio
     dbit
+    dbit_fragments
     experimental.iss
     mcmicro
     merscope

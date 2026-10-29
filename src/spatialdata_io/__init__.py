@@ -11,6 +11,7 @@ _LAZY_IMPORTS: dict[str, str] = {
     "cosmx": "spatialdata_io.readers.cosmx",
     "curio": "spatialdata_io.readers.curio",
     "dbit": "spatialdata_io.readers.dbit",
+    "dbit_fragments": "spatialdata_io.readers.dbit_epigenome",
     "macsima": "spatialdata_io.readers.macsima",
     "mcmicro": "spatialdata_io.readers.mcmicro",
     "merscope": "spatialdata_io.readers.merscope",
@@ -40,6 +41,7 @@ __all__ = [
     "cosmx",
     "curio",
     "dbit",
+    "dbit_fragments",
     "macsima",
     "mcmicro",
     "merscope",
@@ -91,6 +93,7 @@ if TYPE_CHECKING:
     from spatialdata_io.readers.cosmx import cosmx
     from spatialdata_io.readers.curio import curio
     from spatialdata_io.readers.dbit import dbit
+    from spatialdata_io.readers.dbit_epigenome import dbit_fragments
 
     # readers file types
     from spatialdata_io.readers.generic import generic, geojson, image
