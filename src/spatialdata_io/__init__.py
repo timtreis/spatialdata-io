@@ -14,6 +14,7 @@ _LAZY_IMPORTS: dict[str, str] = {
     "macsima": "spatialdata_io.readers.macsima",
     "mcmicro": "spatialdata_io.readers.mcmicro",
     "merscope": "spatialdata_io.readers.merscope",
+    "mibi": "spatialdata_io.readers.mibi",
     "phenocycler": "spatialdata_io.readers.phenocycler",
     "seqfish": "spatialdata_io.readers.seqfish",
     "steinbock": "spatialdata_io.readers.steinbock",
@@ -42,6 +43,7 @@ __all__ = [
     "macsima",
     "mcmicro",
     "merscope",
+    "mibi",
     "phenocycler",
     "seqfish",
     "steinbock",
@@ -95,6 +97,7 @@ if TYPE_CHECKING:
     from spatialdata_io.readers.macsima import macsima
     from spatialdata_io.readers.mcmicro import mcmicro
     from spatialdata_io.readers.merscope import merscope
+    from spatialdata_io.readers.mibi import mibi
     from spatialdata_io.readers.phenocycler import phenocycler
     from spatialdata_io.readers.seqfish import seqfish
     from spatialdata_io.readers.steinbock import steinbock
