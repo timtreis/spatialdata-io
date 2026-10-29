@@ -11,6 +11,7 @@ import subprocess
 from typing import TYPE_CHECKING, Any, cast
 
 import dask.array as da
+import numpy as np
 import pandas as pd
 import polars as pl
 import pyarrow as pa
@@ -165,6 +166,20 @@ def _read_fov_locs(
         df = df.loc[fovs_sorted]
 
     return df
+
+
+def _pixel_size_from_fov_positions(csv_path: Path) -> float | None:
+    """µm per pixel from a positions file that lists each FOV in both pixels and mm, else ``None``."""
+    df = pd.read_csv(csv_path)
+    cols = {c.lower(): c for c in df.columns}
+    if "x_global_px" not in cols or "x_global_mm" not in cols:
+        return None
+    px = df[cols["x_global_px"]].astype(float)
+    mm = df[cols["x_global_mm"]].astype(float)
+    if px.nunique() < 2:
+        return None
+    # slope of mm over px, so a shared origin offset between the two columns does not matter
+    return abs(float(np.polyfit(px, mm, 1)[0])) * 1000.0
 
 
 # ---------------------------------------------------------------------------

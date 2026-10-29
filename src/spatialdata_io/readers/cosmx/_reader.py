@@ -41,7 +41,7 @@ from spatialdata.models import (
     ShapesModel,
     TableModel,
 )
-from spatialdata.transformations import Translation
+from spatialdata.transformations import Scale, Sequence, Translation, get_transformation, set_transformation
 
 from spatialdata_io._constants._constants import CosmxKeys
 from spatialdata_io._docs import inject_docs
@@ -53,12 +53,14 @@ from ._discovery import (
 )
 from ._io import (
     COSMX_FOV_SIZE_PX,
+    COSMX_PIXEL_SIZE,
     NoFovCoordinatesError,
     _default_image_kwargs,
     _find_matching_fov_file,
     _get_cosmx_morphology_coords,
     _maybe_warn_big_file,
     _parquet_cache_for_tx,
+    _pixel_size_from_fov_positions,
     _read_expr_mat_polars,
     _read_fov_image,
     _read_fov_locs,
@@ -1144,12 +1146,33 @@ def _cosmx_multi(
                 tables[mod_name] = next(iter(mod_tables.values()))
 
     logger.debug("[5/5] Assembling SpatialData object...")
-    return _assemble_sdata(images, points, labels, shapes, tables)
+    return _assemble_sdata(images, points, labels, shapes, tables, label_ds.fov_positions_file)
 
 
 # ---------------------------------------------------------------------------
 # SpatialData assembly
 # ---------------------------------------------------------------------------
+
+
+def _pixel_size_um(fov_positions_file: Path | None) -> dict[str, Any]:
+    """The pixel size in µm and its source: the deposit's positions file if it lists px and mm, else the spec."""
+    measured = _pixel_size_from_fov_positions(fov_positions_file) if fov_positions_file is not None else None
+    if measured is None:
+        return {"pixel_size_um": COSMX_PIXEL_SIZE, "pixel_size_source": "spec"}
+    if abs(measured / COSMX_PIXEL_SIZE - 1) > 0.01:
+        logger.warning(
+            f"{fov_positions_file.name} gives {measured:.6g} µm per pixel, more than 1% off the CosMx spec "  # type: ignore[union-attr]
+            f"{COSMX_PIXEL_SIZE}; using the file's value for the 'microns' coordinate system."
+        )
+    return {"pixel_size_um": measured, "pixel_size_source": "fov_positions"}
+
+
+def _add_microns(sdata: SpatialData, pixel_size_um: float) -> None:
+    """Add the ``"microns"`` coordinate system: each element's ``"global"`` (pixel) transformation, then a scale."""
+    scale = Scale([pixel_size_um, pixel_size_um], axes=("x", "y"))
+    for _, _, element in sdata.gen_spatial_elements():
+        to_global = get_transformation(element, to_coordinate_system="global")
+        set_transformation(element, Sequence([to_global, scale]), to_coordinate_system="microns")  # type: ignore[list-item]
 
 
 def _assemble_sdata(
@@ -1158,6 +1181,7 @@ def _assemble_sdata(
     labels: dict[str, Any],
     shapes: dict[str, Any],
     tables: dict[str, Any],
+    fov_positions_file: Path | None = None,
 ) -> SpatialData:
     """Build and annotate the final SpatialData object."""
     # Move each image's per-channel normalization divisors from the (non-persisted) element
@@ -1180,6 +1204,8 @@ def _assemble_sdata(
         tables=tables,
         attrs=attrs,
     )
+    sdata.attrs["cosmx"] = _pixel_size_um(fov_positions_file)
+    _add_microns(sdata, sdata.attrs["cosmx"]["pixel_size_um"])
 
     # Wire tables to label elements
     if labels and sdata.tables:
@@ -1424,6 +1450,12 @@ def cosmx(
     Returns
     -------
     :class:`spatialdata.SpatialData` or ``None`` (if ``preview_fovs=True``).
+
+    Every element is in pixels in ``"global"`` and in µm in ``"microns"`` (the same transformation followed by a
+    scale). The pixel size is taken from the FOV positions file when it lists each FOV in both ``x_global_px`` and
+    ``x_global_mm`` (a warning is logged if it is more than 1% off the spec), else it is the CosMx spec value
+    0.120280945 µm; ``sdata.attrs["cosmx"]`` records it as ``pixel_size_um`` with ``pixel_size_source``
+    (``"fov_positions"`` or ``"spec"``).
     """
     n_workers = n_workers or 1
     path = Path(path).resolve()
@@ -1539,4 +1571,4 @@ def cosmx(
     if add_fovs_as_shapes:
         shapes = {**shapes, **reader.build_fov_shapes()}
 
-    return _assemble_sdata(images, points, labels, shapes, tables)
+    return _assemble_sdata(images, points, labels, shapes, tables, dataset.fov_positions_file)

@@ -390,6 +390,37 @@ class TestFovPositions:
             _read_fov_locs(fixture_a / "S0_fov_positions_file.csv.gz", fovs=[99])
 
 
+class TestMicrons:
+    def test_pixel_size_from_px_and_mm_columns(self, fixture_a, sdio):
+        from spatialdata.transformations import get_transformation
+
+        from spatialdata_io.readers.cosmx._io import COSMX_PIXEL_SIZE
+
+        sdata = _read(sdio, fixture_a)
+        assert sdata.attrs["cosmx"]["pixel_size_source"] == "fov_positions"
+        assert sdata.attrs["cosmx"]["pixel_size_um"] == pytest.approx(COSMX_PIXEL_SIZE, rel=1e-6)
+        for _, name, element in sdata.gen_spatial_elements():
+            to_px = get_transformation(element, "global").to_affine_matrix(("x", "y"), ("x", "y"))
+            to_um = get_transformation(element, "microns").to_affine_matrix(("x", "y"), ("x", "y"))
+            np.testing.assert_allclose(to_um[:2], to_px[:2] * COSMX_PIXEL_SIZE, err_msg=name)
+
+    def test_spec_pixel_size_without_mm_and_warning_off_spec(self, fixture_b, tmp_path, sdio, caplog):
+        from spatialdata_io.readers.cosmx._io import COSMX_PIXEL_SIZE
+        from spatialdata_io.readers.cosmx._reader import _pixel_size_um
+
+        sdata = _read(sdio, fixture_b)
+        assert sdata.attrs["cosmx"] == {"pixel_size_um": COSMX_PIXEL_SIZE, "pixel_size_source": "spec"}
+        assert "microns" in sdata.coordinate_systems
+
+        off = tmp_path / "fov_positions_file.csv"
+        pd.DataFrame({"fov": [1, 2], "x_global_px": [100, 4356], "x_global_mm": [0.1, 0.1 + 4256 * 0.18e-3]}).to_csv(
+            off, index=False
+        )
+        with caplog.at_level("WARNING"):
+            assert _pixel_size_um(off)["pixel_size_um"] == pytest.approx(0.18)
+        assert "off the CosMx spec" in caplog.text
+
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 3. HEADER MATCHING (no I/O)
 # ═══════════════════════════════════════════════════════════════════════════

@@ -17,6 +17,8 @@ Release notes for `v0.7.1` and earlier are available on the [Releases][] page.
 
 - `dbit_fragments()` reads DBiT spatial-ATAC / spatial-CUT&Tag deposits: it streams a 10x fragments file into Tn5
   insertion counts per peak or genome tile (or reads a 10x peak matrix), with one square per DBiT pixel and the tissue image.
+- `cosmx()` adds a `"microns"` coordinate system next to the pixel `"global"` one, scaled by the pixel size from
+  the FOV positions file (when it lists px and mm) or the CosMx spec; `sdata.attrs["cosmx"]` records the value and its source.
 - `mibi()` reads one MIBI field of view in the Angelo lab layout (one TIFF per channel, as deposited on the
   BioImage Archive) into an image named by its channels, with optional segmentation masks as labels.
 - `cell_table` reads a cells x genes table of raw integer counts with centroids into a CSR table and
