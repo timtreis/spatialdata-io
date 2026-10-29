@@ -123,7 +123,8 @@ def merscope(
 
     This function reads the following files:
 
-        - ``{ms.COUNTS_FILE!r}``: Counts file.
+        - ``{ms.COUNTS_FILE!r}``: Counts file. If it is missing, the counts are built from the ``cell_id`` of each
+          transcript in ``{ms.TRANSCRIPTS_FILE!r}`` (unassigned transcripts, ``cell_id`` -1, are dropped).
         - ``{ms.TRANSCRIPTS_FILE!r}``: Transcript file.
         - ``{ms.CELL_METADATA_FILE!r}``: Per-cell metadata file.
         - ``{ms.BOUNDARIES_FILE!r}``: Cell polygon boundaries.
@@ -252,8 +253,13 @@ def merscope(
     tables = {}
 
     if cells_table:
-        if count_path.exists() and obs_path.exists():
+        if obs_path.exists() and count_path.exists():
             tables["table"] = _get_table(count_path, obs_path, vizgen_region, slide_name, dataset_id, region)
+        elif obs_path.exists() and transcript_path.exists():
+            logger.warning(f"{count_path.name} not found; counting the transcripts of {transcript_path.name} per cell.")
+            tables["table"] = _get_table(
+                count_path, obs_path, vizgen_region, slide_name, dataset_id, region, transcript_path
+            )
         else:
             logger.warning(
                 f"At least one of the following files does not exist: {count_path}, {obs_path}. The table is not loaded."
@@ -427,6 +433,41 @@ def _read_csv_str_index(path: Path) -> pd.DataFrame:
     return pd.read_csv(path, index_col=0, dtype={first: str})
 
 
+_TX_CHUNK_ROWS = 5_000_000
+
+
+def _counts_from_transcripts(transcript_path: Path, cells: pd.Index) -> pd.DataFrame:
+    """Cells x genes counts from the ``cell_id`` of each transcript, for deposits without a cell_by_gene file.
+
+    The transcripts are read in chunks; unassigned ones (``cell_id`` -1) are dropped, and metadata cells without
+    transcripts get an all-zero row. Transcripts of cells missing from the metadata are dropped with a warning.
+    """
+    counts: pd.Series | None = None
+    n_total = 0
+    reader = pd.read_csv(
+        transcript_path, usecols=["cell_id", "gene"], dtype={"cell_id": str, "gene": str}, chunksize=_TX_CHUNK_ROWS
+    )
+    for chunk in reader:
+        n_total += len(chunk)
+        chunk_counts = chunk[chunk["cell_id"] != "-1"].value_counts(["cell_id", "gene"])
+        counts = chunk_counts if counts is None else counts.add(chunk_counts, fill_value=0)
+    if counts is None or counts.empty:
+        raise ValueError(f"No transcript of {transcript_path.name} is assigned to a cell (all cell_id -1).")
+    data = counts.astype(np.int64).unstack(fill_value=0)
+    n_cell = int(counts.sum())
+    logger.info(
+        f"Built the counts from {transcript_path.name}: {n_cell:,} of {n_total:,} transcripts are assigned to a cell "
+        f"({n_total - n_cell:,} unassigned, cell_id -1)."
+    )
+    if len(extra := data.index.difference(cells)):
+        logger.warning(
+            f"Dropped the transcripts of {len(extra)} cell(s) missing from the cell metadata, e.g. {list(extra[:3])}."
+        )
+    data = data.reindex(index=cells, fill_value=0)
+    data.columns.name = None
+    return data
+
+
 def _get_table(
     count_path: Path,
     obs_path: Path,
@@ -434,9 +475,14 @@ def _get_table(
     slide_name: str,
     dataset_id: str,
     region: str,
+    transcript_path: Path | None = None,
 ) -> anndata.AnnData:
-    data = _read_csv_str_index(count_path)
     obs = _read_csv_str_index(obs_path)
+    if count_path.exists() or transcript_path is None:
+        data = _read_csv_str_index(count_path)
+    else:
+        # GSE327192: no cell_by_gene, but every transcript carries the cell it was assigned to.
+        data = _counts_from_transcripts(transcript_path, obs.index)
     # cell_metadata may list the cells in another order than cell_by_gene (GEO re-exports): align by id.
     missing = data.index.difference(obs.index)
     if len(missing) and (bare := _strip_uniform_prefix(data.index)) is not None and bare.isin(obs.index).all():

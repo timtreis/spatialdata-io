@@ -213,6 +213,27 @@ def test_vpt_folder_with_prefixed_names(tmp_path: Path, counts: str, metadata: s
     assert len(next(iter(sdata.points.values()))) == len(GENES) * 2
 
 
+def test_counts_built_from_transcripts_without_cell_by_gene(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # GSE327192: cell_metadata + detected_transcripts (with cell_id) but no cell_by_gene. Unassigned (-1) transcripts
+    # are dropped, and a cell without transcripts keeps an all-zero row.
+    from spatialdata_io.readers import merscope as mod
+
+    region = _write_dataset(tmp_path, with_images_transform=False)
+    (region / "cell_by_gene.csv").unlink()
+    tx = pd.read_csv(region / "detected_transcripts.csv", index_col=0)
+    tx["cell_id"] = [CELL_IDS[i % 2] for i in range(len(tx) - 1)] + [-1]
+    tx.to_csv(region / "detected_transcripts.csv")
+    monkeypatch.setattr(mod, "_TX_CHUNK_ROWS", 3)  # several chunks
+    table = merscope(region, mosaic_images=False, cells_boundaries=False, transcripts=False)["table"]
+    assigned = tx[tx["cell_id"] != -1]
+    expected = pd.crosstab(assigned["cell_id"].astype(str), assigned["gene"]).reindex(
+        index=[str(c) for c in CELL_IDS], columns=table.var_names, fill_value=0
+    )
+    assert table.obs_names.tolist() == [str(c) for c in CELL_IDS]
+    assert table.X.toarray().tolist() == expected.to_numpy().tolist()
+    assert table.X.sum() == len(tx) - 1
+
+
 def test_polygon_boundaries_supported(tmp_path: Path) -> None:
     # plain Polygon geometries must not crash the MultiPolygon normalisation
     region = _write_dataset(tmp_path, polygon_geometry=True)
