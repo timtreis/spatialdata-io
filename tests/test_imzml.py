@@ -116,3 +116,26 @@ def test_header_pixel_size_area_and_placeholder(
         source,
         expected is None,
     )
+
+
+def _dims(width_um: float) -> str:
+    return f'<cvParam cvRef="IMS" accession="IMS:1000044" name="max dimension x" value="{width_um}" unitName="micrometer"/>'
+
+
+@pytest.mark.parametrize(
+    ("header", "width", "expected", "source"),
+    [
+        ("400", 40, 20.0, "imzml header (area->sqrt)"),  # 2 pixels over 40 µm: a 20 µm pixel written as its area
+        ("20", 40, 20.0, "imzml header"),
+        ("7", 40, None, "inconsistent"),
+    ],
+)
+def test_header_pixel_size_checked_against_dimensions(
+    tmp_path: Path, header: str, width: float, expected: float | None, source: str
+) -> None:
+    settings = _PIXEL_SIZE.replace('value="50"', f'value="{header}"') + _dims(width)
+    path = _write(tmp_path / "s.imzML", extra_settings=settings)
+    uns = imzml(path, pixel_size_um=33.0)["table"].uns["spatialdata_io"]
+    assert (uns["pixel_size_um"], uns["pixel_size_source"]) == (expected, source)
+    assert (uns["pixel_size_header"], uns["pixel_size_from_dimensions"]) == (float(header), 20.0)
+    assert uns["pitch_unknown"] is (expected is None)

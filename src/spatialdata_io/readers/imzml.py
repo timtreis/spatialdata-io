@@ -32,6 +32,8 @@ _PPM_TOF = 20.0
 _PPM_DEFAULT = 10.0
 # header pixel sizes above this are FlexImaging pixel areas in µm²
 _AREA_THRESHOLD = 1000.0
+# max dimension x may span count or count - 1 pixels
+_DIM_TOL = 0.05
 
 
 def imzml(
@@ -67,9 +69,11 @@ def imzml(
     ppm
         m/z tolerance (bin width) in ppm; see above for the default.
     pixel_size_um
-        Pixel size in µm, used when the header states none (e.g. from the repository text). A header value above
-        1000 is read as the pixel area in µm² (FlexImaging) and its square root is used; a header value of exactly 1
-        is treated as a converter placeholder, i.e. as no value.
+        Pixel size in µm, used when the header states none (e.g. from the repository text). The header value is
+        checked against ``max dimension x`` / ``max count of pixels x`` when both are given: equal to it, it is the
+        side; equal to its square, the area (FlexImaging writes µm²), so its square root is used; otherwise the
+        pixel size is unknown (``pixel_size_source="inconsistent"``, both values in ``uns``). Without those fields, a
+        header value above 1000 is read as an area and exactly 1 as a converter placeholder (no value).
 
     Returns
     -------
@@ -124,20 +128,19 @@ def imzml(
     keep = np.flatnonzero(n_peaks > 0)
     xy = coords[keep, :2]
 
-    header_px, header_source = _pixel_size(parser), "imzml header"
-    if header_px is not None and header_px > _AREA_THRESHOLD:
-        # FlexImaging writes the pixel area in µm² (10000 for 100 µm pixels)
-        header_px, header_source = math.sqrt(header_px), "imzml header (area->sqrt)"
-    if header_px == 1.0:
-        header_px = None  # a converter placeholder, not a 1 µm pixel
+    raw_px = _pixel_size(parser)
+    d = parser.imzmldict
+    dim, count = d.get("max dimension x"), d.get("max count of pixels x")
+    dim_px = float(dim) / float(count) if dim and count else None
+    header_px, header_source = _resolve_header_pixel_size(raw_px, dim_px)
     if header_px is not None:
         px, px_source = header_px, header_source
         if pixel_size_um is not None and not math.isclose(header_px, pixel_size_um, rel_tol=0.01):
             logger.warning(f"{path.name} states {header_px} µm per pixel, not {pixel_size_um}; using the header.")
-    elif pixel_size_um is not None:
+    elif pixel_size_um is not None and header_source != "inconsistent":
         px, px_source = pixel_size_um, "repository text"
     else:
-        px, px_source = None, None
+        px, px_source = None, header_source if header_source == "inconsistent" else None
 
     uns = {
         "reader": "imzml",
@@ -153,6 +156,8 @@ def imzml(
         "n_pixels_empty": int(len(coords) - len(keep)),
         "pixel_size_um": px,
         "pixel_size_source": px_source,
+        "pixel_size_header": raw_px,
+        "pixel_size_from_dimensions": dim_px,
         "pitch_unknown": px is None,
     }
     obs = pd.DataFrame(
@@ -198,6 +203,31 @@ def _pixel_size(parser: Any) -> float | None:
     if y is not None and not math.isclose(float(x), float(y), rel_tol=1e-3):
         raise ValueError(f"Non-square pixels ({x} x {y} µm) are not supported.")
     return float(x)
+
+
+def _resolve_header_pixel_size(raw: float | None, dim_px: float | None) -> tuple[float | None, str | None]:
+    """The pixel size in µm from the header value, checked against max dimension / max count of pixels if given.
+
+    FlexImaging writes the pixel area in µm² and some converters a 1.0 placeholder. With the dimensions, a header
+    equal to their ratio is the side, one equal to its square is the area, anything else is ``"inconsistent"``
+    (no pixel size). Without them, values above 1000 are taken as areas and 1.0 as no value.
+    """
+    if raw is None:
+        return None, None
+    if dim_px is not None:
+        if math.isclose(raw, dim_px, rel_tol=_DIM_TOL):
+            return raw, "imzml header"
+        if math.isclose(raw, dim_px**2, rel_tol=2 * _DIM_TOL):
+            return math.sqrt(raw), "imzml header (area->sqrt)"
+        logger.warning(
+            f"Header pixel size {raw} matches neither max dimension / pixels ({dim_px:.4g} µm) nor its square."
+        )
+        return None, "inconsistent"
+    if raw > _AREA_THRESHOLD:
+        return math.sqrt(raw), "imzml header (area->sqrt)"
+    if raw == 1.0:
+        return None, None
+    return raw, "imzml header"
 
 
 def _read_features(path: Path) -> np.ndarray:
