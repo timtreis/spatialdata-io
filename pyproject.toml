@@ -51,6 +51,8 @@ dependencies = [
 urls.Documentation = "https://spatialdata-io.readthedocs.io/"
 urls.Homepage = "https://github.com/scverse/spatialdata-io"
 urls.Source = "https://github.com/scverse/spatialdata-io"
+# imzml(): imaging mass spectrometry
+optional-dependencies.imzml = [ "pyimzml" ]
 
 [dependency-groups]
 dev = [
@@ -69,6 +71,7 @@ test = [
   "coverage>=7.10",
   # https://github.com/scverse/spatialdata-io/issues/334
   "pyarrow!=22",
+  "pyimzml",
   "pytest",
   "pytest-mock",
 ]
@@ -164,6 +167,7 @@ module = [
   "h5py.*",
   "multiscale_spatial_image.*",
   "pyarrow.*",
+  "pyimzml.*",
   "rasterio.*",
   "readfcs.*",
   "rioxarray.*",

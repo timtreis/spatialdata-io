@@ -15,6 +15,8 @@ Release notes for `v0.7.1` and earlier are available on the [Releases][] page.
 
 ### Added
 
+- `imzml()` (extra `imzml`, needs `pyimzml`) reads 2-D imzML imaging mass spectrometry into pixels x m/z features
+  (a deposited m/z list, or the top-K ppm bins by total intensity) with one square per pixel, in µm when the pixel size is known.
 - `imc()` reads one IMC region of interest from an OME-NGFF zarr(.zip), a per-page OME-TIFF (MCD Viewer export) or a
   multi-page TIFF named by a steinbock `panel.csv`, with optional mask labels; pixels are µm (1 µm ablation).
 - `dbit_fragments()` reads DBiT spatial-ATAC / spatial-CUT&Tag deposits: it streams a 10x fragments file into Tn5
