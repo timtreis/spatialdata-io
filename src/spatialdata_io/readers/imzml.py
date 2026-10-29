@@ -69,11 +69,11 @@ def imzml(
     ppm
         m/z tolerance (bin width) in ppm; see above for the default.
     pixel_size_um
-        Pixel size in µm, used when the header states none (e.g. from the repository text). The header value is
-        checked against ``max dimension x`` / ``max count of pixels x`` when both are given: equal to it, it is the
-        side; equal to its square, the area (FlexImaging writes µm²), so its square root is used; otherwise the
-        pixel size is unknown (``pixel_size_source="inconsistent"``, both values in ``uns``). Without those fields, a
-        header value above 1000 is read as an area and exactly 1 as a converter placeholder (no value).
+        Pixel size in µm from the repository text, used when the file gives none. The header value is checked
+        against the file's dimensions and units; ``uns["spatialdata_io"]["pixel_size_source"]`` records the outcome:
+        ``"imzml header"``, ``"imzml header (area->sqrt)"`` (FlexImaging writes µm²), ``"imzml dimensions"`` (a 1.0
+        placeholder replaced by max dimension / pixels), ``"repository text"``, ``"inconsistent"`` or ``"ambiguous
+        unitless header"`` (both without a pixel size), or ``None``.
 
     Returns
     -------
@@ -132,15 +132,12 @@ def imzml(
     d = parser.imzmldict
     dim, count = d.get("max dimension x"), d.get("max count of pixels x")
     dim_px = float(dim) / float(count) if dim and count else None
-    header_px, header_source = _resolve_header_pixel_size(raw_px, dim_px)
-    if header_px is not None:
-        px, px_source = header_px, header_source
-        if pixel_size_um is not None and not math.isclose(header_px, pixel_size_um, rel_tol=0.01):
-            logger.warning(f"{path.name} states {header_px} µm per pixel, not {pixel_size_um}; using the header.")
-    elif pixel_size_um is not None and header_source != "inconsistent":
-        px, px_source = pixel_size_um, "repository text"
-    else:
-        px, px_source = None, header_source if header_source == "inconsistent" else None
+    px, px_source = _resolve_pixel_size(raw_px, dim_px, _header_has_unit(head), pixel_size_um)
+    if px_source not in ("repository text", None) and px is not None and pixel_size_um is not None:
+        if not math.isclose(px, pixel_size_um, rel_tol=0.01):
+            logger.warning(
+                f"{path.name}: {px} µm per pixel from the file ({px_source}), not {pixel_size_um}; using the file."
+            )
 
     uns = {
         "reader": "imzml",
@@ -205,15 +202,30 @@ def _pixel_size(parser: Any) -> float | None:
     return float(x)
 
 
-def _resolve_header_pixel_size(raw: float | None, dim_px: float | None) -> tuple[float | None, str | None]:
-    """The pixel size in µm from the header value, checked against max dimension / max count of pixels if given.
+def _header_has_unit(head: str) -> bool:
+    """Whether the header's pixel size cvParam (IMS:1000046) carries a unit attribute."""
+    m = re.search(r'<cvParam [^>]*accession="IMS:1000046"[^>]*>', head)
+    return m is not None and "unit" in m.group(0)
 
-    FlexImaging writes the pixel area in µm² and some converters a 1.0 placeholder. With the dimensions, a header
-    equal to their ratio is the side, one equal to its square is the area, anything else is ``"inconsistent"``
-    (no pixel size). Without them, values above 1000 are taken as areas and 1.0 as no value.
+
+def _resolve_pixel_size(
+    raw: float | None, dim_px: float | None, has_unit: bool, text: float | None
+) -> tuple[float | None, str | None]:
+    """The pixel size in µm and its source, from the header, the file's dimensions or the repository ``text``.
+
+    FlexImaging writes the pixel area in µm² and some converters a 1.0 placeholder, so the header is checked:
+
+        - 1.0: ``max dimension x / max count of pixels x`` if given (``"imzml dimensions"``), else ``text``;
+        - with those dimensions: the side if it matches their ratio, the square root if it matches its square,
+          else ``"inconsistent"`` (no pixel size);
+        - without them: above 1000 an area; at most 1000 and without a unit ambiguous (no pixel size, unless
+          ``text`` agrees within 5% with the header read as a side or as an area); otherwise the side.
     """
+    from_text = (text, "repository text") if text is not None else (None, None)
     if raw is None:
-        return None, None
+        return from_text
+    if raw == 1.0:
+        return (dim_px, "imzml dimensions") if dim_px is not None else from_text
     if dim_px is not None:
         if math.isclose(raw, dim_px, rel_tol=_DIM_TOL):
             return raw, "imzml header"
@@ -225,8 +237,10 @@ def _resolve_header_pixel_size(raw: float | None, dim_px: float | None) -> tuple
         return None, "inconsistent"
     if raw > _AREA_THRESHOLD:
         return math.sqrt(raw), "imzml header (area->sqrt)"
-    if raw == 1.0:
-        return None, None
+    if not has_unit:
+        if text is not None and any(math.isclose(text, v, rel_tol=_DIM_TOL) for v in (raw, math.sqrt(raw))):
+            return from_text
+        return None, "ambiguous unitless header"
     return raw, "imzml header"
 
 

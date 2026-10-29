@@ -139,3 +139,32 @@ def test_header_pixel_size_checked_against_dimensions(
     assert (uns["pixel_size_um"], uns["pixel_size_source"]) == (expected, source)
     assert (uns["pixel_size_header"], uns["pixel_size_from_dimensions"]) == (float(header), 20.0)
     assert uns["pitch_unknown"] is (expected is None)
+
+
+def test_placeholder_with_dimensions_uses_them(tmp_path: Path) -> None:
+    settings = _PIXEL_SIZE.replace('value="50"', 'value="1.000000"') + _dims(40)
+    uns = imzml(_write(tmp_path / "s.imzML", extra_settings=settings))["table"].uns["spatialdata_io"]
+    assert (uns["pixel_size_um"], uns["pixel_size_source"]) == (20.0, "imzml dimensions")
+
+
+@pytest.mark.parametrize(
+    ("text", "expected", "source"),
+    [
+        (None, None, "ambiguous unitless header"),
+        (25.0, 25.0, "repository text"),  # agrees with the header read as a side
+        (5.0, 5.0, "repository text"),  # agrees with the header read as an area
+        (30.0, None, "ambiguous unitless header"),
+    ],
+)
+def test_unitless_header_without_dimensions(
+    tmp_path: Path, text: float | None, expected: float | None, source: str
+) -> None:
+    unitless = '<cvParam cvRef="IMS" accession="IMS:1000046" name="pixel size" value="25"/>'
+    uns = imzml(_write(tmp_path / "s.imzML", extra_settings=unitless), pixel_size_um=text)["table"].uns[
+        "spatialdata_io"
+    ]
+    assert (uns["pixel_size_um"], uns["pixel_size_source"], uns["pitch_unknown"]) == (
+        expected,
+        source,
+        expected is None,
+    )
