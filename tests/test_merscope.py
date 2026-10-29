@@ -189,6 +189,30 @@ def test_vpt_dict_mode_accepts_string_paths(tmp_path: Path) -> None:
     assert len(sdata.shapes) == 1
 
 
+@pytest.mark.parametrize(
+    ("counts", "metadata", "transcripts"),
+    [
+        # BioImage Archive S-BIAD1093: <region>/Cellpose_polyT_CB3/cellpose_cell_by_gene.csv, transcripts in the region
+        ("cellpose_cell_by_gene.csv", "cellpose_cell_metadata.csv", None),
+        # Allen (BIL, merfish_output/cellpose_cyto2_nuclei/): all VPT outputs, transcripts included, in one folder
+        ("cellpose-cell-by-gene.csv", "cellpose_metadata.csv", "cellpose-detected_transcripts.csv"),
+    ],
+)
+def test_vpt_folder_with_prefixed_names(tmp_path: Path, counts: str, metadata: str, transcripts: str | None) -> None:
+    region = _write_dataset(tmp_path)
+    vpt = region / "Cellpose_polyT_CB3"
+    vpt.mkdir()
+    (region / "cell_by_gene.csv").rename(vpt / counts)
+    (region / "cell_metadata.csv").rename(vpt / metadata)
+    (region / "cell_boundaries.parquet").rename(vpt / "cellpose_micron_space.parquet")
+    if transcripts:
+        (region / "detected_transcripts.csv").rename(vpt / transcripts)
+    sdata = merscope(region, vpt_outputs=vpt, mosaic_images=False)
+    assert sdata["table"].n_obs == len(CELL_IDS)
+    assert len(next(iter(sdata.shapes.values()))) == len(CELL_IDS)
+    assert len(next(iter(sdata.points.values()))) == len(GENES) * 2
+
+
 def test_polygon_boundaries_supported(tmp_path: Path) -> None:
     # plain Polygon geometries must not crash the MultiPolygon normalisation
     region = _write_dataset(tmp_path, polygon_geometry=True)
@@ -305,7 +329,9 @@ def test_counts_ids_with_a_uniform_prefix_match_metadata(tmp_path: Path) -> None
     # more cells) does not. The table keeps the counted cells under their bare EntityID.
     region = _write_dataset(tmp_path, with_images_transform=False)
     counts = pd.read_csv(region / "cell_by_gene.csv", index_col=0)
-    counts.iloc[:3].rename(index=lambda i: f"AbxF_{i}").to_csv(region / "cell_by_gene.csv", index_label="")  # GEO: no id header
+    counts.iloc[:3].rename(index=lambda i: f"AbxF_{i}").to_csv(
+        region / "cell_by_gene.csv", index_label=""
+    )  # GEO: no id header
     table = merscope(region, mosaic_images=False, cells_boundaries=False)["table"]
     assert list(table.obs_names) == [str(i) for i in CELL_IDS[:3]]
     assert table.obs.index.name is None or isinstance(table.obs.index.name, str)  # anndata writes only str keys

@@ -42,16 +42,24 @@ def _get_channel_names(images_dir: Path) -> list[str]:
     return sorted(stainings)
 
 
-def _get_file_paths(path: Path, vpt_outputs: Path | str | dict[str, Any] | None) -> tuple[Path, Path, Path]:
+def _first_existing(folder: Path, *names: str) -> Path:
+    """The first of ``names`` that exists in ``folder``, else the first one (for the not-found warning)."""
+    return next((folder / n for n in names if (folder / n).exists()), folder / names[0])
+
+
+def _get_file_paths(path: Path, vpt_outputs: Path | str | dict[str, Any] | None) -> tuple[Path, Path, Path, Path]:
     """Gets the MERSCOPE file paths when vpt_outputs is provided.
 
-    That is, (i) the file of transcript per cell, (ii) the cell metadata file, and (iii) the cell boundary file
+    That is, (i) the file of transcript per cell, (ii) the cell metadata file, (iii) the cell boundary file, and
+    (iv) the transcripts file
     """
+    transcripts = path / MerscopeKeys.TRANSCRIPTS_FILE
     if vpt_outputs is None:
         return (
             path / MerscopeKeys.COUNTS_FILE,
             path / MerscopeKeys.CELL_METADATA_FILE,
             path / MerscopeKeys.BOUNDARIES_FILE,
+            transcripts,
         )
 
     if isinstance(vpt_outputs, str) or isinstance(vpt_outputs, Path):
@@ -67,10 +75,20 @@ def _get_file_paths(path: Path, vpt_outputs: Path | str | dict[str, Any] | None)
             f"Boundary file not found - expected to find one of these files: {', '.join(map(str, plausible_boundaries))}"
         )
 
+        # VPT names its outputs after the segmentation, e.g. cellpose_cell_by_gene.csv (BioImage Archive S-BIAD1093)
+        # or cellpose-cell-by-gene.csv, cellpose_metadata.csv and cellpose-detected_transcripts.csv (Allen, on BIL).
+        seg = valid_boundaries[0].name.removesuffix("_micron_space.parquet")
         return (
-            vpt_outputs / MerscopeKeys.COUNTS_FILE,
-            vpt_outputs / MerscopeKeys.CELL_METADATA_FILE,
+            _first_existing(
+                vpt_outputs, MerscopeKeys.COUNTS_FILE, f"{seg}_cell_by_gene.csv", f"{seg}-cell-by-gene.csv"
+            ),
+            _first_existing(
+                vpt_outputs, MerscopeKeys.CELL_METADATA_FILE, f"{seg}_cell_metadata.csv", f"{seg}_metadata.csv"
+            ),
             valid_boundaries[0],
+            transcripts
+            if transcripts.exists()
+            else _first_existing(vpt_outputs, f"{seg}-{MerscopeKeys.TRANSCRIPTS_FILE}"),
         )
 
     if isinstance(vpt_outputs, dict):
@@ -78,6 +96,7 @@ def _get_file_paths(path: Path, vpt_outputs: Path | str | dict[str, Any] | None)
             Path(vpt_outputs[MerscopeKeys.VPT_NAME_COUNTS]),
             Path(vpt_outputs[MerscopeKeys.VPT_NAME_OBS]),
             Path(vpt_outputs[MerscopeKeys.VPT_NAME_BOUNDARIES]),
+            transcripts,
         )
 
     raise ValueError(
@@ -118,9 +137,11 @@ def merscope(
         Optional arguments to indicate the output of the vizgen-postprocessing-tool (VPT), when used.
         If a folder path is provided, it looks inside the folder for the following files:
 
-            - ``{ms.COUNTS_FILE!r}``
-            - ``{ms.CELL_METADATA_FILE!r}``
-            - ``{ms.BOUNDARIES_FILE!r}``
+            - ``{ms.COUNTS_FILE!r}``, else ``<seg>_cell_by_gene.csv`` or ``<seg>-cell-by-gene.csv``
+            - ``{ms.CELL_METADATA_FILE!r}``, else ``<seg>_cell_metadata.csv`` or ``<seg>_metadata.csv``
+            - ``{ms.CELLPOSE_BOUNDARIES!r}`` or ``{ms.WATERSHED_BOUNDARIES!r}`` (``<seg>`` is ``cellpose`` or
+              ``watershed``)
+            - ``<seg>-{ms.TRANSCRIPTS_FILE}``, if ``path`` has no ``{ms.TRANSCRIPTS_FILE!r}``
 
         If a dictionary, then the following keys should be provided with the desired path:
 
@@ -169,7 +190,7 @@ def merscope(
     )
 
     path = Path(path).absolute()
-    count_path, obs_path, boundaries_path = _get_file_paths(path, vpt_outputs)
+    count_path, obs_path, boundaries_path, transcript_path = _get_file_paths(path, vpt_outputs)
     images_dir = path / MerscopeKeys.IMAGES_DIR
 
     # The micron-to-mosaic-pixel transform only ships with the mosaic images. Without it the data stays
@@ -213,7 +234,6 @@ def merscope(
     points = {}
 
     if transcripts:
-        transcript_path = path / MerscopeKeys.TRANSCRIPTS_FILE
         if transcript_path.exists():
             points[f"{dataset_id}_transcripts"] = _get_points(transcript_path, transformations)
         else:
