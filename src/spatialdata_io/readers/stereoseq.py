@@ -720,7 +720,8 @@ def _read_bins(
         group = f["geneExp/bin1"]
         gene = group["gene"][:]
         bins, x_mat = _bin_chunks(group["expression"], gene, bin_size, chunk_rows)
-    var_names = np.char.decode(gene["gene"], "utf-8")
+    # older GEFs name the field `gene`; newer geftool versions write `geneID` + `geneName`
+    var_names = np.char.decode(gene["geneName" if "geneName" in gene.dtype.names else "gene"], "utf-8")
     n = len(bins)
     if n == 0:
         raise ValueError(f"{f.filename}: `{group.name}/expression` has no rows with counts.")

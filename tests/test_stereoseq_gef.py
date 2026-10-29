@@ -738,3 +738,22 @@ def test_omics_header_recorded(tmp_path: Path) -> None:
     adt = _tissue(tmp_path, "GSM1_CHIP_Stereo-CITE_ADT.tissue.gef", attrs={"omics": [b"Proteomics"], "resolution": 500})
     assert stereoseq_gef(gef=adt, bin_size=2)["table"].uns["spatialdata_io"]["omics"] == "Proteomics"
     assert stereoseq_gef(gef=_tissue(tmp_path), bin_size=2)["table"].uns["spatialdata_io"]["omics"] is None
+
+
+def test_gene_id_and_name_fields(tmp_path: Path) -> None:
+    ref = _tissue(tmp_path)
+    new = _tissue(tmp_path, "new.tissue.gef")
+    with h5py.File(new, "r+") as f:
+        for name in list(f["geneExp"]):
+            old = f[f"geneExp/{name}/gene"][:]
+            gene = np.zeros(
+                len(old), dtype=[("geneID", "S64"), ("geneName", "S64"), ("offset", "<u4"), ("count", "<u4")]
+            )
+            gene["geneID"], gene["geneName"] = [b"ID" + g for g in old["gene"]], old["gene"]
+            gene["offset"], gene["count"] = old["offset"], old["count"]
+            del f[f"geneExp/{name}/gene"]
+            f[f"geneExp/{name}"].create_dataset("gene", data=gene)
+    t1, *_ = _bins(ref, 2)
+    t2, *_ = _bins(new, 2)
+    assert list(t1.var_names) == list(t2.var_names)
+    np.testing.assert_array_equal(t1.X.toarray(), t2.X.toarray())
