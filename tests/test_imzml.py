@@ -94,3 +94,25 @@ def test_drifting_ion_is_one_feature(tmp_path: Path) -> None:
     table = imzml(path, ppm=5, n_features=2)["table"]
     assert table.n_vars == 2
     np.testing.assert_allclose(table.X.toarray(), [[4, 1], [3, 0]])
+
+
+@pytest.mark.parametrize(
+    ("header", "kwarg", "expected", "source"),
+    [
+        ("10000", None, 100.0, "imzml header (area->sqrt)"),
+        ("1", 20.0, 20.0, "repository text"),
+        ("1", None, None, None),
+    ],
+)
+def test_header_pixel_size_area_and_placeholder(
+    tmp_path: Path, header: str, kwarg: float | None, expected: float | None, source: str | None
+) -> None:
+    settings = _PIXEL_SIZE.replace('value="50"', f'value="{header}"')
+    uns = imzml(_write(tmp_path / "s.imzML", extra_settings=settings), pixel_size_um=kwarg)["table"].uns[
+        "spatialdata_io"
+    ]
+    assert (uns["pixel_size_um"], uns["pixel_size_source"], uns["pitch_unknown"]) == (
+        expected,
+        source,
+        expected is None,
+    )

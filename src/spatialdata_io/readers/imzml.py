@@ -30,6 +30,8 @@ _BATCH = 2000  # spectra per vectorised step
 _PPM_BY_ANALYSER = (("orbitrap", 5.0), ("fourier transform ion cyclotron", 5.0), ("ft-icr", 5.0), ("fticr", 5.0))
 _PPM_TOF = 20.0
 _PPM_DEFAULT = 10.0
+# header pixel sizes above this are FlexImaging pixel areas in µm²
+_AREA_THRESHOLD = 1000.0
 
 
 def imzml(
@@ -65,7 +67,9 @@ def imzml(
     ppm
         m/z tolerance (bin width) in ppm; see above for the default.
     pixel_size_um
-        Pixel size in µm, used when the header states none (e.g. from the repository text).
+        Pixel size in µm, used when the header states none (e.g. from the repository text). A header value above
+        1000 is read as the pixel area in µm² (FlexImaging) and its square root is used; a header value of exactly 1
+        is treated as a converter placeholder, i.e. as no value.
 
     Returns
     -------
@@ -120,9 +124,14 @@ def imzml(
     keep = np.flatnonzero(n_peaks > 0)
     xy = coords[keep, :2]
 
-    header_px = _pixel_size(parser)
+    header_px, header_source = _pixel_size(parser), "imzml header"
+    if header_px is not None and header_px > _AREA_THRESHOLD:
+        # FlexImaging writes the pixel area in µm² (10000 for 100 µm pixels)
+        header_px, header_source = math.sqrt(header_px), "imzml header (area->sqrt)"
+    if header_px == 1.0:
+        header_px = None  # a converter placeholder, not a 1 µm pixel
     if header_px is not None:
-        px, px_source = header_px, "imzml header"
+        px, px_source = header_px, header_source
         if pixel_size_um is not None and not math.isclose(header_px, pixel_size_um, rel_tol=0.01):
             logger.warning(f"{path.name} states {header_px} µm per pixel, not {pixel_size_um}; using the header.")
     elif pixel_size_um is not None:
