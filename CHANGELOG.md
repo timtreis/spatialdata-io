@@ -15,6 +15,8 @@ Release notes for `v0.7.1` and earlier are available on the [Releases][] page.
 
 ### Added
 
+- `imc()` reads one IMC region of interest from an OME-NGFF zarr(.zip), a per-page OME-TIFF (MCD Viewer export) or a
+  multi-page TIFF named by a steinbock `panel.csv`, with optional mask labels; pixels are µm (1 µm ablation).
 - `dbit_fragments()` reads DBiT spatial-ATAC / spatial-CUT&Tag deposits: it streams a 10x fragments file into Tn5
   insertion counts per peak or genome tile (or reads a 10x peak matrix), with one square per DBiT pixel and the tissue image.
 - `cosmx()` adds a `"microns"` coordinate system next to the pixel `"global"` one, scaled by the pixel size from

@@ -25,6 +25,7 @@ I/O for the `spatialdata` project.
     dbit
     dbit_fragments
     experimental.iss
+    imc
     mcmicro
     merscope
     mibi
