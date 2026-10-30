@@ -168,3 +168,10 @@ def test_unitless_header_without_dimensions(
         source,
         expected is None,
     )
+
+
+def test_mzml_without_namespace(tmp_path: Path) -> None:
+    path = _write(tmp_path / "s.imzML", extra_settings=_PIXEL_SIZE)
+    path.write_text(path.read_text().replace(' xmlns="http://psi.hupo.org/ms/mzml"', "", 1))
+    table = imzml(path, n_features=3)["table"]
+    assert table.n_obs == 3 and table.uns["spatialdata_io"]["pixel_size_um"] == 50.0

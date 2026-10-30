@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import math
 import re
 import warnings
@@ -25,6 +26,7 @@ if TYPE_CHECKING:
 __all__ = ["imzml"]
 
 _SHAPES = "msi_pixels"
+_MZML_NS = "http://psi.hupo.org/ms/mzml"
 _BATCH = 2000  # spectra per vectorised step
 # m/z accuracy by mass analyser, used when `ppm` is not given
 _PPM_BY_ANALYSER = (("orbitrap", 5.0), ("fourier transform ion cyclotron", 5.0), ("ft-icr", 5.0), ("fticr", 5.0))
@@ -84,15 +86,23 @@ def imzml(
     ``True``. ``uns["spatialdata_io"]`` also records the mode, polarity, analyser, m/z range, ``ppm`` and their sources.
     """
     try:
-        from pyimzml.ImzMLParser import ImzMLParser
+        from pyimzml.ImzMLParser import INFER_IBD_FROM_IMZML, ImzMLParser
     except ImportError as e:  # pragma: no cover
         raise ImportError("imzml() needs pyimzml: pip install 'spatialdata-io[imzml]'.") from e
 
     path = Path(path)
     head = _header(path)
+
+    source: Any = str(path)
+    ibd: Any = INFER_IBD_FROM_IMZML
+    root_tag = head[head.find("<mzML") : head.find(">", head.find("<mzML"))]
+    if f'xmlns="{_MZML_NS}"' not in root_tag:
+        # pyimzml matches tags in the mzML namespace only; some exports (e.g. PXD053247) omit it, so no spectrum is found
+        source = io.BytesIO(path.read_bytes().replace(b"<mzML", f'<mzML xmlns="{_MZML_NS}"'.encode(), 1))
+        ibd = open(_ibd_path(path), "rb")  # kept open: the parser reads spectra from it lazily
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)  # pyimzml warns about outdated ontology term names
-        parser = ImzMLParser(str(path))
+        parser = ImzMLParser(source, ibd_file=ibd)
     coords = np.asarray(parser.coordinates)
     if (coords[:, 2] > 1).any():
         raise ValueError(f"{path.name} has {coords[:, 2].max()} z planes; only 2-D imzML is supported.")
@@ -176,6 +186,14 @@ def imzml(
     squares = gpd.GeoDataFrame({"geometry": [box(x - 1, y - 1, x, y) for x, y in xy]}, index=keep)
     shapes = ShapesModel.parse(squares, transformations={"global": transform})
     return _set_reader_metadata(SpatialData(shapes={_SHAPES: shapes}, tables={"table": table}), "imzml")
+
+
+def _ibd_path(path: Path) -> Path:
+    """The ``.ibd`` next to ``path``, matching the extension case-insensitively."""
+    hits = [p for p in path.parent.glob(f"{path.stem}.*") if p.suffix.lower() == ".ibd"]
+    if not hits:
+        raise FileNotFoundError(f"No .ibd next to {path}.")
+    return hits[0]
 
 
 def _header(path: Path, size: int = 4 << 20) -> str:
