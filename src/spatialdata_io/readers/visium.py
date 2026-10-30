@@ -69,7 +69,9 @@ def visium(
         ``{vx.RAW_COUNTS_FILE!r}``. Also, use when the file names are not following the standard SpaceRanger
         conventions.
     fullres_image_file
-        Path to the full-resolution image.
+        Path to the full-resolution image (the one passed to Space Ranger). If fewer than 99% of the spots fall
+        inside it, it is not that image (e.g. a deposited crop or the CytAssist capture image): a warning is logged
+        and it is skipped.
     tissue_positions_file
         Path to the tissue positions file.
     scalefactors_file
@@ -228,14 +230,23 @@ def visium(
         fullres_image_file = path / Path(fullres_image_file)
         if fullres_image_file.exists():
             image = _read_image(fullres_image_file, imread_kwargs)
-            full_image = DataArray(image, dims=("c", "y", "x"))
-            images[dataset_id + "_full_image"] = Image2DModel.parse(
-                full_image,
-                scale_factors=[2, 2, 2, 2],
-                transformations={dataset_id: transform_original},
-                rgb=None,
-                **image_models_kwargs,
-            )
+            inside = _fraction_inside(spot_coords, image.shape[-2:])
+            if inside < _MIN_SPOTS_INSIDE_FULLRES:
+                # e.g. a deposited crop or the CytAssist capture image: not the frame the spots were measured in
+                logger.warning(
+                    f"Only {inside:.1%} of the spots fall inside {fullres_image_file.name} "
+                    f"({image.shape[-1]} x {image.shape[-2]} px), so it is not the full-resolution image the spot "
+                    "coordinates refer to; skipping it."
+                )
+            else:
+                full_image = DataArray(image, dims=("c", "y", "x"))
+                images[dataset_id + "_full_image"] = Image2DModel.parse(
+                    full_image,
+                    scale_factors=[2, 2, 2, 2],
+                    transformations={dataset_id: transform_original},
+                    rgb=None,
+                    **image_models_kwargs,
+                )
         else:
             logger.warning(f"File {fullres_image_file} does not exist, skipping...")
 
@@ -292,3 +303,17 @@ def _read_image(image_file: Path, imread_kwargs: dict[str, Any]) -> Any:
     else:
         raise ValueError(f"Image shape {im.shape} is not supported.")
     return image
+
+
+# a full-resolution image must contain (almost) all spots; deposited crops and CytAssist images do not
+_MIN_SPOTS_INSIDE_FULLRES = 0.99
+
+
+def _fraction_inside(spot_xy: np.ndarray, shape_yx: tuple[int, ...]) -> float:
+    """Fraction of the (x, y) spot centres, ignoring missing ones, inside an image of shape ``(y, x)``."""
+    xy = np.asarray(spot_xy, dtype=float)
+    xy = xy[~np.isnan(xy).any(axis=1)]
+    if not len(xy):
+        return 1.0
+    h, w = shape_yx
+    return float(((xy[:, 0] >= 0) & (xy[:, 0] <= w) & (xy[:, 1] >= 0) & (xy[:, 1] <= h)).mean())
