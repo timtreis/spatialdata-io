@@ -106,6 +106,7 @@ def imc(
 def imc_mcd(
     path: str | Path,
     *,
+    acquisitions: Sequence[int] | None = None,
     image_models_kwargs: Mapping[str, Any] = MappingProxyType({}),
 ) -> SpatialData:
     """Read all acquisitions (ROIs) of a raw *IMC* ``.mcd`` file with :mod:`readimc` (extra ``mcd``).
@@ -122,6 +123,8 @@ def imc_mcd(
     ----------
     path
         The ``.mcd`` file.
+    acquisitions
+        Acquisition ids to read (e.g. one core of a tissue microarray); all by default.
     image_models_kwargs
         Keyword arguments for :class:`spatialdata.models.Image2DModel`.
 
@@ -138,6 +141,8 @@ def imc_mcd(
     with MCDFile(path) as f:
         for slide in f.slides:
             for acq in slide.acquisitions:
+                if acquisitions is not None and acq.id not in acquisitions:
+                    continue
                 try:
                     data = f.read_acquisition(acq)
                 except Exception as e:  # noqa: BLE001 - aborted or truncated acquisitions

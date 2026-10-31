@@ -154,3 +154,4 @@ def test_mcd_acquisitions_placed_on_the_slide(tmp_path: Path, monkeypatch: pytes
     np.testing.assert_allclose(t @ [0, 0, 1], [1000, -2040, 1])
     assert set(get_transformation(sdata.images["slide_1_2_image"], get_all=True)) == {"slide_1_2"}
     assert [a["coordinate_system"] for a in sdata.attrs["imc"]["acquisitions"]] == ["global", "slide_1_2"]
+    assert list(imc_mcd(tmp_path / "x.mcd", acquisitions=[2]).images) == ["x_2_image"]
