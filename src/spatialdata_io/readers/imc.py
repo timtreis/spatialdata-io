@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 import zipfile
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from types import MappingProxyType
 from typing import Any
@@ -25,14 +25,14 @@ _CHANNEL_NAME = re.compile(r'<Channel [^>]*Name="([^"]+)"')
 
 
 def imc(
-    path: str | Path,
+    path: str | Path | Sequence[str | Path],
     *,
     panel: str | Path | None = None,
-    labels: Mapping[str, str | Path] = MappingProxyType({}),
+    labels: Mapping[str, str | Path | Sequence[str | Path]] = MappingProxyType({}),
     image_models_kwargs: Mapping[str, Any] = MappingProxyType({}),
     labels_models_kwargs: Mapping[str, Any] = MappingProxyType({}),
 ) -> SpatialData:
-    """Read one *imaging mass cytometry* (IMC) region of interest (ROI) exported from MCD files.
+    """Read *imaging mass cytometry* (IMC) regions of interest (ROIs) exported from MCD files.
 
     ``path`` is one of:
 
@@ -48,15 +48,20 @@ def imc(
     element name by :func:`spatialdata.sanitize_name`. IMC ablates 1 µm per pixel, so pixels are µm: all elements
     have ``Identity`` to ``"global"``, and ``sdata.attrs["imc"]`` records ``pixel_size_um`` 1.0 with its source.
 
+    ``path`` may also be a sequence of ROI images (e.g. all ROIs of one patient), each read as above into its own
+    elements of one :class:`spatialdata.SpatialData`. Exported ROIs carry no stage position, so each ROI then gets
+    its own coordinate system named after it.
+
     Parameters
     ----------
     path
-        The ROI image.
+        The ROI image, or a sequence of ROI images.
     panel
         steinbock ``panel.csv`` naming the channels of a TIFF without channel names.
     labels
         Segmentation masks of the ROI by name, e.g. ``{"cells": ".../masks/<roi>.tiff"}``. Each is stored as
-        ``<roi>_<name>_labels`` and must have the image's shape.
+        ``<roi>_<name>_labels`` and must have the image's shape. For several ROIs, give one mask per ROI, in the
+        order of ``path``.
     image_models_kwargs
         Keyword arguments for :class:`spatialdata.models.Image2DModel`.
     labels_models_kwargs
@@ -66,7 +71,46 @@ def imc(
     -------
     :class:`spatialdata.SpatialData`
     """
-    path = Path(path)
+    paths = [Path(path)] if isinstance(path, str | Path) else [Path(p) for p in path]
+    roi_labels = {name: [Path(m)] if isinstance(m, str | Path) else [Path(x) for x in m] for name, m in labels.items()}
+    if bad := {name: len(m) for name, m in roi_labels.items() if len(m) != len(paths)}:
+        raise ValueError(f"Expected one mask per ROI ({len(paths)}), got {bad}.")
+    image_models_kwargs, labels_models_kwargs = _initialize_raster_models_kwargs(
+        image_models_kwargs, labels_models_kwargs
+    )
+    images: dict[str, Any] = {}
+    label_elements: dict[str, Any] = {}
+    for i, roi_path in enumerate(paths):
+        cs = "global" if len(paths) == 1 else sanitize_name(roi_path.name.split(".")[0])
+        im, lab = _read_roi(
+            roi_path,
+            panel,
+            {name: m[i] for name, m in roi_labels.items()},
+            {cs: Identity()},
+            image_models_kwargs,
+            labels_models_kwargs,
+        )
+        images |= im
+        label_elements |= lab
+
+    sdata = SpatialData(images=images, labels=label_elements)
+    sdata.attrs["imc"] = {
+        "roi": paths[0].name if len(paths) == 1 else [p.name for p in paths],
+        "pixel_size_um": PIXEL_SIZE_UM,
+        "pixel_size_source": "instrument spec (Hyperion/XTi ablation)",
+    }
+    return _set_reader_metadata(sdata, "imc")
+
+
+def _read_roi(
+    path: Path,
+    panel: str | Path | None,
+    labels: Mapping[str, Path],
+    transformations: dict[str, Any],
+    image_models_kwargs: Mapping[str, Any],
+    labels_models_kwargs: Mapping[str, Any],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """The image and label elements of one ROI."""
     names: list[str] | None
     if ".zarr" in path.suffixes:
         image, names = _read_ngff(path)
@@ -77,11 +121,7 @@ def imc(
     if len(names) != image.shape[0]:
         raise ValueError(f"{path.name} has {image.shape[0]} channels, but {len(names)} channel names were found.")
 
-    image_models_kwargs, labels_models_kwargs = _initialize_raster_models_kwargs(
-        image_models_kwargs, labels_models_kwargs
-    )
     roi = sanitize_name(path.name.split(".")[0])
-    transformations = {"global": Identity()}
     images = {
         f"{roi}_image": Image2DModel.parse(
             image, dims=("c", "y", "x"), c_coords=names, transformations=transformations, **image_models_kwargs
@@ -95,14 +135,7 @@ def imc(
         label_elements[f"{roi}_{sanitize_name(name)}_labels"] = Labels2DModel.parse(
             mask, dims=("y", "x"), transformations=transformations, **labels_models_kwargs
         )
-
-    sdata = SpatialData(images=images, labels=label_elements)
-    sdata.attrs["imc"] = {
-        "roi": path.name,
-        "pixel_size_um": PIXEL_SIZE_UM,
-        "pixel_size_source": "instrument spec (Hyperion/XTi ablation)",
-    }
-    return _set_reader_metadata(sdata, "imc")
+    return images, label_elements
 
 
 def _read_tiff(path: Path) -> tuple[da.Array, list[str] | None]:

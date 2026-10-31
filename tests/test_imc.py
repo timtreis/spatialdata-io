@@ -92,3 +92,22 @@ def test_errors(tmp_path: Path) -> None:
     tifffile.imwrite(tmp_path / "mask.tiff", np.zeros((10, 10), dtype=np.uint16))
     with pytest.raises(ValueError, match="expected"):
         imc(path, labels={"cells": tmp_path / "mask.tiff"})
+
+
+def test_several_rois_each_in_its_own_frame(tmp_path: Path) -> None:
+    rois, masks = [], []
+    for i in (7, 8):
+        tifffile.imwrite(tmp_path / f"img_slide3_00{i}.tiff", _DATA * i, imagej=True)
+        tifffile.imwrite(tmp_path / f"masks_slide3_00{i}.tiff", np.full((40, 30), i, dtype=np.uint16))
+        rois.append(tmp_path / f"img_slide3_00{i}.tiff")
+        masks.append(tmp_path / f"masks_slide3_00{i}.tiff")
+    (tmp_path / "panel.csv").write_text("name\naSMA\nCD3\nMBP\n")
+
+    sdata = imc(rois, panel=tmp_path / "panel.csv", labels={"cells": masks}, image_models_kwargs=_FAST)
+
+    assert sorted(sdata.images) == ["img_slide3_007_image", "img_slide3_008_image"]
+    assert sdata.labels["img_slide3_008_cells_labels"]["scale0"]["image"].values.max() == 8
+    assert sorted(sdata.coordinate_systems) == ["img_slide3_007", "img_slide3_008"]
+    assert sdata.attrs["imc"]["roi"] == ["img_slide3_007.tiff", "img_slide3_008.tiff"]
+    with pytest.raises(ValueError, match="one mask per ROI"):
+        imc(rois, labels={"cells": masks[:1]})
