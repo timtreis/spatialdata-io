@@ -83,6 +83,11 @@ def test_pitch_unknown_and_3d_error(tmp_path: Path) -> None:
     assert sdata.coordinate_systems == ["global"]
     with pytest.raises(ValueError, match="z planes"):
         imzml(_write(tmp_path / "z.imzML", z=2))
+    with ImzMLWriter(str(tmp_path / "dup.imzML"), mode="processed") as w:
+        for z in (1, 1):  # two planes on one grid without position z, as in Bruker 3D exports
+            w.addSpectrum(np.array([100.0]), np.array([1.0], dtype=np.float32), (1, 1, z))
+    with pytest.raises(ValueError, match="repeat an x/y position"):
+        imzml(tmp_path / "dup.imzML")
 
 
 def test_drifting_ion_is_one_feature(tmp_path: Path) -> None:
@@ -96,7 +101,6 @@ def test_drifting_ion_is_one_feature(tmp_path: Path) -> None:
     np.testing.assert_allclose(table.X.toarray(), [[4, 1], [3, 0]])
 
 
-
 def test_mz_below_one_is_ignored(tmp_path: Path) -> None:
     path = tmp_path / "m.imzML"
     with ImzMLWriter(str(path), mode="processed") as w:
@@ -105,6 +109,7 @@ def test_mz_below_one_is_ignored(tmp_path: Path) -> None:
     table = imzml(path, ppm=5, n_features=5)["table"]
     np.testing.assert_allclose(table.var["mz"], [100], rtol=5e-6)
     np.testing.assert_allclose(table.X.toarray(), [[1]])
+
 
 @pytest.mark.parametrize(
     ("header", "kwarg", "expected", "source"),

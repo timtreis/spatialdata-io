@@ -106,6 +106,9 @@ def imzml(
     coords = np.asarray(parser.coordinates)
     if (coords[:, 2] > 1).any():
         raise ValueError(f"{path.name} has {coords[:, 2].max()} z planes; only 2-D imzML is supported.")
+    if (n_dup := len(coords) - len(np.unique(coords[:, :2], axis=0))) > 0:
+        # e.g. Bruker 3D exports: the planes share one x/y grid and only the 3DPositionZ parameter tells them apart
+        raise ValueError(f"{path.name}: {n_dup} spectra repeat an x/y position; only 2-D imzML is supported.")
 
     analyser = _analyser(head)
     if ppm is not None:
