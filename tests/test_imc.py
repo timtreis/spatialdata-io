@@ -123,8 +123,8 @@ class _Acq:
 
 class _MCD:
     def __init__(self, path: Path) -> None:
-        # ROI 1 sits at x 1000-1030 µm, y 2000-2040 µm (y grows downwards); ROI 2 has no stage position; ROI 3 aborted
-        acqs = [_Acq(1, ((1000, 2000), (1030, 2000), (1030, 2040), (1000, 2040))), _Acq(2, None), _Acq(3, None)]
+        # ROI 1 sits at x 1000-1030 µm, y 2040-2000 µm (stage y points up); ROI 2 has no stage position; ROI 3 aborted
+        acqs = [_Acq(1, ((1000, 2040), (1030, 2040), (1030, 2000), (1000, 2000))), _Acq(2, None), _Acq(3, None)]
         self.slides = [type("Slide", (), {"acquisitions": acqs})()]
 
     def __enter__(self) -> _MCD:
@@ -149,6 +149,8 @@ def test_mcd_acquisitions_placed_on_the_slide(tmp_path: Path, monkeypatch: pytes
     # duplicate labels get their metal; the unlabelled channel keeps its metal
     assert get_channel_names(sdata.images["slide_1_1_image"]) == ["CD3_Nd142", "Ir191_Ir191", "CD3_Er168"]
     t = get_transformation(sdata.images["slide_1_1_image"], "global").to_affine_matrix(("x", "y"), ("x", "y"))
-    np.testing.assert_allclose(t @ [30, 40, 1], [1030, 2040, 1])
+    # the bottom-right pixel corner lands at stage (1030, 2000) with y negated: below the top edge (-2040)
+    np.testing.assert_allclose(t @ [30, 40, 1], [1030, -2000, 1])
+    np.testing.assert_allclose(t @ [0, 0, 1], [1000, -2040, 1])
     assert set(get_transformation(sdata.images["slide_1_2_image"], get_all=True)) == {"slide_1_2"}
     assert [a["coordinate_system"] for a in sdata.attrs["imc"]["acquisitions"]] == ["global", "slide_1_2"]

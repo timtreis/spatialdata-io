@@ -113,7 +113,8 @@ def imc_mcd(
     Each acquisition becomes the image ``<mcd>_<id>_image``, ``<mcd>`` being the file name without its extension,
     with channels named by their antibody label (the metal, e.g. ``Ir191``, where unlabelled). The pixel size is the
     acquisition's ablation distance. Acquisitions with stage coordinates are placed on the slide in µm in
-    ``"global"``; any other gets its own coordinate system in µm, named after the image. Acquisitions that cannot be
+    ``"global"`` (with the stage y axis negated where it points up, so the images keep their orientation); any other
+    gets its own coordinate system in µm, named after the image. Acquisitions that cannot be
     read (e.g. aborted ones) are skipped with a warning. ``sdata.attrs["imc"]`` lists each acquisition's id,
     description, pixel size and placement.
 
@@ -184,6 +185,8 @@ def _stage_transform(acq: Any) -> BaseTransformation | None:
     if corners is None or not acq.width_px or not acq.height_px:
         return None
     (x0, y0), (x1, y1), _, (x3, y3) = corners
+    if y3 < y0:  # the Hyperion stage y axis points up; negate it so the images are not shown upside down
+        y0, y1, y3 = -y0, -y1, -y3
     w, h = acq.width_px, acq.height_px
     matrix = [[(x1 - x0) / w, (x3 - x0) / h, x0], [(y1 - y0) / w, (y3 - y0) / h, y0], [0, 0, 1]]
     return Affine(matrix, input_axes=("x", "y"), output_axes=("x", "y"))
