@@ -52,6 +52,9 @@ def visium(
             Spots positions file.
         - ``fullres_image_file``: large microscopy image used as input for space ranger.
 
+    The gene expression is the table ``"table"``. A Gene and Protein (CytAssist) counts file also holds Antibody
+    Capture features, which become a second table ``"table_protein"`` annotating the same spots.
+
     .. seealso::
 
         - `Space Ranger output <https://support.10xgenomics.com/spatial-gene-expression/software/pipelines/latest/output/overview>`_.
@@ -141,6 +144,8 @@ def visium(
     #     spaceranger100_count_30458_ST8059048_mm10-3_0_0_premrna
     # We discard this value and use the one inferred from the filename of VisiumKeys.FILTERED_COUNTS_FILE, or the one
     # provided by the user in dataset_id
+    if counts_file.endswith((".h5", ".mtx.gz")):
+        kwargs.setdefault("gex_only", False)  # keep Antibody Capture features for `table_protein`
     adata, _ = _read_counts(path, counts_file=counts_file, library_id=library_id, **kwargs)
 
     if (path / "spatial" / VisiumKeys.SPOTS_FILE_1).exists() or (
@@ -221,9 +226,18 @@ def visium(
     )
     shapes[dataset_id] = circles
     adata.obs["region"] = dataset_id
-    table = TableModel.parse(adata, region=dataset_id, region_key="region", instance_key="spot_id")
-    if var_names_make_unique:
-        table.var_names_make_unique()
+    tables = {}
+    feature_types = adata.var.get("feature_types")
+    for key, kind in (("table", "Gene Expression"), ("table_protein", "Antibody Capture")):
+        if feature_types is None:
+            if key == "table":
+                tables[key] = adata
+        elif (keep := (feature_types == kind).to_numpy()).any():
+            tables[key] = adata[:, keep].copy()
+    for key, t in tables.items():
+        tables[key] = TableModel.parse(t, region=dataset_id, region_key="region", instance_key="spot_id")
+        if var_names_make_unique:
+            tables[key].var_names_make_unique()
 
     images = {}
     if fullres_image_file is not None:
@@ -267,7 +281,7 @@ def visium(
             rgb=None,
         )
 
-    sdata = SpatialData(images=images, shapes=shapes, tables={"table": table})
+    sdata = SpatialData(images=images, shapes=shapes, tables=tables)
     return _set_reader_metadata(sdata, "visium")
 
 

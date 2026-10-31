@@ -15,6 +15,8 @@ Release notes for `v0.7.1` and earlier are available on the [Releases][] page.
 
 ### Added
 
+- `visium()` keeps the Antibody Capture features of a CytAssist Gene and Protein counts file as a second table,
+  `table_protein`, annotating the same spots (they were dropped by `gex_only`).
 - `imzml()` (extra `imzml`, needs `pyimzml`) reads 2-D imzML imaging mass spectrometry into pixels x m/z features
   (a deposited m/z list, or the top-K ppm bins by total intensity) with one square per pixel, in µm when the pixel size is known.
 - `imc()` reads one IMC region of interest from an OME-NGFF zarr(.zip), a per-page OME-TIFF (MCD Viewer export) or a

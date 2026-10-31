@@ -1,0 +1,58 @@
+"""The Antibody Capture table of visium() on a synthetic Space Ranger Gene and Protein output."""
+
+from __future__ import annotations
+
+import json
+from pathlib import Path
+
+import h5py
+import numpy as np
+import scipy.sparse as sp
+from spatialdata import read_zarr
+
+from spatialdata_io import visium
+
+_BARCODES = ["AAAC-1", "AAAG-1", "AAAT-1"]
+_FEATURES = [("G1", "Gene Expression"), ("G2", "Gene Expression"), ("CD3", "Antibody Capture")]
+
+
+def _space_ranger(root: Path) -> Path:
+    (root / "spatial").mkdir(parents=True)
+    # features x barcodes, as in a 10x HDF5 matrix
+    counts = sp.csc_matrix(np.array([[1, 0, 2], [0, 3, 0], [7, 8, 9]]))
+    with h5py.File(root / "S1_filtered_feature_bc_matrix.h5", "w") as f:
+        f.attrs["library_ids"] = np.array([b"S1"])
+        m = f.create_group("matrix")
+        m["barcodes"] = np.array(_BARCODES, dtype="S")
+        m["data"], m["indices"], m["indptr"] = counts.data, counts.indices, counts.indptr
+        m["shape"] = np.array(counts.shape)
+        g = m.create_group("features")
+        g["id"] = g["name"] = np.array([n for n, _ in _FEATURES], dtype="S")
+        g["feature_type"] = np.array([t for _, t in _FEATURES], dtype="S")
+        g["genome"] = np.array([b"GRCh38"] * len(_FEATURES))
+        g["_all_tag_keys"] = np.array([b"genome"])
+    positions = ["barcode,in_tissue,array_row,array_col,pxl_row_in_fullres,pxl_col_in_fullres"]
+    positions += [f"{b},1,0,{i},100,{100 + 50 * i}" for i, b in enumerate(_BARCODES)]
+    (root / "spatial" / "tissue_positions.csv").write_text("\n".join(positions) + "\n")
+    scalefactors = {"spot_diameter_fullres": 40.0, "tissue_hires_scalef": 0.1, "tissue_lowres_scalef": 0.03}
+    (root / "spatial" / "scalefactors_json.json").write_text(json.dumps(scalefactors))
+    return root
+
+
+def test_antibody_capture_is_a_second_table_on_the_same_spots(tmp_path: Path) -> None:
+    sdata = visium(_space_ranger(tmp_path / "S1"))
+
+    rna, protein = sdata["table"], sdata["table_protein"]
+    assert list(rna.var_names) == ["G1", "G2"] and list(protein.var_names) == ["CD3"]
+    np.testing.assert_array_equal(rna.X.toarray(), [[1, 0], [0, 3], [2, 0]])
+    np.testing.assert_array_equal(protein.X.toarray(), [[7], [8], [9]])
+    for t in (rna, protein):
+        assert t.uns["spatialdata_attrs"]["region"] == "S1"
+        assert list(t.obs["spot_id"]) == [0, 1, 2]
+    sdata.write(tmp_path / "x.zarr")
+    assert set(read_zarr(tmp_path / "x.zarr").tables) == {"table", "table_protein"}
+
+
+def test_gene_expression_only_has_no_protein_table(tmp_path: Path) -> None:
+    sdata = visium(_space_ranger(tmp_path / "S1"), gex_only=True)
+    assert set(sdata.tables) == {"table"}
