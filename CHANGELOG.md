@@ -23,6 +23,8 @@ Release notes for `v0.7.1` and earlier are available on the [Releases][] page.
   `protein_file` reads antibody counts deposited apart (e.g. SPOTS `*_ADT.csv.gz`, a CytAssist `*_Protein.h5ad`).
 - `visium()` reads a deposit without a scale factors file (e.g. GSE263617): the spot diameter follows from the spot
   spacing (55 µm spots at 100 µm) and the hires/lowres images, which cannot be placed, are skipped with a warning.
+  GSE263617 also ships its `matrix.mtx.gz` without `barcodes.tsv.gz`: the columns are the in-tissue barcodes of
+  `tissue_positions.csv` in sorted order (Space Ranger's filtered order; checked equal to the series `.h5ad` obs).
 - `imzml()` (extra `imzml`, needs `pyimzml`) reads 2-D imzML imaging mass spectrometry into pixels x m/z features
   (a deposited m/z list, or the top-K ppm bins by total intensity) with one square per pixel, in µm when the pixel size is known.
 - `imc()` reads one IMC region of interest from an OME-NGFF zarr(.zip), a per-page OME-TIFF (MCD Viewer export) or a
