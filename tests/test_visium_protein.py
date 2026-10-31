@@ -14,7 +14,7 @@ from spatialdata import read_zarr
 from spatialdata_io import visium
 
 _BARCODES = ["AAAC-1", "AAAG-1", "AAAT-1"]
-_FEATURES = [("G1", "Gene Expression"), ("G2", "Gene Expression"), ("CD3", "Antibody Capture")]
+_FEATURES = [("CD3", "Gene Expression"), ("G2", "Gene Expression"), ("CD3", "Antibody Capture")]
 
 
 def _space_ranger(root: Path) -> Path:
@@ -45,7 +45,8 @@ def test_antibody_capture_is_a_second_table_on_the_same_spots(tmp_path: Path) ->
     sdata = visium(_space_ranger(tmp_path / "S1"))
 
     rna, protein = sdata["table"], sdata["table_protein"]
-    assert list(rna.var_names) == ["G1", "G2"] and list(protein.var_names) == ["CD3"]
+    # the antibody keeps its name although the gene CD3 has it too
+    assert list(rna.var_names) == ["CD3", "G2"] and list(protein.var_names) == ["CD3"]
     np.testing.assert_array_equal(rna.X.toarray(), [[1, 0], [0, 3], [2, 0]])
     np.testing.assert_array_equal(protein.X.toarray(), [[7], [8], [9]])
     for t in (rna, protein):
@@ -59,3 +60,11 @@ def test_antibody_capture_is_a_second_table_on_the_same_spots(tmp_path: Path) ->
 def test_gene_expression_only_has_no_protein_table(tmp_path: Path) -> None:
     sdata = visium(_space_ranger(tmp_path / "S1"), gex_only=True)
     assert set(sdata.tables) == {"table"}
+
+
+def test_spot_diameter_from_spacing_without_scale_factors(tmp_path: Path) -> None:
+    root = _space_ranger(tmp_path / "S1")
+    (root / "spatial" / "scalefactors_json.json").unlink()  # GSE263617 deposits none
+    sdata = visium(root)
+    assert sdata.shapes["S1"]["radius"].iloc[0] == 0.55 * 50 / 2  # spots 50 px apart
+    assert not sdata.images and set(sdata.coordinate_systems) == {"S1"}

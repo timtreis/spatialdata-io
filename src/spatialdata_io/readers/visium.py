@@ -11,6 +11,7 @@ import numpy as np
 import pandas as pd
 from dask_image.imread import imread
 from imageio import imread as imread2
+from scipy.spatial import cKDTree
 from spatialdata import SpatialData
 from spatialdata._logging import logger
 from spatialdata.models import Image2DModel, ShapesModel, TableModel
@@ -146,6 +147,8 @@ def visium(
     # provided by the user in dataset_id
     if counts_file.endswith((".h5", ".mtx.gz")):
         kwargs.setdefault("gex_only", False)  # keep Antibody Capture features for `table_protein`
+    if counts_file.endswith(".mtx.gz"):
+        kwargs.setdefault("make_unique", False)  # names are made unique per table below
     adata, _ = _read_counts(path, counts_file=counts_file, library_id=library_id, **kwargs)
 
     if (path / "spatial" / VisiumKeys.SPOTS_FILE_1).exists() or (
@@ -188,6 +191,7 @@ def visium(
     adata.obs = pd.DataFrame(adata.obs)
     adata.obs.drop(columns=[VisiumKeys.SPOTS_X, VisiumKeys.SPOTS_Y], inplace=True)
     adata.obs["spot_id"] = np.arange(len(adata))
+    var_names = adata.var_names.copy()  # antibodies share names with their genes (CD163), so dedupe per table
     adata.var_names_make_unique()
 
     if not adata.obs_names.is_unique:
@@ -202,27 +206,30 @@ def visium(
             path / "spatial" / VisiumKeys.SCALEFACTORS_FILE if scalefactors_file is None else path / scalefactors_file
         )
         scalefactors = json.loads(scalefactors_file.read_bytes())
+    else:
+        # e.g. GSE263617: Visium spots are 55 µm wide at 100 µm centre-to-centre (instrument spec), so the diameter
+        # follows from the spot spacing; the hires/lowres images cannot be placed without their scale factors
+        pitch = float(np.median(cKDTree(spot_coords).query(spot_coords, k=2)[0][:, 1]))
+        scalefactors = {"spot_diameter_fullres": 0.55 * pitch}
+        logger.warning(
+            f"No scale factors file in {path}: spot diameter {0.55 * pitch:.1f} px from the spot spacing (55 µm spots "
+            "at 100 µm); the hires/lowres images are skipped."
+        )
 
     transform_original = Identity()
-    transform_lowres = Scale(
-        np.array([scalefactors[VisiumKeys.SCALEFACTORS_LOWRES], scalefactors[VisiumKeys.SCALEFACTORS_LOWRES]]),
-        axes=("y", "x"),
-    )
-    transform_hires = Scale(
-        np.array([scalefactors[VisiumKeys.SCALEFACTORS_HIRES], scalefactors[VisiumKeys.SCALEFACTORS_HIRES]]),
-        axes=("y", "x"),
-    )
+    transforms = {
+        res: Scale(np.array([scalefactors[key], scalefactors[key]]), axes=("y", "x"))
+        for res, key in (("hires", VisiumKeys.SCALEFACTORS_HIRES), ("lowres", VisiumKeys.SCALEFACTORS_LOWRES))
+        if key in scalefactors
+    }
     shapes = {}
     circles = ShapesModel.parse(
         spot_coords,
         geometry=0,
         radius=scalefactors["spot_diameter_fullres"] / 2.0,
         index=adata.obs["spot_id"].copy(),
-        transformations={
-            dataset_id: transform_original,
-            f"{dataset_id}_downscaled_hires": transform_hires,
-            f"{dataset_id}_downscaled_lowres": transform_lowres,
-        },
+        transformations={dataset_id: transform_original}
+        | {f"{dataset_id}_downscaled_{res}": t for res, t in transforms.items()},
     )
     shapes[dataset_id] = circles
     adata.obs["region"] = dataset_id
@@ -234,6 +241,7 @@ def visium(
                 tables[key] = adata
         elif (keep := (feature_types == kind).to_numpy()).any():
             tables[key] = adata[:, keep].copy()
+            tables[key].var_names = var_names[keep].tolist()
     for key, t in tables.items():
         tables[key] = TableModel.parse(t, region=dataset_id, region_key="region", instance_key="spot_id")
         if var_names_make_unique:
@@ -264,22 +272,13 @@ def visium(
         else:
             logger.warning(f"File {fullres_image_file} does not exist, skipping...")
 
-    if (path / VisiumKeys.IMAGE_HIRES_FILE).exists():
-        image_hires = _read_png(path / VisiumKeys.IMAGE_HIRES_FILE, imread_kwargs)
-        image_hires = DataArray(image_hires, dims=("c", "y", "x"))
-        images[dataset_id + "_hires_image"] = Image2DModel.parse(
-            image_hires,
-            transformations={f"{dataset_id}_downscaled_hires": Identity(), dataset_id: transform_hires.inverse()},
-            rgb=None,
-        )
-    if (path / VisiumKeys.IMAGE_LOWRES_FILE).exists():
-        image_lowres = _read_png(path / VisiumKeys.IMAGE_LOWRES_FILE, imread_kwargs)
-        image_lowres = DataArray(image_lowres, dims=("c", "y", "x"))
-        images[dataset_id + "_lowres_image"] = Image2DModel.parse(
-            image_lowres,
-            transformations={f"{dataset_id}_downscaled_lowres": Identity(), dataset_id: transform_lowres.inverse()},
-            rgb=None,
-        )
+    for res, file in (("hires", VisiumKeys.IMAGE_HIRES_FILE), ("lowres", VisiumKeys.IMAGE_LOWRES_FILE)):
+        if res in transforms and (path / file).exists():
+            images[f"{dataset_id}_{res}_image"] = Image2DModel.parse(
+                DataArray(_read_png(path / file, imread_kwargs), dims=("c", "y", "x")),
+                transformations={f"{dataset_id}_downscaled_{res}": Identity(), dataset_id: transforms[res].inverse()},
+                rgb=None,
+            )
 
     sdata = SpatialData(images=images, shapes=shapes, tables=tables)
     return _set_reader_metadata(sdata, "visium")
