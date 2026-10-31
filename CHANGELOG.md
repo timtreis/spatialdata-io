@@ -25,6 +25,9 @@ Release notes for `v0.7.1` and earlier are available on the [Releases][] page.
   the FOV positions file (when it lists px and mm) or the CosMx spec; `sdata.attrs["cosmx"]` records the value and its source.
 - `mibi()` reads one MIBI field of view in the Angelo lab layout (one TIFF per channel, as deposited on the
   BioImage Archive) into an image named by its channels, with optional segmentation masks as labels.
+  A folder of FOV folders (e.g. the tiles of one region) is read into one `SpatialData`, each FOV placed by
+  `fov_positions` in `"global"` or, without positions, in its own coordinate system; `{fov}` in a mask path is
+  replaced per FOV.
 - `cell_table` reads a cells x genes table of raw integer counts with centroids into a CSR table and
   `cells` circle shapes, from a wide CSV/TSV, a counts file (delimited or `.mtx`) plus a `coordinates`
   file, or an `.h5ad` file (`layer` picks the counts). `split_by` creates one shapes element per section.
