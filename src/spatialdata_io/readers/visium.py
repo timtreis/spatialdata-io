@@ -265,7 +265,7 @@ def visium(
             logger.warning(f"File {fullres_image_file} does not exist, skipping...")
 
     if (path / VisiumKeys.IMAGE_HIRES_FILE).exists():
-        image_hires = imread(path / VisiumKeys.IMAGE_HIRES_FILE, **imread_kwargs).squeeze().transpose(2, 0, 1)
+        image_hires = _read_png(path / VisiumKeys.IMAGE_HIRES_FILE, imread_kwargs)
         image_hires = DataArray(image_hires, dims=("c", "y", "x"))
         images[dataset_id + "_hires_image"] = Image2DModel.parse(
             image_hires,
@@ -273,7 +273,7 @@ def visium(
             rgb=None,
         )
     if (path / VisiumKeys.IMAGE_LOWRES_FILE).exists():
-        image_lowres = imread(path / VisiumKeys.IMAGE_LOWRES_FILE, **imread_kwargs).squeeze().transpose(2, 0, 1)
+        image_lowres = _read_png(path / VisiumKeys.IMAGE_LOWRES_FILE, imread_kwargs)
         image_lowres = DataArray(image_lowres, dims=("c", "y", "x"))
         images[dataset_id + "_lowres_image"] = Image2DModel.parse(
             image_lowres,
@@ -283,6 +283,12 @@ def visium(
 
     sdata = SpatialData(images=images, shapes=shapes, tables=tables)
     return _set_reader_metadata(sdata, "visium")
+
+
+def _read_png(image_file: Path, imread_kwargs: dict[str, Any]) -> Any:
+    """A hires/lowres image as ``(c, y, x)``; grayscale PNGs (e.g. GSE198353) have no channel axis."""
+    im = imread(image_file, **imread_kwargs).squeeze()
+    return im[None] if im.ndim == 2 else im.transpose(2, 0, 1)
 
 
 def _read_image(image_file: Path, imread_kwargs: dict[str, Any]) -> Any:

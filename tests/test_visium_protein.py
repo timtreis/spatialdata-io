@@ -8,6 +8,7 @@ from pathlib import Path
 import h5py
 import numpy as np
 import scipy.sparse as sp
+from PIL import Image
 from spatialdata import read_zarr
 
 from spatialdata_io import visium
@@ -36,6 +37,7 @@ def _space_ranger(root: Path) -> Path:
     (root / "spatial" / "tissue_positions.csv").write_text("\n".join(positions) + "\n")
     scalefactors = {"spot_diameter_fullres": 40.0, "tissue_hires_scalef": 0.1, "tissue_lowres_scalef": 0.03}
     (root / "spatial" / "scalefactors_json.json").write_text(json.dumps(scalefactors))
+    Image.fromarray(np.zeros((30, 40), dtype=np.uint8)).save(root / "spatial" / "tissue_hires_image.png")  # grayscale
     return root
 
 
@@ -49,6 +51,7 @@ def test_antibody_capture_is_a_second_table_on_the_same_spots(tmp_path: Path) ->
     for t in (rna, protein):
         assert t.uns["spatialdata_attrs"]["region"] == "S1"
         assert list(t.obs["spot_id"]) == [0, 1, 2]
+    assert sdata.images["S1_hires_image"].shape == (1, 30, 40)
     sdata.write(tmp_path / "x.zarr")
     assert set(read_zarr(tmp_path / "x.zarr").tables) == {"table", "table_protein"}
 

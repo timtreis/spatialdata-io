@@ -70,6 +70,7 @@ Release notes for `v0.7.1` and earlier are available on the [Releases][] page.
 
 ### Fixed
 
+- `visium()` reads grayscale hires/lowres PNGs (e.g. GSE198353), which failed on the RGB axis transpose.
 - `imzml()` ignores m/z values below 1, which gave negative bin indices and failed to read (e.g. MTBLS176).
 - `imzml()` raises on spectra that repeat an x/y position (e.g. Bruker 3D exports that keep z only in
   `3DPositionZ`) instead of writing duplicate pixels.
