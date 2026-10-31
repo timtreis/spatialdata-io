@@ -68,6 +68,7 @@ Release notes for `v0.7.1` and earlier are available on the [Releases][] page.
 
 ### Fixed
 
+- `imzml()` ignores m/z values below 1, which gave negative bin indices and failed to read (e.g. MTBLS176).
 - `visium()` skips a `fullres_image_file` that holds fewer than 99% of the spots (e.g. a deposited crop or the
   CytAssist capture image), with a warning, instead of placing it misregistered at identity.
 - `codex()` read the CSV table and the image relative to the current working directory instead of `path`, and an

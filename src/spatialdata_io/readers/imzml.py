@@ -285,7 +285,7 @@ def _bin_totals(parser: Any, step: float) -> np.ndarray:
     """Total intensity per log-spaced m/z bin (bin ``i`` spans ``exp(i * step)`` to ``exp((i + 1) * step)``)."""
     totals = np.zeros(0)
     for _, mz, it in _spectra(parser):
-        ok = mz > 0
+        ok = mz >= 1  # m/z below 1 is no ion, and its log bin would be negative
         b = np.floor(np.log(mz[ok]) / step).astype(np.int64)
         part = np.bincount(b, weights=it[ok])
         if len(part) > len(totals):
@@ -302,7 +302,7 @@ def _bin_lookup(top: np.ndarray, step: float) -> Any:
             return np.full(len(mz), -1)
         b = np.floor(np.log(np.maximum(mz, 1e-12)) / step).astype(np.int64)
         i = np.minimum(np.searchsorted(top, b - 1), len(top) - 1)
-        return np.where(np.abs(top[i] - b) <= 1, i, -1)
+        return np.where((np.abs(top[i] - b) <= 1) & (mz >= 1), i, -1)
 
     return lookup
 

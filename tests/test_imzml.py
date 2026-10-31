@@ -96,6 +96,16 @@ def test_drifting_ion_is_one_feature(tmp_path: Path) -> None:
     np.testing.assert_allclose(table.X.toarray(), [[4, 1], [3, 0]])
 
 
+
+def test_mz_below_one_is_ignored(tmp_path: Path) -> None:
+    path = tmp_path / "m.imzML"
+    with ImzMLWriter(str(path), mode="processed") as w:
+        # m/z < 1 (e.g. zero-padded or calibration artefacts in MTBLS176) would give a negative log bin
+        w.addSpectrum(np.array([0.5, 0.9999, 100.0]), np.array([9.0, 9.0, 1.0], dtype=np.float32), (1, 1, 1))
+    table = imzml(path, ppm=5, n_features=5)["table"]
+    np.testing.assert_allclose(table.var["mz"], [100], rtol=5e-6)
+    np.testing.assert_allclose(table.X.toarray(), [[1]])
+
 @pytest.mark.parametrize(
     ("header", "kwarg", "expected", "source"),
     [
