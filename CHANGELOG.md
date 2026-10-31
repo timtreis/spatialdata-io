@@ -15,8 +15,12 @@ Release notes for `v0.7.1` and earlier are available on the [Releases][] page.
 
 ### Added
 
+- `dbit_matrix()` reads DBiT spots x features matrices (DBiT-seq, xDBiT, spatial-CITE-seq) from `<A>x<B>`-named
+  delimited tables or `.h5ad` files with `array_row`/`array_col` (and µm `um_row`/`um_col`) into pixel squares in µm,
+  with the RNA as `table` and antibody counts as `table_protein`.
 - `visium()` keeps the Antibody Capture features of a CytAssist Gene and Protein counts file as a second table,
   `table_protein`, annotating the same spots (they were dropped by `gex_only`).
+  `protein_file` reads antibody counts deposited apart (e.g. SPOTS `*_ADT.csv.gz`, a CytAssist `*_Protein.h5ad`).
 - `visium()` reads a deposit without a scale factors file (e.g. GSE263617): the spot diameter follows from the spot
   spacing (55 µm spots at 100 µm) and the hires/lowres images, which cannot be placed, are skipped with a warning.
 - `imzml()` (extra `imzml`, needs `pyimzml`) reads 2-D imzML imaging mass spectrometry into pixels x m/z features

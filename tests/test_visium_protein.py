@@ -7,6 +7,8 @@ from pathlib import Path
 
 import h5py
 import numpy as np
+import pandas as pd
+import pytest
 import scipy.sparse as sp
 from PIL import Image
 from spatialdata import read_zarr
@@ -68,3 +70,15 @@ def test_spot_diameter_from_spacing_without_scale_factors(tmp_path: Path) -> Non
     sdata = visium(root)
     assert sdata.shapes["S1"]["radius"].iloc[0] == 0.55 * 50 / 2  # spots 50 px apart
     assert not sdata.images and set(sdata.coordinate_systems) == {"S1"}
+
+
+def test_protein_file_in_either_orientation(tmp_path: Path) -> None:
+    root = _space_ranger(tmp_path / "S1")
+    # a SPOTS-style ADT table, antibodies x barcodes, missing one spot and with one barcode off the array
+    pd.DataFrame({"AAAT-1": [3], "AAAC-1": [5], "TTTT-1": [9]}, index=["CD4"]).to_csv(root / "adt.csv.gz")
+    sdata = visium(root, gex_only=True, protein_file="adt.csv.gz")
+    protein = sdata["table_protein"]
+    assert list(protein.obs_names) == ["AAAC-1", "AAAT-1"] and list(protein.obs["spot_id"]) == [0, 2]
+    np.testing.assert_array_equal(protein.X.toarray(), [[5], [3]])
+    with pytest.raises(ValueError, match="already holds Antibody Capture"):
+        visium(root, protein_file="adt.csv.gz")

@@ -9,6 +9,8 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pandas as pd
+import scipy.sparse as sp
+from anndata import AnnData, read_h5ad
 from dask_image.imread import imread
 from imageio import imread as imread2
 from scipy.spatial import cKDTree
@@ -37,6 +39,7 @@ def visium(
     tissue_positions_file: str | Path | None = None,
     scalefactors_file: str | Path | None = None,
     var_names_make_unique: bool = True,
+    protein_file: str | Path | None = None,
     imread_kwargs: Mapping[str, Any] = MappingProxyType({}),
     image_models_kwargs: Mapping[str, Any] = MappingProxyType({}),
     **kwargs: Any,
@@ -54,7 +57,8 @@ def visium(
         - ``fullres_image_file``: large microscopy image used as input for space ranger.
 
     The gene expression is the table ``"table"``. A Gene and Protein (CytAssist) counts file also holds Antibody
-    Capture features, which become a second table ``"table_protein"`` annotating the same spots.
+    Capture features, which become a second table ``"table_protein"`` annotating the same spots; antibody counts in
+    a separate file are read with ``protein_file``.
 
     .. seealso::
 
@@ -82,6 +86,11 @@ def visium(
         Path to the scalefactors file.
     var_names_make_unique
         If `True`, call `.var_names_make_unique()` on each `AnnData` table.
+    protein_file
+        Antibody counts deposited apart from the counts file (e.g. SPOTS ``*_ADT.csv.gz``, GSE198353, or a CytAssist
+        ``*_Protein.h5ad``): a delimited table of antibodies x barcodes (either orientation) or an ``.h5ad`` with
+        the barcodes as ``obs_names``. It becomes ``"table_protein"`` on the spots it shares with the counts file;
+        its values are taken as deposited.
     imread_kwargs
         Keyword arguments passed to :func:`dask_image.imread.imread`.
     image_models_kwargs
@@ -242,6 +251,10 @@ def visium(
         elif (keep := (feature_types == kind).to_numpy()).any():
             tables[key] = adata[:, keep].copy()
             tables[key].var_names = var_names[keep].tolist()
+    if protein_file is not None:
+        if "table_protein" in tables:
+            raise ValueError(f"{counts_file} already holds Antibody Capture features; drop `protein_file`.")
+        tables["table_protein"] = _read_protein(path / protein_file, adata.obs)
     for key, t in tables.items():
         tables[key] = TableModel.parse(t, region=dataset_id, region_key="region", instance_key="spot_id")
         if var_names_make_unique:
@@ -282,6 +295,25 @@ def visium(
 
     sdata = SpatialData(images=images, shapes=shapes, tables=tables)
     return _set_reader_metadata(sdata, "visium")
+
+
+def _read_protein(file: Path, spots: pd.DataFrame) -> AnnData:
+    """Antibodies on the counts file's spots (``spots`` is its ``obs``), oriented by the barcodes."""
+    if file.suffix == ".h5ad":
+        p = read_h5ad(file)
+        df = p.to_df()
+    else:
+        df = pd.read_csv(file, sep="\t" if ".tsv" in file.suffixes else ",", index_col=0)
+        if df.columns.isin(spots.index).sum() > df.index.isin(spots.index).sum():
+            df = df.T  # antibodies x barcodes
+    common = spots.index[spots.index.isin(df.index)]
+    if not len(common):
+        raise ValueError(f"No barcode of {file.name} is a spot of the counts file.")
+    return AnnData(
+        sp.csr_matrix(df.loc[common].to_numpy()),
+        obs=spots.loc[common].copy(),
+        var=pd.DataFrame(index=df.columns.astype(str)),
+    )
 
 
 def _read_png(image_file: Path, imread_kwargs: dict[str, Any]) -> Any:
