@@ -90,6 +90,42 @@ def test_pitch_unknown_and_3d_error(tmp_path: Path) -> None:
         imzml(tmp_path / "dup.imzML")
 
 
+def test_bruker_3d_positions(tmp_path: Path) -> None:
+    path = tmp_path / "3d.imzML"
+    # two planes on one 2 x 1 grid; SCiLS stores each voxel's µm position as 3DPosition userParams
+    spectra = [
+        ((1, 1), (5000, -2000, 0)),
+        ((2, 1), (5400, -2000, 0)),
+        ((1, 1), (5010, -2000, 1500)),
+        ((2, 1), (5410, -2000, 1500)),
+    ]
+    with ImzMLWriter(str(path), mode="processed") as w:
+        for (x, y), _ in spectra:
+            w.addSpectrum(np.array([100.0]), np.array([1.0], dtype=np.float32), (x, y, 1))
+    text = path.read_text()
+    # put each userParam block after its position y cvParam
+    rebuilt = ""
+    for i, chunk in enumerate(text.split('name="position y"')):
+        if i == 0:
+            rebuilt += chunk
+            continue
+        end = chunk.index("/>") + 2
+        params = "".join(
+            f'<userParam name="3DPosition{a}" value="{v}"/>' for a, v in zip("XYZ", spectra[i - 1][1], strict=True)
+        )
+        rebuilt += 'name="position y"' + chunk[:end] + params + chunk[end:]
+    path.write_text(rebuilt)
+
+    sdata = imzml(path, ppm=5, n_features=1)
+
+    assert sorted(sdata.shapes) == ["msi_pixels_z0", "msi_pixels_z1500"]
+    table = sdata["table"]
+    assert list(table.obs["z_um"]) == [0, 0, 1500, 1500] and table.n_obs == 4
+    uns = table.uns["spatialdata_io"]
+    assert (uns["pixel_size_um"], uns["pixel_size_source"], uns["n_planes"]) == (400.0, "3DPosition spacing", 2)
+    assert sdata.shapes["msi_pixels_z1500"].geometry.iloc[0].bounds == (4810, -2200, 5210, -1800)
+
+
 def test_drifting_ion_is_one_feature(tmp_path: Path) -> None:
     path = tmp_path / "d.imzML"
     with ImzMLWriter(str(path), mode="processed") as w:

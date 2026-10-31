@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import math
+import mmap
 import re
 import warnings
 from pathlib import Path
@@ -12,6 +13,7 @@ import geopandas as gpd
 import numpy as np
 import pandas as pd
 import scipy.sparse as sp
+from scipy.spatial import cKDTree
 from shapely.geometry import box
 from spatialdata import SpatialData
 from spatialdata._logging import logger
@@ -104,9 +106,10 @@ def imzml(
         warnings.simplefilter("ignore", UserWarning)  # pyimzml warns about outdated ontology term names
         parser = ImzMLParser(source, ibd_file=ibd)
     coords = np.asarray(parser.coordinates)
-    if (coords[:, 2] > 1).any():
+    pos3d = _positions_3d(path, len(coords))
+    if pos3d is None and (coords[:, 2] > 1).any():
         raise ValueError(f"{path.name} has {coords[:, 2].max()} z planes; only 2-D imzML is supported.")
-    if (n_dup := len(coords) - len(np.unique(coords[:, :2], axis=0))) > 0:
+    if pos3d is None and (n_dup := len(coords) - len(np.unique(coords[:, :2], axis=0))) > 0:
         # e.g. Bruker 3D exports: the planes share one x/y grid and only the 3DPositionZ parameter tells them apart
         raise ValueError(f"{path.name}: {n_dup} spectra repeat an x/y position; only 2-D imzML is supported.")
 
@@ -146,6 +149,11 @@ def imzml(
     dim, count = d.get("max dimension x"), d.get("max count of pixels x")
     dim_px = float(dim) / float(count) if dim and count else None
     px, px_source = _resolve_pixel_size(raw_px, dim_px, _header_has_unit(head), pixel_size_um)
+    if pos3d is not None:
+        # registered voxel centres in µm: the spot spacing within a plane is the pixel size (MTBLS176 microbes: 400
+        # µm, as stated, while the header says 100)
+        px = spacing = _plane_spacing(pos3d)
+        px_source = "3DPosition spacing"
     if px_source not in ("repository text", None) and px is not None and pixel_size_um is not None:
         if not math.isclose(px, pixel_size_um, rel_tol=0.01):
             logger.warning(
@@ -170,6 +178,10 @@ def imzml(
         "pixel_size_from_dimensions": dim_px,
         "pitch_unknown": px is None,
     }
+    if pos3d is not None:
+        return _set_reader_metadata(
+            _sdata_3d(X[keep], var, coords[keep], pos3d[keep], tic[keep], keep, spacing, uns), "imzml"
+        )
     obs = pd.DataFrame(
         {
             "x": xy[:, 0],
@@ -189,6 +201,70 @@ def imzml(
     squares = gpd.GeoDataFrame({"geometry": [box(x - 1, y - 1, x, y) for x, y in xy]}, index=keep)
     shapes = ShapesModel.parse(squares, transformations={"global": transform})
     return _set_reader_metadata(SpatialData(shapes={_SHAPES: shapes}, tables={"table": table}), "imzml")
+
+
+def _positions_3d(path: Path, n: int) -> np.ndarray | None:
+    """Per-spectrum ``3DPositionX/Y/Z`` userParams (µm) of Bruker/SCiLS 3D exports, if every spectrum has them."""
+    with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as m:
+        if m.find(b'name="3DPositionZ"') < 0:
+            return None
+        cols = [
+            [float(v) for v in re.findall(rb'name="3DPosition%s" value="([-0-9.eE+]+)"' % a.encode(), m)]  # type: ignore[call-overload]
+            for a in "XYZ"
+        ]
+    if any(len(c) != n for c in cols):
+        return None
+    return np.array(cols).T
+
+
+def _plane_spacing(pos: np.ndarray) -> float:
+    """Median distance to the nearest spectrum of the same plane."""
+    d = [cKDTree(p := pos[pos[:, 2] == z, :2]).query(p, k=2)[0][:, 1] for z in np.unique(pos[:, 2])]
+    return float(np.median(np.concatenate(d)))
+
+
+def _sdata_3d(
+    X: sp.csr_matrix,
+    var: pd.DataFrame,
+    grid: np.ndarray,
+    pos: np.ndarray,
+    tic: np.ndarray,
+    keep: np.ndarray,
+    px: float,
+    uns: dict[str, Any],
+) -> SpatialData:
+    """One ``msi_pixels_z<µm>`` squares element per plane in µm, all annotated by one table with ``z_um``."""
+    regions = np.array([f"{_SHAPES}_z{z:g}" for z in pos[:, 2]])
+    obs = pd.DataFrame(
+        {
+            "x": grid[:, 0],
+            "y": grid[:, 1],
+            "x_um": pos[:, 0],
+            "y_um": pos[:, 1],
+            "z_um": pos[:, 2],
+            "tic": tic,
+            "region": pd.Categorical(regions),
+            "instance_id": keep,
+        },
+        index=pd.Index([str(i) for i in keep]),
+    )
+    adata = ad.AnnData(X=X, obs=obs, var=var)
+    adata.obsm["spatial"] = pos[:, :2]
+    adata.uns["spatialdata_io"] = uns | {"n_planes": len(set(regions))}
+    names = sorted({str(r) for r in regions}, key=lambda r: float(r.rsplit("_z", 1)[1]))
+    table = TableModel.parse(adata, region=names, region_key="region", instance_key="instance_id")
+    h = px / 2
+    shapes = {
+        name: ShapesModel.parse(
+            gpd.GeoDataFrame(
+                {"geometry": [box(x - h, y - h, x + h, y + h) for x, y in pos[regions == name, :2]]},
+                index=keep[regions == name],
+            ),
+            transformations={"global": Identity()},
+        )
+        for name in names
+    }
+    return SpatialData(shapes=shapes, tables={"table": table})
 
 
 def _ibd_path(path: Path) -> Path:
