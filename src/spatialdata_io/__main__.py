@@ -719,6 +719,12 @@ def stereoseq_wrapper(
     help="Whether to make variable names unique. [default: True]",
 )
 @click.option(
+    "--protein-file",
+    type=str,
+    default=None,
+    help="Antibody counts deposited apart from the counts file, relative to the input folder. [default: None]",
+)
+@click.option(
     "--imread-kwargs",
     type=str,
     default="{}",
@@ -739,6 +745,7 @@ def visium_wrapper(
     tissue_positions_file: str | Path | None = None,
     scalefactors_file: str | Path | None = None,
     var_names_make_unique: bool = True,
+    protein_file: str | None = None,
     imread_kwargs: str = "{}",
     image_models_kwargs: str = "{}",
 ) -> None:
@@ -753,6 +760,7 @@ def visium_wrapper(
         tissue_positions_file=tissue_positions_file,
         scalefactors_file=scalefactors_file,
         var_names_make_unique=var_names_make_unique,
+        protein_file=protein_file,
         imread_kwargs=_parse_json_param(imread_kwargs, "imread_kwargs"),
         image_models_kwargs=_parse_json_param(image_models_kwargs, "image_models_kwargs"),
     )
