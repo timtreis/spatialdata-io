@@ -24,6 +24,7 @@ I/O for the `spatialdata` project.
     curio
     dbit
     dbit_fragments
+    dbit_matrix
     experimental.iss
     imc
     imzml
