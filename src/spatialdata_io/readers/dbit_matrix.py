@@ -40,7 +40,9 @@ def dbit_matrix(
           ``um_row``/``um_col`` (e.g. xDBiT, GSE207843). Its ``uns`` (which may hold full-size images) is dropped.
 
     Each pixel becomes a ``pixel_width_um`` square in the ``spots`` shapes element, centred at the deposited µm
-    position, else at the barcode indices times ``pitch_um``; elements are in µm in ``"global"``. The RNA counts are
+    position, else at the barcode indices times ``pitch_um``; elements are in µm in ``"global"``. Without either,
+    the pixels are one-unit squares at their barcode indices (grid units, ``pitch_unknown`` in ``uns``), and
+    ``pixel_width_um`` is kept as metadata only. The RNA counts are
     ``table`` and the antibody counts ``table_protein`` (oligo barcode suffixes stripped from their names); both
     annotate ``spots``.
 
@@ -51,7 +53,8 @@ def dbit_matrix(
     pixel_width_um
         Width of one pixel (the microfluidic channel width), as stated by the study.
     pitch_um
-        Centre-to-centre pixel spacing, as stated by the study; needed when the matrix has no µm positions.
+        Centre-to-centre pixel spacing, as stated by the study; without it (and without µm positions) the pixels are
+        placed in grid units.
     protein
         Antibody-derived tag (ADT) counts on the same pixels.
 
@@ -68,11 +71,10 @@ def dbit_matrix(
     spots = spots[~spots.index.duplicated()]
     if {"um_x", "um_y"} <= set(spots.columns):
         centres = spots[["um_x", "um_y"]].to_numpy(dtype=float)
-    elif pitch_um is None:
-        raise ValueError("`pitch_um` is needed to place pixels that have no deposited µm positions.")
     else:
-        centres = spots[["array_x", "array_y"]].to_numpy(dtype=float) * pitch_um
-    half = pixel_width_um / 2
+        centres = spots[["array_x", "array_y"]].to_numpy(dtype=float) * (pitch_um or 1)
+    pitch_unknown = "um_x" not in spots.columns and pitch_um is None
+    half = 0.5 if pitch_unknown else pixel_width_um / 2
     squares = gpd.GeoDataFrame(
         {"geometry": [box(x - half, y - half, x + half, y + half) for x, y in centres]}, index=np.arange(len(spots))
     )
@@ -84,7 +86,11 @@ def dbit_matrix(
         a.obs["region"] = pd.Categorical([_SHAPES] * a.n_obs)
         a.obs["instance_id"] = instance.loc[a.obs_names].to_numpy()
         a.obsm["spatial"] = centres[a.obs["instance_id"]]
-        a.uns["spatialdata_io"] = {"pixel_width_um": pixel_width_um, "pitch_um": pitch_um}
+        a.uns["spatialdata_io"] = {
+            "pixel_width_um": pixel_width_um,
+            "pitch_um": pitch_um,
+            "pitch_unknown": pitch_unknown,
+        }
         tables[key] = TableModel.parse(a, region=_SHAPES, region_key="region", instance_key="instance_id")
     return _set_reader_metadata(SpatialData(shapes={_SHAPES: shapes}, tables=tables), "dbit_matrix")
 

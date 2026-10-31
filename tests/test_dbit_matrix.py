@@ -7,7 +7,6 @@ from pathlib import Path
 import anndata as ad
 import numpy as np
 import pandas as pd
-import pytest
 from spatialdata import read_zarr
 
 from spatialdata_io import dbit_matrix
@@ -43,10 +42,13 @@ def test_h5ad_with_um_positions(tmp_path: Path) -> None:
 
     table = sdata["table"]
     assert "spatial" not in table.uns and list(table.obs["array_x"]) == [3, 3]
+    assert table.uns["spatialdata_io"]["pitch_unknown"] is False
     assert sdata.shapes["spots"].geometry.iloc[1].bounds == (275, 175, 325, 225)
 
 
-def test_index_grid_needs_pitch(tmp_path: Path) -> None:
-    pd.DataFrame({"G": [1]}, index=["1x1"]).to_csv(tmp_path / "r.csv")
-    with pytest.raises(ValueError, match="pitch_um"):
-        dbit_matrix(tmp_path / "r.csv", pixel_width_um=10)
+def test_index_grid_without_pitch_is_in_grid_units(tmp_path: Path) -> None:
+    pd.DataFrame({"G": [1, 2]}, index=["1x1", "3x2"]).to_csv(tmp_path / "r.csv")
+    sdata = dbit_matrix(tmp_path / "r.csv", pixel_width_um=25)
+    uns = sdata["table"].uns["spatialdata_io"]
+    assert uns["pitch_unknown"] is True and uns["pixel_width_um"] == 25  # metadata only, no scale derived
+    assert sdata.shapes["spots"].geometry.iloc[1].bounds == (2.5, 1.5, 3.5, 2.5)

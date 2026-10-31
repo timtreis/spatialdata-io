@@ -18,6 +18,7 @@ Release notes for `v0.7.1` and earlier are available on the [Releases][] page.
 - `dbit_matrix()` reads DBiT spots x features matrices (DBiT-seq, xDBiT, spatial-CITE-seq) from `<A>x<B>`-named
   delimited tables or `.h5ad` files with `array_row`/`array_col` (and µm `um_row`/`um_col`) into pixel squares in µm,
   with the RNA as `table` and antibody counts as `table_protein`.
+  Without a stated pitch or µm positions, the pixels are placed in grid units with `pitch_unknown`.
 - `visium()` keeps the Antibody Capture features of a CytAssist Gene and Protein counts file as a second table,
   `table_protein`, annotating the same spots (they were dropped by `gex_only`).
   `protein_file` reads antibody counts deposited apart (e.g. SPOTS `*_ADT.csv.gz`, a CytAssist `*_Protein.h5ad`).
