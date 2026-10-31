@@ -12,12 +12,13 @@ import pandas as pd
 import tifffile
 import zarr
 from spatialdata import SpatialData, sanitize_name
+from spatialdata._logging import logger
 from spatialdata.models import Image2DModel, Labels2DModel
-from spatialdata.transformations import Identity
+from spatialdata.transformations import Affine, BaseTransformation, Identity, Scale
 
 from spatialdata_io.readers._utils._utils import _initialize_raster_models_kwargs, _set_reader_metadata
 
-__all__ = ["imc"]
+__all__ = ["imc", "imc_mcd"]
 
 # Hyperion/XTi ablate a 1 µm spot per pixel; no IMC export states it
 PIXEL_SIZE_UM = 1.0
@@ -100,6 +101,92 @@ def imc(
         "pixel_size_source": "instrument spec (Hyperion/XTi ablation)",
     }
     return _set_reader_metadata(sdata, "imc")
+
+
+def imc_mcd(
+    path: str | Path,
+    *,
+    image_models_kwargs: Mapping[str, Any] = MappingProxyType({}),
+) -> SpatialData:
+    """Read all acquisitions (ROIs) of a raw *IMC* ``.mcd`` file with :mod:`readimc` (extra ``mcd``).
+
+    Each acquisition becomes the image ``<mcd>_<id>_image``, ``<mcd>`` being the file name without its extension,
+    with channels named by their antibody label (the metal, e.g. ``Ir191``, where unlabelled). The pixel size is the
+    acquisition's ablation distance. Acquisitions with stage coordinates are placed on the slide in µm in
+    ``"global"``; any other gets its own coordinate system in µm, named after the image. Acquisitions that cannot be
+    read (e.g. aborted ones) are skipped with a warning. ``sdata.attrs["imc"]`` lists each acquisition's id,
+    description, pixel size and placement.
+
+    Parameters
+    ----------
+    path
+        The ``.mcd`` file.
+    image_models_kwargs
+        Keyword arguments for :class:`spatialdata.models.Image2DModel`.
+
+    Returns
+    -------
+    :class:`spatialdata.SpatialData`
+    """
+    from readimc import MCDFile
+
+    path = Path(path)
+    image_models_kwargs, _ = _initialize_raster_models_kwargs(image_models_kwargs, {})
+    stem = sanitize_name(path.stem)
+    images, info = {}, []
+    with MCDFile(path) as f:
+        for slide in f.slides:
+            for acq in slide.acquisitions:
+                try:
+                    data = f.read_acquisition(acq)
+                except Exception as e:  # noqa: BLE001 - aborted or truncated acquisitions
+                    logger.warning(f"{path.name}: skipping acquisition {acq.id} ({acq.description}): {e}")
+                    continue
+                key = f"{stem}_{acq.id}"
+                names = [label or metal for label, metal in zip(acq.channel_labels, acq.channel_names, strict=True)]
+                if len(set(names)) < len(names):
+                    names = [f"{n}_{m}" for n, m in zip(names, acq.channel_names, strict=True)]
+                transform, cs = _stage_transform(acq), "global"
+                if transform is None:
+                    transform, cs = (
+                        Scale([acq.pixel_size_x_um or 1.0, acq.pixel_size_y_um or 1.0], axes=("x", "y")),
+                        key,
+                    )
+                images[f"{key}_image"] = Image2DModel.parse(
+                    da.from_array(data),
+                    dims=("c", "y", "x"),
+                    c_coords=names,
+                    transformations={cs: transform},
+                    **image_models_kwargs,
+                )
+                info.append(
+                    {
+                        "id": acq.id,
+                        "description": acq.description,
+                        "pixel_size_um": acq.pixel_size_x_um,
+                        "coordinate_system": cs,
+                    }
+                )
+    if not images:
+        raise ValueError(f"No readable acquisition in {path}.")
+    sdata = SpatialData(images=images)
+    sdata.attrs["imc"] = {
+        "mcd": path.name,
+        "acquisitions": info,
+        "pixel_size_source": "MCD AblationDistanceBetweenShots",
+    }
+    return _set_reader_metadata(sdata, "imc")
+
+
+def _stage_transform(acq: Any) -> BaseTransformation | None:
+    """Pixels -> slide µm from the acquisition's stage corners (top left, top right, bottom right, bottom left)."""
+    corners = acq.roi_coords_um
+    if corners is None or not acq.width_px or not acq.height_px:
+        return None
+    (x0, y0), (x1, y1), _, (x3, y3) = corners
+    w, h = acq.width_px, acq.height_px
+    matrix = [[(x1 - x0) / w, (x3 - x0) / h, x0], [(y1 - y0) / w, (y3 - y0) / h, y0], [0, 0, 1]]
+    return Affine(matrix, input_axes=("x", "y"), output_axes=("x", "y"))
 
 
 def _read_roi(

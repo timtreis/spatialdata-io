@@ -10,8 +10,9 @@ import tifffile
 import zarr
 from spatialdata import read_zarr
 from spatialdata.models import get_channel_names
+from spatialdata.transformations import get_transformation
 
-from spatialdata_io import imc
+from spatialdata_io import imc, imc_mcd
 
 _FAST = {"scale_factors": [2]}
 _DATA = np.random.default_rng(0).random((3, 40, 30), dtype=np.float32)
@@ -111,3 +112,43 @@ def test_several_rois_each_in_its_own_frame(tmp_path: Path) -> None:
     assert sdata.attrs["imc"]["roi"] == ["img_slide3_007.tiff", "img_slide3_008.tiff"]
     with pytest.raises(ValueError, match="one mask per ROI"):
         imc(rois, labels={"cells": masks[:1]})
+
+
+class _Acq:
+    def __init__(self, id: int, corners: object) -> None:
+        self.id, self.description, self.roi_coords_um = id, f"ROI_{id}", corners
+        self.channel_labels, self.channel_names = ["CD3", "", "CD3"], ["Nd142", "Ir191", "Er168"]
+        self.width_px, self.height_px, self.pixel_size_x_um, self.pixel_size_y_um = 30, 40, 1.0, 1.0
+
+
+class _MCD:
+    def __init__(self, path: Path) -> None:
+        # ROI 1 sits at x 1000-1030 µm, y 2000-2040 µm (y grows downwards); ROI 2 has no stage position; ROI 3 aborted
+        acqs = [_Acq(1, ((1000, 2000), (1030, 2000), (1030, 2040), (1000, 2040))), _Acq(2, None), _Acq(3, None)]
+        self.slides = [type("Slide", (), {"acquisitions": acqs})()]
+
+    def __enter__(self) -> _MCD:
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        pass
+
+    def read_acquisition(self, acq: _Acq) -> np.ndarray:
+        if acq.id == 3:
+            raise OSError("aborted")
+        return _DATA * acq.id
+
+
+def test_mcd_acquisitions_placed_on_the_slide(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    readimc = pytest.importorskip("readimc")
+    monkeypatch.setattr(readimc, "MCDFile", _MCD)
+
+    sdata = imc_mcd(tmp_path / "slide 1.mcd", image_models_kwargs=_FAST)
+
+    assert sorted(sdata.images) == ["slide_1_1_image", "slide_1_2_image"]
+    # duplicate labels get their metal; the unlabelled channel keeps its metal
+    assert get_channel_names(sdata.images["slide_1_1_image"]) == ["CD3_Nd142", "Ir191_Ir191", "CD3_Er168"]
+    t = get_transformation(sdata.images["slide_1_1_image"], "global").to_affine_matrix(("x", "y"), ("x", "y"))
+    np.testing.assert_allclose(t @ [30, 40, 1], [1030, 2040, 1])
+    assert set(get_transformation(sdata.images["slide_1_2_image"], get_all=True)) == {"slide_1_2"}
+    assert [a["coordinate_system"] for a in sdata.attrs["imc"]["acquisitions"]] == ["global", "slide_1_2"]

@@ -27,6 +27,7 @@ I/O for the `spatialdata` project.
     dbit_matrix
     experimental.iss
     imc
+    imc_mcd
     imzml
     mcmicro
     merscope

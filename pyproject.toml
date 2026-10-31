@@ -47,12 +47,13 @@ dependencies = [
   "xmltodict",
   "zarr>=3.2",
 ]
+# imzml(): imaging mass spectrometry
+optional-dependencies.imzml = [ "pyimzml" ]
+optional-dependencies.mcd = [ "readimc" ]
 # https://docs.pypi.org/project_metadata/#project-urls
 urls.Documentation = "https://spatialdata-io.readthedocs.io/"
 urls.Homepage = "https://github.com/scverse/spatialdata-io"
 urls.Source = "https://github.com/scverse/spatialdata-io"
-# imzml(): imaging mass spectrometry
-optional-dependencies.imzml = [ "pyimzml" ]
 
 [dependency-groups]
 dev = [
@@ -74,6 +75,7 @@ test = [
   "pyimzml",
   "pytest",
   "pytest-mock",
+  "readimc",
 ]
 doc = [
   "ipykernel",
@@ -170,6 +172,7 @@ module = [
   "pyimzml.*",
   "rasterio.*",
   "readfcs.*",
+  "readimc.*",
   "rioxarray.*",
   "scanpy.*",
   "spatial_image.*",
@@ -194,11 +197,11 @@ testpaths = [ "tests" ]
 xfail_strict = true
 
 [tool.coverage]
+run.source = [ "spatialdata_io" ]
 run.omit = [
   "**/test_*.py",
 ]
 run.patch = [ "subprocess" ]
-run.source = [ "spatialdata_io" ]
 
 [tool.cruft]
 skip = [
