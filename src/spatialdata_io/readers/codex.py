@@ -237,6 +237,13 @@ def codex(
         arrays[region], channels, names_source = _read_legacy_image(
             files, layout.channel_names_txt, image_models_kwargs=image_models_kwargs
         )
+        pixel_size, pixel_size_xy = _pixel_size_um(experiment), None
+        pixel_size_source: str | None = "experiment.json"
+        if pixel_size is None and (pixel_size_xy := _ome_pixel_size_um(files[0])) is not None:
+            # e.g. HuBMAP codex-pipeline OME-TIFFs: PhysicalSizeX 377.4 nm, no experiment.json
+            pixel_size, pixel_size_source = pixel_size_xy[0], "ome-xml"
+        elif pixel_size is None:
+            pixel_size_source = None
         scans.append(
             AkoyaScan(
                 path=files[0] if len(files) == 1 else files[0].parent,
@@ -244,7 +251,7 @@ def codex(
                 generation="legacy_processor",
                 software=None,
                 slide_id=None,
-                pixel_size_um=_pixel_size_um(experiment),
+                pixel_size_um=pixel_size,
                 nominal_pixel_size_um=None,
                 stage_position_um=None,
                 channels=channels,
@@ -254,6 +261,8 @@ def codex(
                     "experiment_json": experiment,
                     "channel_names_txt": names_txt,
                     "names_source": names_source,
+                    "pixel_size_source": pixel_size_source,
+                    "pixel_size_xy_um": list(pixel_size_xy) if pixel_size_xy is not None else None,
                 },
             )
         )
@@ -428,6 +437,39 @@ def _read_legacy_image(
         name = names[i] if names is not None else f"cyc{cycle:03d}_ch{channel:03d}"
         channels.append(AkoyaChannel(name=name, cycle=cycle, channel=channel))
     return image, channels, source
+
+
+_UM_PER_UNIT = {"nm": 1e-3, "µm": 1.0, "um": 1.0, "\u03bcm": 1.0, "mm": 1e3, "cm": 1e4, "m": 1e6}
+
+
+def _ome_pixel_size_um(path: Path) -> tuple[float, float] | None:
+    """OME-XML ``PhysicalSizeX``/``Y`` of the first image in µm (OME's default unit is µm); warns if they differ."""
+    with tifffile.TiffFile(path) as tf:
+        ome = tf.ome_metadata
+    pixels = ElementTree.fromstring(ome).find("{*}Image/{*}Pixels") if ome else None
+    if pixels is None or pixels.get("PhysicalSizeX") is None:
+        return None
+    size = []
+    for axis in "XY":
+        value, unit = (
+            pixels.get(f"PhysicalSize{axis}", pixels.get("PhysicalSizeX")),
+            pixels.get(f"PhysicalSize{axis}Unit", "µm"),
+        )
+        if unit not in _UM_PER_UNIT:
+            warnings.warn(
+                f"{path.name}: unknown OME PhysicalSize{axis}Unit {unit!r}; ignoring the pixel size.",
+                UserWarning,
+                stacklevel=2,
+            )
+            return None
+        size.append(float(value) * _UM_PER_UNIT[unit])  # type: ignore[arg-type]
+    if not np.isclose(size[0], size[1], rtol=1e-3):
+        warnings.warn(
+            f"{path.name}: OME pixel size differs in x ({size[0]} µm) and y ({size[1]} µm); using x.",
+            UserWarning,
+            stacklevel=2,
+        )
+    return size[0], size[1]
 
 
 def _ome_channel_names(path: Path) -> list[str] | None:

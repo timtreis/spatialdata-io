@@ -438,3 +438,32 @@ def test_codex_names_source(
     assert get_channel_names(sdata.images["reg001_image"]) == names
     assert sdata.attrs["akoya"]["regions"]["reg001"]["raw"]["names_source"] == source
     assert any("No channel names" in str(w.message) for w in record) == (source == "positional")
+
+
+@pytest.mark.parametrize(
+    ("pixels", "expected", "source"),
+    [
+        (
+            {"PhysicalSizeX": 377.4, "PhysicalSizeXUnit": "nm", "PhysicalSizeY": 377.4, "PhysicalSizeYUnit": "nm"},
+            0.3774,
+            "ome-xml",
+        ),
+        ({"PhysicalSizeX": 0.5, "PhysicalSizeY": 0.5}, 0.5, "ome-xml"),  # OME's default unit is µm
+        ({}, None, None),
+    ],
+    ids=["nm", "um-default", "none"],
+)
+def test_codex_ome_pixel_size(
+    tmp_path: Path, pixels: dict[str, Any], expected: float | None, source: str | None
+) -> None:
+    _hyperstack(tmp_path, metadata={"axes": "CYX", "Channel": {"Name": ["A", "B", "C"]}, **pixels})
+    region = _codex(tmp_path).attrs["akoya"]["regions"]["reg001"]
+    assert region["pixel_size_um"] == (pytest.approx(expected) if expected is not None else None)
+    assert region["raw"]["pixel_size_source"] == source
+
+
+def test_codex_ome_pixel_size_xy_differ_warns(tmp_path: Path) -> None:
+    _hyperstack(tmp_path, metadata={"axes": "CYX", "PhysicalSizeX": 0.5, "PhysicalSizeY": 0.6})
+    with pytest.warns(UserWarning, match="differs in x"):
+        region = _codex(tmp_path).attrs["akoya"]["regions"]["reg001"]
+    assert region["raw"]["pixel_size_xy_um"] == [0.5, 0.6] and region["pixel_size_um"] == 0.5
