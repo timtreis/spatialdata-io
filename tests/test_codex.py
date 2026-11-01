@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 import shutil
 import warnings
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 import pandas as pd
@@ -354,6 +354,7 @@ def test_codex_mask_discovery_errors_and_explicit_labels(tmp_path: Path) -> None
     tifffile.imwrite(tmp_path / "reg001_x_mask.tif", np.ones((16, 16), dtype=np.uint16))
     with warnings.catch_warnings():
         warnings.simplefilter("error")
+        warnings.filterwarnings("ignore", "No channel names", UserWarning)  # the fixture's images are unnamed
         sdata = _codex(tmp_path, labels={"reg001": tmp_path / "reg001_x_mask.tif"})
     assert sorted(sdata.images) == ["reg001_image", "reg002_image"]
     assert list(sdata.labels) == ["reg001_labels"]
@@ -398,3 +399,42 @@ def test_codex_old_flat_layout_regression(tmp_path: Path, monkeypatch: pytest.Mo
     table = sdata.tables["table"]
     assert list(table.obs["region"].cat.categories) == ["reg001_cells"]
     np.testing.assert_allclose(table.X, data["cells"].filter(regex="^cyc").to_numpy(), rtol=1e-6)
+
+
+def _hyperstack(tmp_path: Path, **kwargs: Any) -> None:
+    tifffile.imwrite(tmp_path / "reg001_expr.ome.tif", np.zeros((3, 16, 16), np.uint16), **kwargs)
+
+
+@pytest.mark.parametrize(
+    ("write", "sidecar", "names", "source"),
+    [
+        # HuBMAP codex-pipeline: OME-XML Channel@Name and no channelNames.txt
+        (
+            {"metadata": {"axes": "CYX", "Channel": {"Name": ["Hoechst1", "MUC1", "CD25"]}}},
+            None,
+            ["Hoechst1", "MUC1", "CD25"],
+            "ome-xml",
+        ),
+        (
+            {"imagej": True, "metadata": {"axes": "CYX", "Labels": ["A", "B", "C"]}},
+            "o0\no1\no2\n",
+            ["A", "B", "C"],
+            "imagej",
+        ),
+        ({"metadata": None}, "DAPI\nCD3\nCD8\n", ["DAPI", "CD3", "CD8"], "sidecar"),
+        ({"metadata": None}, None, ["cyc001_ch001", "cyc001_ch002", "cyc001_ch003"], "positional"),
+    ],
+    ids=["ome-xml", "imagej", "sidecar", "positional"],
+)
+def test_codex_names_source(
+    tmp_path: Path, write: dict[str, Any], sidecar: str | None, names: list[str], source: str
+) -> None:
+    _hyperstack(tmp_path, **write)
+    if sidecar is not None:
+        (tmp_path / "channelNames.txt").write_text(sidecar)
+    with warnings.catch_warnings(record=True) as record:
+        warnings.simplefilter("always")
+        sdata = _codex(tmp_path)
+    assert get_channel_names(sdata.images["reg001_image"]) == names
+    assert sdata.attrs["akoya"]["regions"]["reg001"]["raw"]["names_source"] == source
+    assert any("No channel names" in str(w.message) for w in record) == (source == "positional")

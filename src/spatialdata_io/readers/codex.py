@@ -8,9 +8,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any
+from xml.etree import ElementTree
 
 import dask.array as da
 import numpy as np
+import tifffile
 from spatialdata import SpatialData, sanitize_name
 
 from spatialdata_io._constants._constants import CodexKeys
@@ -232,7 +234,7 @@ def codex(
             scans.append(read_qptiff_metadata(files[0], region=region))
             arrays[region] = read_qptiff_image(scans[-1])
             continue
-        arrays[region], channels = _read_legacy_image(
+        arrays[region], channels, names_source = _read_legacy_image(
             files, layout.channel_names_txt, image_models_kwargs=image_models_kwargs
         )
         scans.append(
@@ -251,6 +253,7 @@ def codex(
                     "files": [str(file) for file in files],
                     "experiment_json": experiment,
                     "channel_names_txt": names_txt,
+                    "names_source": names_source,
                 },
             )
         )
@@ -366,7 +369,7 @@ def _read_legacy_image(
     files: list[Path],
     channel_names_txt: Path | None,
     image_models_kwargs: Mapping[str, Any] = MappingProxyType({}),
-) -> tuple[da.Array, list[AkoyaChannel]]:
+) -> tuple[da.Array, list[AkoyaChannel], str]:
     """Lazily read the image of one legacy CODEX region.
 
     Parameters
@@ -374,19 +377,21 @@ def _read_legacy_image(
     files
         The per-marker images of the region, or its single hyperstack, as returned by :func:`_discover_legacy`.
     channel_names_txt
-        Optional ``channelNames.txt`` naming the hyperstack channels when the file has no ImageJ ``Labels``.
+        Optional ``channelNames.txt`` naming the hyperstack channels when the file has neither ImageJ ``Labels`` nor
+        OME-XML ``Channel@Name`` s (e.g. HuBMAP's ``reg001_expr.ome.tif`` has the latter).
     image_models_kwargs
         Keyword arguments for :class:`spatialdata.models.Image2DModel`; their ``chunks`` set the spatial chunks of
         uncompressed files, which are memory-mapped.
 
     Returns
     -------
-    The ``(c, y, x)`` image and its channels.
+    The ``(c, y, x)`` image, its channels, and where their names came from: ``"file-name"`` (per-marker images),
+    ``"imagej"``, ``"ome-xml"``, ``"sidecar"`` or ``"positional"`` (``cycCCC_chHHH``, when nothing names them).
     """
     chunks = _spatial_chunks(image_models_kwargs)
     markers = [(match, file) for file in files if (match := _PER_MARKER.search(file.name)) is not None]
     if len(markers) == len(files):
-        return _read_per_marker(markers, chunks)
+        return (*_read_per_marker(markers, chunks), "file-name")
     if len(files) != 1:
         raise ValueError(f"Expected per-marker images or a single hyperstack, got {[str(f) for f in files]}.")
 
@@ -395,7 +400,11 @@ def _read_legacy_image(
     # the last non-spatial axis holds the channels of a cycle; ImageJ axis labels are unreliable (cycles as Z)
     n_channels = leading_shape[-1] if leading_shape else 1
     names: list[str] | None = labels if labels is not None and len(labels) == n_planes else None
+    source = "imagej"
+    if names is None and (ome := _ome_channel_names(files[0])) is not None and len(ome) == n_planes:
+        names, source = ome, "ome-xml"
     if names is None and channel_names_txt is not None:
+        source = "sidecar"
         names = _read_channel_names_txt(channel_names_txt)
         if len(names) != n_planes:
             warnings.warn(
@@ -405,12 +414,31 @@ def _read_legacy_image(
                 stacklevel=2,
             )
             names = None
+    if names is None:
+        source = "positional"
+        warnings.warn(
+            f"No channel names for {files[0]} (no ImageJ labels, OME-XML channel names or matching "
+            f"{CodexKeys.CHANNEL_NAMES_FILE.value}); naming its {n_planes} channels by position 'cycCCC_chHHH'.",
+            UserWarning,
+            stacklevel=2,
+        )
     channels = []
     for i in range(n_planes):
         cycle, channel = i // n_channels + 1, i % n_channels + 1
         name = names[i] if names is not None else f"cyc{cycle:03d}_ch{channel:03d}"
         channels.append(AkoyaChannel(name=name, cycle=cycle, channel=channel))
-    return image, channels
+    return image, channels, source
+
+
+def _ome_channel_names(path: Path) -> list[str] | None:
+    """The ``Channel@Name`` s of the first OME-XML image, if every channel has a non-blank one."""
+    with tifffile.TiffFile(path) as tf:
+        ome = tf.ome_metadata
+    if not ome:
+        return None
+    image = ElementTree.fromstring(ome).find("{*}Image")
+    names = [c.get("Name", "") for c in image.iterfind("{*}Pixels/{*}Channel")] if image is not None else []
+    return names if names and all(n.strip() for n in names) else None
 
 
 def _read_per_marker(
