@@ -106,6 +106,8 @@ def imzml(
         warnings.simplefilter("ignore", UserWarning)  # pyimzml warns about outdated ontology term names
         parser = ImzMLParser(source, ibd_file=ibd)
     coords = np.asarray(parser.coordinates)
+    # continuous mode: one shared m/z array, so the spectra can be sliced straight from a memmap of the .ibd
+    ibd_path = _ibd_path(path) if "IMS:1000030" in head and len(set(parser.mzOffsets)) == 1 else None
     pos3d = _positions_3d(path, len(coords))
     if pos3d is None and (coords[:, 2] > 1).any():
         raise ValueError(f"{path.name} has {coords[:, 2].max()} z planes; only 2-D imzML is supported.")
@@ -128,7 +130,7 @@ def imzml(
         space = "deposited"
     else:
         step = math.log1p(tol)
-        totals = _bin_totals(parser, step)
+        totals = _bin_totals(parser, step, ibd_path)
         # local maxima only, so an ion whose m/z drifts across neighbouring bins between pixels is one feature
         left, right = np.r_[0.0, totals[:-1]], np.r_[totals[1:], 0.0]
         peaks = np.flatnonzero((totals > 0) & (totals >= left) & (totals > right))
@@ -140,7 +142,7 @@ def imzml(
         space = f"mz_top{len(top)}_{ppm:g}ppm"
     var.index = pd.Index([f"mz_{mz:.4f}" for mz in var["mz"]])
 
-    X, tic, n_peaks, mz_range = _count(parser, lookup, len(var))
+    X, tic, n_peaks, mz_range = _count(parser, lookup, len(var), ibd_path)
     keep = np.flatnonzero(n_peaks > 0)
     xy = coords[keep, :2]
 
@@ -360,9 +362,16 @@ def _read_features(path: Path) -> np.ndarray:
     return np.unique(pd.to_numeric(col, errors="coerce").dropna().to_numpy(dtype=float))
 
 
-def _spectra(parser: Any) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray]]:
-    """Batches of ``(pixel index, m/z, intensity)`` over all spectra."""
+def _spectra(parser: Any, ibd_path: Path | None = None) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    """Batches of ``(pixel index, m/z, intensity)`` over all spectra.
+
+    With ``ibd_path`` (continuous mode), the arrays are sliced from a memmap of the ``.ibd``: the same bytes and dtypes
+    as :meth:`pyimzml.ImzMLParser.getspectrum` reads, so the results are identical, without a Python read per spectrum.
+    """
     n = len(parser.coordinates)
+    if ibd_path is not None:
+        yield from _spectra_memmap(parser, ibd_path)
+        return
     for start in range(0, n, _BATCH):
         pix, mzs, ints = [], [], []
         for i in range(start, min(start + _BATCH, n)):
@@ -373,10 +382,28 @@ def _spectra(parser: Any) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray]]
         yield np.concatenate(pix), np.concatenate(mzs), np.concatenate(ints)
 
 
-def _bin_totals(parser: Any, step: float) -> np.ndarray:
+def _spectra_memmap(parser: Any, ibd_path: Path) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    n = len(parser.coordinates)
+    mm = np.memmap(ibd_path, dtype=np.uint8, mode="r")
+    mz_type, it_type = np.dtype(parser.mzPrecision), np.dtype(parser.intensityPrecision)
+    off, length = parser.mzOffsets[0], parser.mzLengths[0]
+    mz = np.asarray(mm[off : off + length * mz_type.itemsize].view(mz_type), dtype=float)
+    it_off, it_len = np.asarray(parser.intensityOffsets), np.asarray(parser.intensityLengths)
+    for start in range(0, n, _BATCH):
+        stop = min(start + _BATCH, n)
+        ints = [mm[o : o + k * it_type.itemsize] for o, k in zip(it_off[start:stop], it_len[start:stop], strict=True)]
+        counts = it_len[start:stop]
+        yield (
+            np.repeat(np.arange(start, stop, dtype=np.int64), counts),
+            np.tile(mz, stop - start) if (counts == len(mz)).all() else np.concatenate([mz[:k] for k in counts]),
+            np.asarray(np.concatenate(ints).view(it_type), dtype=float),
+        )
+
+
+def _bin_totals(parser: Any, step: float, ibd_path: Path | None = None) -> np.ndarray:
     """Total intensity per log-spaced m/z bin (bin ``i`` spans ``exp(i * step)`` to ``exp((i + 1) * step)``)."""
     totals = np.zeros(0)
-    for _, mz, it in _spectra(parser):
+    for _, mz, it in _spectra(parser, ibd_path):
         ok = mz >= 1  # m/z below 1 is no ion, and its log bin would be negative
         b = np.floor(np.log(mz[ok]) / step).astype(np.int64)
         part = np.bincount(b, weights=it[ok])
@@ -411,19 +438,25 @@ def _deposited_lookup(feat: np.ndarray, tol: float) -> Any:
     return lookup
 
 
-def _count(parser: Any, lookup: Any, n_feat: int) -> tuple[sp.csr_matrix, np.ndarray, np.ndarray, tuple[float, float]]:
+def _count(
+    parser: Any, lookup: Any, n_feat: int, ibd_path: Path | None = None
+) -> tuple[sp.csr_matrix, np.ndarray, np.ndarray, tuple[float, float]]:
     """Pixels x features CSR of summed intensities, the TIC and number of peaks per pixel, and the m/z range."""
     n = len(parser.coordinates)
     tic, n_peaks = np.zeros(n), np.zeros(n, dtype=np.int64)
     blocks: list[sp.csr_matrix] = []
-    lo, hi = np.inf, -np.inf
-    for pix, mz, it in _spectra(parser):
+    lo, hi, done = np.inf, -np.inf, 0
+    for pix, mz, it in _spectra(parser, ibd_path):
         tic += np.bincount(pix, weights=it, minlength=n)
         n_peaks += np.bincount(pix, minlength=n)
         if len(mz):
             lo, hi = min(lo, float(mz.min())), max(hi, float(mz.max()))
         f = lookup(mz)
         m = f >= 0
-        blocks.append(sp.csr_matrix((it[m].astype(np.float32), (pix[m], f[m])), shape=(n, n_feat)))
-    X = sum(blocks[1:], blocks[0]) if blocks else sp.csr_matrix((n, n_feat), dtype=np.float32)
-    return X.tocsr(), tic, n_peaks, (lo, hi)
+        # stacked row blocks: adding n x n_feat blocks was quadratic in the number of batches. Each block runs from
+        # the rows done so far to its last pixel, so empty spectra at either end of a batch keep their rows.
+        end = int(pix.max()) + 1 if len(pix) else done
+        blocks.append(sp.csr_matrix((it[m].astype(np.float32), (pix[m] - done, f[m])), shape=(end - done, n_feat)))
+        done = end
+    blocks.append(sp.csr_matrix((n - done, n_feat), dtype=np.float32))  # trailing spectra without peaks
+    return sp.vstack(blocks, format="csr"), tic, n_peaks, (lo, hi)

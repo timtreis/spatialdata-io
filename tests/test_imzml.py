@@ -5,6 +5,7 @@ from __future__ import annotations
 from pathlib import Path
 
 import numpy as np
+import pandas as pd
 import pytest
 from spatialdata import read_zarr
 from spatialdata.transformations import get_transformation
@@ -236,3 +237,29 @@ def test_mzml_without_namespace(tmp_path: Path) -> None:
     path.write_text(path.read_text().replace(' xmlns="http://psi.hupo.org/ms/mzml"', "", 1))
     table = imzml(path, n_features=3)["table"]
     assert table.n_obs == 3 and table.uns["spatialdata_io"]["pixel_size_um"] == 50.0
+
+
+@pytest.mark.parametrize("mode", ["continuous", "processed"])
+def test_memmap_path_matches_pyimzml(tmp_path: Path, mode: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    from spatialdata_io.readers import imzml as mod
+
+    rng = np.random.default_rng(0)
+    mz = np.linspace(100, 900, 400)
+    path = tmp_path / f"{mode}.imzML"
+    with ImzMLWriter(str(path), mode=mode) as w:
+        for i in range(11):
+            # spectrum 3: all zeros (continuous) or shorter (processed); batches of 3 below
+            k = 400 if mode == "continuous" or i != 3 else 50
+            it = rng.random(k).astype(np.float32) * (i != 3 or mode == "processed")
+            w.addSpectrum(mz[:k], it, (i % 4 + 1, i // 4 + 1, 1))
+    monkeypatch.setattr(mod, "_BATCH", 3)
+    used = []
+    fast_reader = mod._spectra_memmap
+    monkeypatch.setattr(mod, "_spectra_memmap", lambda *a: used.append(1) or fast_reader(*a))
+    fast = imzml(path, n_features=20, ppm=50)["table"]
+    assert bool(used) == (mode == "continuous")  # processed mode stays on pyimzml
+    monkeypatch.setattr(mod, "_spectra_memmap", lambda parser, ibd: mod._spectra(parser, None))
+    slow = imzml(path, n_features=20, ppm=50)["table"]
+    assert (fast.X != slow.X).nnz == 0 and fast.X.dtype == slow.X.dtype
+    pd.testing.assert_frame_equal(fast.var, slow.var)
+    pd.testing.assert_frame_equal(fast.obs, slow.obs)
