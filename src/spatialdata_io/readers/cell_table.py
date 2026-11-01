@@ -186,6 +186,8 @@ def _build(
 
     n = len(obs)
     obs[_INSTANCE_KEY] = np.arange(n)
+    # the string ids stay the index; an index named like the id column ("cell_id") clashes with the instance key on write
+    obs.index.name = None
     transformation, factor = _transformation(unit, pixel_size)
     source, radius_um = _resolve_radius(obs, unit, cell_radius)
 

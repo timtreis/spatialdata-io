@@ -831,3 +831,15 @@ def test_mtx_does_not_take_coordinates_as_barcodes(tmp_path: Path) -> None:
     cells.write_text("cell,x,y\n" + "\n".join(f"c{i},{i},1" for i in range(20)) + "\n")
     with pytest.raises(ValueError, match="barcodes"):
         cell_table(mtx, cells, unit="um", x="x", y="y", cell_id="cell")
+
+
+def test_coordinates_id_column_named_cell_id_writes(tmp_path: Path) -> None:
+    # Zenodo MERFISH (zenodo:10420367): the id column of both files is literally "cell_id", the instance key's name
+    (tmp_path / "counts.csv").write_text("cell_id,G1,G2\n3,1,0\n5,0,2\n")
+    (tmp_path / "meta.csv").write_text('cell_id,fov,global_x,global_y\n3,"[0, 115]",-191.6,24.0\n5,[0],-190.8,60.9\n')
+    sdata = cell_table(
+        tmp_path / "counts.csv", tmp_path / "meta.csv", unit="um", x="global_x", y="global_y", cell_id="cell_id"
+    )
+    obs = sdata["table"].obs
+    assert obs.index.name is None and list(obs.index) == ["3", "5"] and list(obs["cell_id"]) == [0, 1]
+    sdata.write(tmp_path / "x.zarr")
