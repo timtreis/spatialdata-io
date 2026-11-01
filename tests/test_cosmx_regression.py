@@ -1985,3 +1985,16 @@ def test_failed_tx_conversion_leaves_no_parquet_cache(tmp_path: Path, monkeypatc
     with pytest.raises(OSError, match="disk full"):
         _io._parquet_cache_for_tx(tmp_path, None)
     assert not list(tmp_path.glob("*.parquet*"))
+
+
+def test_dataset_id_selects_only_its_own_flat_files(tmp_path: Path) -> None:
+    # sddb_2lqsgigobg: one export folder holds Run5452_S2_* plus CXC10_* / CXCR3_* transcript files of other analyses
+    from spatialdata_io.readers.cosmx._discovery import _scan_for_files_to_read
+
+    for name in ("CXC10_tx_file.csv", "CXCR3_tx_file.csv", "Run5452_S2_tx_file.csv", "Run5452_S2_exprMat_file.csv"):
+        (tmp_path / name).write_text("fov\n")
+    found = _scan_for_files_to_read(tmp_path, ["tx_file", "exprMat_file"], dataset_id="Run5452_S2")
+    assert found["tx_file"] == tmp_path / "Run5452_S2_tx_file.csv"
+    assert found["exprMat_file"] == tmp_path / "Run5452_S2_exprMat_file.csv"
+    (tmp_path / "Run5452_S2_tx_file.csv").unlink()
+    assert _scan_for_files_to_read(tmp_path, ["tx_file"], dataset_id="Run5452_S2")["tx_file"] is None

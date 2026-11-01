@@ -176,7 +176,11 @@ def _scan_for_files_to_read(
                 if child.is_dir() and child.name == t:
                     found[t] = child
                     break
-                if child.is_file() and _matches_target(_strip_all_extensions(child), t):
+                if child.is_file() and _matches_target(stem := _strip_all_extensions(child), t):
+                    # with a dataset id, a file under another prefix belongs to another run (e.g. CXC10_tx_file.csv
+                    # next to Run5452_S2_tx_file.csv, GSE sddb_2lqsgigobg); only a bare target name is accepted
+                    if dataset_id is not None and stem != t:
+                        continue
                     found[t] = child
                     break
             if child.is_dir() and any(v is None for v in found.values()):
