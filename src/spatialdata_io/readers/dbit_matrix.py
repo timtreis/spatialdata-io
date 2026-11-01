@@ -7,6 +7,7 @@ import anndata as ad
 import geopandas as gpd
 import numpy as np
 import pandas as pd
+import scipy.io
 import scipy.sparse as sp
 from shapely.geometry import box
 from spatialdata import SpatialData
@@ -37,7 +38,10 @@ def dbit_matrix(
         - a delimited table (``.tsv``/``.csv``, optionally ``.gz``) whose spots are named ``<A>x<B>`` by their two
           barcode indices, as rows or columns (e.g. GSE213264, GSE137986); ``A`` is taken as x and ``B`` as y;
         - an ``.h5ad`` file whose ``obs`` has ``array_row``/``array_col`` and, optionally, the pixel centres in µm as
-          ``um_row``/``um_col`` (e.g. xDBiT, GSE207843). Its ``uns`` (which may hold full-size images) is dropped.
+          ``um_row``/``um_col`` (e.g. xDBiT, GSE207843). Its ``uns`` (which may hold full-size images) is dropped;
+        - a folder with ``matrix.mtx`` (features x spots), ``features.tsv`` (``name`` and ``assay`` columns),
+          ``barcodes.tsv`` and ``positions.csv`` (``barcode``, ``array_row``, ``array_col``), as written from a
+          Seurat ``.rds`` (e.g. Patho-DBiT, GSE274641) by a conversion script; ``assay`` goes to ``var``.
 
     Each pixel becomes a ``pixel_width_um`` square in the ``spots`` shapes element, centred at the deposited µm
     position, else at the barcode indices times ``pitch_um``; elements are in µm in ``"global"``. Without either,
@@ -97,6 +101,19 @@ def dbit_matrix(
 
 def _read(path: Path) -> ad.AnnData:
     """Spots x features with integer grid indices ``array_x``/``array_y`` (and µm ``um_x``/``um_y`` if deposited)."""
+    if path.is_dir():
+        var = pd.read_csv(path / "features.tsv", sep="\t")
+        barcodes = (path / "barcodes.tsv").read_text().split()
+        pos = pd.read_csv(path / "positions.csv", index_col=0).loc[barcodes]
+        a = ad.AnnData(
+            sp.csr_matrix(scipy.io.mmread(path / "matrix.mtx").T),
+            obs=pd.DataFrame(
+                {"array_x": pos["array_col"].to_numpy(), "array_y": pos["array_row"].to_numpy()}, index=barcodes
+            ),
+            var=pd.DataFrame({"assay": var["assay"].to_numpy()}, index=var["name"].astype(str).to_numpy()),
+        )
+        a.var_names_make_unique()  # e.g. microRNA host genes named like an mRNA
+        return a
     if path.suffix == ".h5ad":
         a = ad.read_h5ad(path)
         a.uns = {}

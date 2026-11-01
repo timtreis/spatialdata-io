@@ -52,3 +52,27 @@ def test_index_grid_without_pitch_is_in_grid_units(tmp_path: Path) -> None:
     uns = sdata["table"].uns["spatialdata_io"]
     assert uns["pitch_unknown"] is True and uns["pixel_width_um"] == 25  # metadata only, no scale derived
     assert sdata.shapes["spots"].geometry.iloc[1].bounds == (2.5, 1.5, 3.5, 2.5)
+
+
+def test_mtx_folder_from_seurat_rds(tmp_path: Path) -> None:
+    import scipy.io
+    import scipy.sparse as sp
+
+    d = tmp_path / "rds"
+    d.mkdir()
+    scipy.io.mmwrite(d / "matrix.mtx", sp.coo_matrix(np.array([[1, 0], [2, 3], [0, 4]])))  # 3 features x 2 spots
+    (d / "features.tsv").write_text("name\tassay\nG1\tSpatial\nmir1\tmicroRNA\nG1\tlncRNA\n")
+    (d / "barcodes.tsv").write_text("31x35\n18x41\n")
+    # the explicit positions win over the spot names: "31x35" is row 31, column 35
+    (d / "positions.csv").write_text("barcode,array_row,array_col\n18x41,18,41\n31x35,31,35\n")
+
+    sdata = dbit_matrix(d, pixel_width_um=50)
+
+    table = sdata["table"]
+    assert list(table.var_names) == ["G1", "mir1", "G1-1"] and list(table.var["assay"]) == [
+        "Spatial",
+        "microRNA",
+        "lncRNA",
+    ]
+    np.testing.assert_array_equal(table.X.toarray(), [[1, 2, 0], [0, 3, 4]])
+    assert list(table.obs["array_x"]) == [35, 41] and list(table.obs["array_y"]) == [31, 18]
