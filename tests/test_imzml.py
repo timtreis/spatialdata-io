@@ -125,6 +125,16 @@ def test_bruker_3d_positions(tmp_path: Path) -> None:
     assert (uns["pixel_size_um"], uns["pixel_size_source"], uns["n_planes"]) == (400.0, "3DPosition spacing", 2)
     assert sdata.shapes["msi_pixels_z1500"].geometry.iloc[0].bounds == (4810, -2200, 5210, -1800)
 
+    # a stated pixel size wins over the measured spacing, which is kept (MTBLS176 pancreas: 60 stated, 64.2 measured)
+    stated = imzml(path, ppm=5, n_features=1, pixel_size_um=380)
+    uns = stated["table"].uns["spatialdata_io"]
+    assert (uns["pixel_size_um"], uns["pixel_size_source"], uns["measured_spacing_um"]) == (
+        380,
+        "repository text",
+        400.0,
+    )
+    assert stated.shapes["msi_pixels_z1500"].geometry.iloc[0].bounds == (4820, -2190, 5200, -1810)
+
 
 def test_drifting_ion_is_one_feature(tmp_path: Path) -> None:
     path = tmp_path / "d.imzML"

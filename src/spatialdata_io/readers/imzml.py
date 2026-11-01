@@ -149,12 +149,23 @@ def imzml(
     dim, count = d.get("max dimension x"), d.get("max count of pixels x")
     dim_px = float(dim) / float(count) if dim and count else None
     px, px_source = _resolve_pixel_size(raw_px, dim_px, _header_has_unit(head), pixel_size_um)
+    measured = None
     if pos3d is not None:
         # registered voxel centres in µm: the spot spacing within a plane is the pixel size (MTBLS176 microbes: 400
-        # µm, as stated, while the header says 100)
-        px = spacing = _plane_spacing(pos3d)
-        px_source = "3DPosition spacing"
-    if px_source not in ("repository text", None) and px is not None and pixel_size_um is not None:
+        # µm, as stated, while the header says 100); a stated pixel size wins, as registration can stretch it
+        # (MTBLS176 pancreas: 60 µm stated, 64.2 µm measured)
+        measured = _plane_spacing(pos3d)
+        if pixel_size_um is not None:
+            px, px_source = pixel_size_um, "repository text"
+            if not math.isclose(measured, pixel_size_um, rel_tol=0.05):
+                logger.warning(
+                    f"{path.name}: the 3DPosition spot spacing is {measured:.1f} µm, not the stated {pixel_size_um} µm; "
+                    "using the stated pixel size."
+                )
+        else:
+            px, px_source = measured, "3DPosition spacing"
+        spacing = px
+    if pos3d is None and px_source not in ("repository text", None) and px is not None and pixel_size_um is not None:
         if not math.isclose(px, pixel_size_um, rel_tol=0.01):
             logger.warning(
                 f"{path.name}: {px} µm per pixel from the file ({px_source}), not {pixel_size_um}; using the file."
@@ -178,6 +189,8 @@ def imzml(
         "pixel_size_from_dimensions": dim_px,
         "pitch_unknown": px is None,
     }
+    if measured is not None:
+        uns["measured_spacing_um"] = measured
     if pos3d is not None:
         return _set_reader_metadata(
             _sdata_3d(X[keep], var, coords[keep], pos3d[keep], tic[keep], keep, spacing, uns), "imzml"
