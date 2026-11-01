@@ -627,7 +627,16 @@ def _load_image(
             # dask_image doesn't recognize .btf automatically and imageio v3 throws error due to pixel limit -> use imageio v2
             data = imread2(path, **imread_kwargs).squeeze()
 
-        if data.shape[-1] == 3:  # HE image in RGB format
+        if data.ndim == 2:  # grayscale
+            data = data[None]
+        elif (
+            data.shape[-1] == 4
+            and np.issubdtype(data.dtype, np.integer)
+            and bool((np.asarray(data[..., 3]) == np.iinfo(data.dtype).max).all())  # computes the alpha only
+        ):
+            # RGBA with a fully opaque alpha (e.g. GEO GSM9083960 hires/lowres PNGs): the colour channels are the image
+            data = data[..., :3].transpose(2, 0, 1)
+        elif data.shape[-1] in (3, 4):  # HE image in RGB(A) format
             data = data.transpose(2, 0, 1)
         else:
             assert data.shape[0] == min(data.shape), (
