@@ -1878,6 +1878,30 @@ class TestAtomxStringIdsWithoutPositions:
         assert table.obs["x_slide_mm"].tolist() == [6.28892, 6.2, 1.0]
         assert table.obs["cell"].tolist() == ["c_4_39_126", "c_4_39_127", "c_4_3_5"]
 
+    def test_ids_repeating_across_slides_get_the_slide(self, sdio, tmp_path):
+        # GSE337336 patch exports: one file holds several slides, so fov_cell ids repeat (e.g. "39_126")
+        root = tmp_path / "d"
+        root.mkdir()
+        (root / "P6_exprMat_file.csv").write_text("cell_id,AATK,ABL1\nc_3_39_126,1,0\nc_4_39_126,0,2\nc_4_3_5,4,4\n")
+        (root / "P6_fov_positions_file.csv").write_text("fov,slide_ID_numeric,Run_Tissue_name\n39,3,S2\n39,4,S3\n")
+        (root / "P6_metadata_file.csv").write_text(
+            '"","cell_ID","fov","x_slide_mm","y_slide_mm"\n'
+            '"c_3_39_126","c_3_39_126",39,6.2,11.2\n"c_4_39_126","c_4_39_126",39,1.0,2.0\n"c_4_3_5","c_4_3_5",3,5.0,5.0\n'
+        )
+        table = sdio.cosmx(root, read_transcripts=False, read_images=False)["cell_data"]
+        assert list(table.obs_names) == ["3_39_126", "4_39_126", "4_3_5"]
+        assert table.obs["x_slide_mm"].tolist() == [6.2, 1.0, 5.0]
+        assert table.obs["global_cell_id"].is_unique
+        assert table.uns["spatialdata_io"]["instance_id_includes_slide"] is True
+
+    def test_repeating_ids_without_slide_raise(self, tmp_path):
+        from spatialdata_io.readers.cosmx._io import _read_expr_mat_polars
+
+        p = tmp_path / "x_exprMat_file.csv"
+        p.write_text("fov,cell_ID,AATK\n1,5,3\n1,5,4\n")
+        with pytest.raises(ValueError, match="no slide column"):
+            _read_expr_mat_polars(p)
+
     def test_unparseable_ids_raise(self, tmp_path):
         from spatialdata_io.readers.cosmx._io import _read_expr_mat_polars
 
@@ -1921,3 +1945,43 @@ def test_metadata_with_only_atomx_cell_column(tmp_path):
     meta = _read_metadata_polars(p)
     assert list(meta.index) == ["1_1", "1_2"]
     assert meta["cell"].tolist() == ["c_1_1_1", "c_1_1_2"]
+
+
+def test_tx_csv_with_sorted_high_cardinality_column_streams_to_parquet(tmp_path: Path) -> None:
+    import gzip
+
+    import pyarrow.parquet as pq
+
+    from spatialdata_io.readers.cosmx._io import _stream_csvgz_to_parquet
+
+    # sorted by cell, so the first block has few distinct cells and a later one many (GSE278133, GSE292268)
+    rows = [f"1,{i},c_1_1_{i},0,0,1.0,2.0,1,G{i % 7},None" for i in range(400)]
+    src = tmp_path / "x_tx_file.csv.gz"
+    with gzip.open(src, "wt") as f:
+        f.write(
+            "fov,cell_ID,cell,x_local_px,y_local_px,x_global_px,y_global_px,z,target,CellComp\n"
+            + "\n".join(rows)
+            + "\n"
+        )
+
+    _stream_csvgz_to_parquet(src, tmp_path / "x.parquet", block_size=1 << 10)
+
+    table = pq.read_table(tmp_path / "x.parquet")
+    assert table.num_rows == 400 and table.column("cell").to_pylist()[-1] == "c_1_1_399"
+
+
+def test_failed_tx_conversion_leaves_no_parquet_cache(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    from spatialdata_io.readers.cosmx import _io
+
+    src = tmp_path / "x_tx_file.csv"
+    src.write_text("fov,cell_ID,target\n1,1,G\n")
+
+    def fail(src: Path, out: Path, **kwargs: object) -> None:
+        out.write_bytes(b"partial")  # what an interrupted writer leaves behind
+        raise OSError("disk full")
+
+    monkeypatch.setattr(_io, "_stream_csvgz_to_parquet", fail)
+    monkeypatch.setattr(_io, "_resolve_tx_path", lambda path, dataset_id: src)
+    with pytest.raises(OSError, match="disk full"):
+        _io._parquet_cache_for_tx(tmp_path, None)
+    assert not list(tmp_path.glob("*.parquet*"))

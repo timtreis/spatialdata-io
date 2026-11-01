@@ -306,7 +306,7 @@ def _read_expr_mat_polars(
     # from the first rows, as polars infers them; background rows (cell_ID=0) are split off per block.
     types = pl.DataFrame(schema={**schema, **dict.fromkeys(meta_cols, pl.Utf8)}).to_arrow().schema
     if parse_ids:
-        meta_cols = ["cell", *meta_cols]
+        meta_cols = ["cell", *meta_cols, *(["slide"] if "slide" not in schema else [])]
     obs_cols = ["fov", "cell_ID", "fov_cellID", *meta_cols]
 
     def prep(df: pl.DataFrame) -> pl.DataFrame:
@@ -350,7 +350,7 @@ def _read_expr_mat_polars(
             bg_df.index.nunique(),
         )
 
-    obs = pl.concat(obs_parts).to_pandas().set_index("fov_cellID", verify_integrity=True)  # type: ignore[call-overload]  # verify_integrity is deprecated in pandas 3, dropped from the stubs
+    obs = _index_by_cell(pl.concat(obs_parts).to_pandas(), expr_path.name)
     X = scipy.sparse.vstack(x_parts, format="csr") if x_parts else scipy.sparse.csr_matrix((0, len(expr_cols)))
     var = pd.DataFrame({"gene": expr_cols}).set_index("gene")
 
@@ -358,15 +358,38 @@ def _read_expr_mat_polars(
 
 
 _EXPR_BLOCK_BYTES = 16 << 20  # CSV text per block: ~0.5 GB dense for 19k int64 genes
-_ATOMX_CELL_ID = r"^c_\d+_(\d+)_(\d+)$"  # c_<slide>_<fov>_<cell>
+_ATOMX_CELL_ID = r"^c_(\d+)_(\d+)_(\d+)$"  # c_<slide>_<fov>_<cell>
+_SLIDE_COLS = ("slide", "slide_ID_numeric", "slide_ID", "Slide")
+
+
+def _index_by_cell(df: pd.DataFrame, name: str) -> pd.DataFrame:
+    """Index cells by ``fov_cellID``; where those repeat (one export of several slides), by ``<slide>_<fov>_<cell>``.
+
+    The slide-prefixed index is flagged in ``attrs["instance_id_includes_slide"]`` with the slide column used.
+    """
+    if not df["fov_cellID"].duplicated().any():
+        return df.set_index("fov_cellID")
+    dups = df.loc[df["fov_cellID"].duplicated(), "fov_cellID"].head(3).tolist()
+    slide = next((c for c in _SLIDE_COLS if c in df.columns), None)
+    if slide is None:
+        raise ValueError(f"{name}: fov_cell ids repeat (e.g. {dups}) and no slide column tells the cells apart.")
+    df["fov_cellID"] = df[slide].astype(str) + "_" + df["fov_cellID"]
+    if df["fov_cellID"].duplicated().any():
+        raise ValueError(f"{name}: cell ids repeat even with the slide column {slide!r}, e.g. {dups}.")
+    out = df.set_index("fov_cellID")
+    out.attrs["instance_id_includes_slide"] = slide
+    return out
 
 
 def _parse_atomx_cell_ids(lf: pl.LazyFrame, id_col: str, name: str) -> pl.LazyFrame:
     """Derive integer ``cell_ID`` (and ``fov``, when absent) from AtoMx string ids, kept as ``cell``."""
     ids = pl.col(id_col).cast(pl.Utf8)
-    cols = [ids.alias("cell"), ids.str.extract(_ATOMX_CELL_ID, 2).cast(pl.Int64).alias("cell_ID")]
-    if "fov" not in lf.collect_schema():
-        cols.append(ids.str.extract(_ATOMX_CELL_ID, 1).cast(pl.Int64).alias("fov"))
+    cols = [ids.alias("cell"), ids.str.extract(_ATOMX_CELL_ID, 3).cast(pl.Int64).alias("cell_ID")]
+    schema = lf.collect_schema()
+    if "fov" not in schema:
+        cols.append(ids.str.extract(_ATOMX_CELL_ID, 2).cast(pl.Int64).alias("fov"))
+    if "slide" not in schema:  # tells apart cells of an export that holds several slides
+        cols.append(ids.str.extract(_ATOMX_CELL_ID, 1).cast(pl.Int64).alias("slide"))
     out = lf.with_columns(cols)
     if id_col not in ("cell", "cell_ID"):
         out = out.drop(id_col)
@@ -394,8 +417,7 @@ def _read_metadata_polars(
         .collect()
     )
 
-    pdf = df.to_pandas()
-    return pdf.set_index("fov_cellID", verify_integrity=True)  # type: ignore[call-overload]  # verify_integrity is deprecated in pandas 3, dropped from the stubs
+    return _index_by_cell(df.to_pandas(), meta_path.name)
 
 
 # ---------------------------------------------------------------------------
@@ -623,6 +645,7 @@ def _stream_csvgz_to_parquet(
     *,
     row_group_rows: int = 5_000_000,
     n_workers: int | None = None,
+    block_size: int = 32 << 20,
 ) -> None:
     total_rows = _count_csv_rows(src, n_workers=n_workers)
     if total_rows == 0:
@@ -652,11 +675,11 @@ def _stream_csvgz_to_parquet(
         "y_global_mm",
         "z",
     }
-    read_opts = pacsv.ReadOptions(block_size=32 << 20)
-    convert_opts = pacsv.ConvertOptions(
-        auto_dict_encode=True,
-        column_types={c: pa.float64() for c in _float_cols},
-    )
+    # No auto_dict_encode: the streaming reader fixes the schema from the first block, so a column sorted by a
+    # high-cardinality key (e.g. "cell", GSE278133) is dictionary-typed there and fails once a later block has more
+    # than 50 values. Parquet dictionary-encodes strings on write anyway.
+    read_opts = pacsv.ReadOptions(block_size=block_size)
+    convert_opts = pacsv.ConvertOptions(column_types={c: pa.float64() for c in _float_cols})
     reader = pacsv.open_csv(fin, read_options=read_opts, convert_options=convert_opts)
 
     with (
@@ -741,12 +764,15 @@ def _parquet_cache_for_tx(
         size_gb,
     )
 
-    _stream_csvgz_to_parquet(
-        src,
-        parquet_path,
-        row_group_rows=row_group_rows,
-        n_workers=n_workers,
-    )
+    # write beside and rename on success: a failed conversion still closes the writer with a valid footer, and that
+    # truncated file would be taken as a finished cache by the next run
+    tmp_path = parquet_path.with_suffix(".parquet.tmp")
+    try:
+        _stream_csvgz_to_parquet(src, tmp_path, row_group_rows=row_group_rows, n_workers=n_workers)
+    except BaseException:
+        tmp_path.unlink(missing_ok=True)
+        raise
+    tmp_path.replace(parquet_path)
 
     if not _is_valid_parquet(parquet_path):
         parquet_path.unlink(missing_ok=True)

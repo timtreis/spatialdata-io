@@ -923,6 +923,7 @@ class CosMxDatasetReader:
             fovs=self.fovs if self.fovs else None,
         )
 
+        by_slide = cast(pd.DataFrame, adata.obs).attrs.get("instance_id_includes_slide")
         if adata.n_obs == 0:
             label = modality or "expression"
             logger.warning("[tables] No %s data for the requested FOVs — skipping.", label)
@@ -938,7 +939,16 @@ class CosMxDatasetReader:
 
         # Compute global cell IDs
         obs = cast(pd.DataFrame, adata.obs)
-        if "fov" in obs.columns and "cell_ID" in obs.columns:
+        if by_slide:
+            # fov * base + cell_ID repeats across slides, so number the cells instead
+            obs["global_cell_id"] = np.arange(1, adata.n_obs + 1, dtype=int)
+            adata.uns["spatialdata_io"] = {
+                "instance_id_includes_slide": True,
+                "slide_column": by_slide,
+                "reason": "fov_cell ids repeat across the slides of one export; cells are keyed <slide>_<fov>_<cell> "
+                "and global_cell_id is the row number",
+            }
+        elif "fov" in obs.columns and "cell_ID" in obs.columns:
             tmp = obs.reset_index(drop=False)
             tmp["global_cell_id"] = self.global_cell_id(tmp)
             obs["global_cell_id"] = tmp.set_index("fov_cellID").loc[obs.index, "global_cell_id"]
