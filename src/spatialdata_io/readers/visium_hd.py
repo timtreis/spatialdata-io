@@ -31,7 +31,7 @@ from xarray import DataArray
 
 from spatialdata_io._constants._constants import VisiumHDKeys
 from spatialdata_io._docs import inject_docs
-from spatialdata_io.readers._utils._utils import _set_reader_metadata
+from spatialdata_io.readers._utils._utils import _add_gene_id_and_genome, _set_reader_metadata
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -344,7 +344,7 @@ def visium_hd(
             adata.obs[VisiumHDKeys.REGION_KEY] = adata.obs[VisiumHDKeys.REGION_KEY].astype("category")
 
             tables[bin_size_str] = TableModel.parse(
-                adata,
+                _add_gene_id_and_genome(adata),
                 region=shapes_name,
                 region_key=str(VisiumHDKeys.REGION_KEY),
                 instance_key=str(VisiumHDKeys.INSTANCE_KEY),
@@ -371,7 +371,7 @@ def visium_hd(
 
         shapes[SHAPES_KEY_HD] = ShapesModel.parse(cell_shapes_gdf, transformations=transformations)
         tables[VisiumHDKeys.CELL_SEG_KEY_HD] = TableModel.parse(
-            cell_adata_hd,
+            _add_gene_id_and_genome(cell_adata_hd),
             region=SHAPES_KEY_HD,
             region_key="region",
             instance_key="cell_id",
@@ -403,7 +403,7 @@ def visium_hd(
 
             shapes[SHAPES_KEY_HD] = ShapesModel.parse(nucleus_shapes_gdf, transformations=transformations)
             tables[VisiumHDKeys.NUCLEUS_SEG_KEY_HD] = TableModel.parse(
-                nucleus_adata_hd,
+                _add_gene_id_and_genome(nucleus_adata_hd),
                 region=SHAPES_KEY_HD,
                 region_key="region",
                 instance_key="cell_id",
