@@ -60,6 +60,25 @@ def test_per_page_ome_tiff_names(tmp_path: Path) -> None:
     np.testing.assert_array_equal(sdata.images["S00T1_ROI2_image"]["scale0"]["image"].values, _DATA)
 
 
+def test_single_ome_xml_stacks_with_dotted_names(tmp_path: Path) -> None:
+    # imctools full_stack layout (figshare 13637549): one ome:-prefixed OME-XML on page 0 names every channel
+    names = ["80ArAr.ArAr80Di.", "89Y_CD45.Y89Di.", "131Xe.Xe131Di."]
+    channels = "".join(
+        f'<ome:Channel ID="Channel:0:{i}" Name="{n}" SamplesPerPixel="1" />' for i, n in enumerate(names)
+    )
+    xml = f'<ome:OME xmlns:ome="x"><ome:Image ID="Image:0"><ome:Pixels SizeC="3">{channels}</ome:Pixels></ome:Image></ome:OME>'
+    rois = [tmp_path / f"BRAC4002.3c_ROI{i}_t1_MRTX.ome.tiff" for i in (1, 2)]
+    for roi in rois:
+        tifffile.imwrite(roi, _DATA, photometric="minisblack", description=xml, metadata=None)
+    sdata = imc(rois, image_models_kwargs=_FAST)
+    assert sorted(sdata.images) == ["BRAC4002.3c_ROI1_t1_MRTX_image", "BRAC4002.3c_ROI2_t1_MRTX_image"]
+    assert get_channel_names(sdata.images["BRAC4002.3c_ROI2_t1_MRTX_image"]) == names
+    sdata.write(tmp_path / "x.zarr")
+    assert len(read_zarr(tmp_path / "x.zarr").images) == 2
+    with pytest.raises(ValueError, match="both named"):
+        imc([rois[0], rois[0]])
+
+
 @pytest.mark.parametrize("zipped", [False, True])
 def test_ngff_zarr(tmp_path: Path, zipped: bool) -> None:
     root = tmp_path / "ROI01_multichannel.zarr"
