@@ -21,7 +21,8 @@ _TIFF_SUFFIXES = (".tif", ".tiff")
 def mibi(
     path: str | Path,
     *,
-    labels: Mapping[str, str | Path] = MappingProxyType({}),
+    labels: Mapping[str, str | Path | Mapping[str, str | Path]] = MappingProxyType({}),
+    channel_folder: str = "",
     pixel_size_um: float | None = None,
     fov_positions: Mapping[str, tuple[float, float]] | None = None,
     image_models_kwargs: Mapping[str, Any] = MappingProxyType({}),
@@ -45,7 +46,12 @@ def mibi(
     labels
         Segmentation masks of the FOV by name, e.g. ``{"whole_cell": ".../<fov>_whole_cell.tiff", "nuclear":
         ".../<fov>_nuclear.tiff"}`` (Mesmer/``deepcell_output``). Each is stored as ``<fov>_<name>_labels`` and must
-        have the image's shape. ``{fov}`` in a path is replaced by each FOV's folder name.
+        have the image's shape. ``{fov}`` in a path is replaced by each FOV's folder name; a mapping from FOV folder
+        name to path instead gives each FOV its own mask file, for names that ``{fov}`` can't express (e.g.
+        ``Point2311_labels.tiff`` for the FOV ``Point2311_pt1053_20698``).
+    channel_folder
+        Subfolder of each FOV folder that holds the channel files, e.g. ``"TIFs"`` for ``<fov>/TIFs/CD45.tif``
+        (Risom et al. 2022), where ``<fov>`` itself also holds compartment masks. The FOV is named after ``<fov>``.
     pixel_size_um
         Pixel size in µm, stored in ``sdata.attrs["mibi"]["pixel_size_um"]``. MIBI TIFFs carry none; the depositors
         state it in the methods (e.g. 800 µm over 2048 px, 0.390625 µm).
@@ -67,9 +73,15 @@ def mibi(
         image_models_kwargs, labels_models_kwargs
     )
     chunks = spatial_chunks(image_models_kwargs["chunks"], (4096, 4096))
-    fovs = [path] if _channel_files(path) else sorted(d for d in path.iterdir() if d.is_dir() and _channel_files(d))
+    fovs = (
+        [path]
+        if _channel_files(path / channel_folder)
+        else sorted(d for d in path.iterdir() if _channel_files(d / channel_folder))
+    )
     if not fovs:
-        raise ValueError(f"No channel .tif(f) files in {path} or its subfolders.")
+        raise ValueError(f"No channel .tif(f) files in {path / channel_folder} or its subfolders.")
+    if unmasked := [(n, d.name) for n, p in labels.items() if isinstance(p, Mapping) for d in fovs if d.name not in p]:
+        raise ValueError(f"(mask, FOV) pairs with no path in `labels`: {unmasked}.")
     if fov_positions is not None and (missing := [d.name for d in fovs if d.name not in fov_positions]):
         raise ValueError(f"FOVs with no position in `fov_positions`: {missing}.")
 
@@ -81,8 +93,12 @@ def mibi(
             if fov_positions is not None
             else {"global" if len(fovs) == 1 else fov.name: Identity()}
         )
-        fov_labels = {name: Path(str(p).replace("{fov}", fov.name)) for name, p in labels.items()}
-        i, lab = _read_fov(fov, fov_labels, chunks, transformations, image_models_kwargs, labels_models_kwargs)
+        fov_labels = {
+            name: Path(p[fov.name] if isinstance(p, Mapping) else str(p).replace("{fov}", fov.name))
+            for name, p in labels.items()
+        }
+        files = _channel_files(fov / channel_folder)
+        i, lab = _read_fov(fov, files, fov_labels, chunks, transformations, image_models_kwargs, labels_models_kwargs)
         images |= i
         label_elements |= lab
 
@@ -94,19 +110,21 @@ def mibi(
 
 
 def _channel_files(path: Path) -> list[Path]:
+    if not path.is_dir():
+        return []
     return sorted(f for f in path.iterdir() if f.suffix.lower() in _TIFF_SUFFIXES and not f.name.startswith("."))
 
 
 def _read_fov(
     path: Path,
+    files: list[Path],
     labels: Mapping[str, Path],
     chunks: Any,
     transformations: dict[str, BaseTransformation],
     image_models_kwargs: Mapping[str, Any],
     labels_models_kwargs: Mapping[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """The image and label elements of one FOV folder."""
-    files = _channel_files(path)
+    """The image and label elements of one FOV folder, from its channel ``files``."""
     planes = []
     for file in files:
         plane, _, _ = read_tiff(file, chunks)

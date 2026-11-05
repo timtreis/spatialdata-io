@@ -96,3 +96,38 @@ def test_reads_a_multi_fov_unit_placed_by_position(tmp_path: Path) -> None:
     assert set(get_transformation(sdata.images["slide4-C2_0_1_image"], get_all=True)) == {"slide4-C2_0_1"}
     with pytest.raises(ValueError, match="no position"):
         mibi(unit, fov_positions={"slide4-C2_0_0": (0, 0)})
+
+
+def test_reads_channels_from_a_subfolder_with_per_fov_mask_paths(tmp_path: Path) -> None:
+    # Risom et al. 2022 (Mendeley d87vg86zd8): raw_tifs_masks/<fov>/TIFs/<channel>.tif beside compartment masks in
+    # <fov>/, cell labels in a separate tree named by the "Point" prefix only
+    root = tmp_path / "raw_tifs_masks"
+    seg = tmp_path / "Segmetation_Outlines_and_Labels_Mendeley"
+    seg.mkdir()
+    fovs = ["Point2310_pt1052_20696", "Point4127_pt1052_31842"]
+    for i, fov in enumerate(fovs):
+        _write_fov(root / fov / "TIFs", ["CD45", "Au"])
+        (root / fov / "TIFs" / ".DS_Store").write_bytes(b"")
+        tifffile.imwrite(root / fov / "epi_mask.tif", np.full((64, 48), 255, dtype=np.uint8))
+        tifffile.imwrite(seg / f"{fov.split('_')[0]}_labels.tiff", np.full((64, 48), i + 1, dtype=np.int16))
+
+    cells = {fov: seg / f"{fov.split('_')[0]}_labels.tiff" for fov in fovs}
+    sdata = mibi(
+        root,
+        channel_folder="TIFs",
+        labels={"whole_cell": cells, "epithelium": root / "{fov}" / "epi_mask.tif"},
+        image_models_kwargs=_FAST,
+        labels_models_kwargs=_FAST,
+    )
+
+    assert sorted(sdata.images) == [f"{fov}_image" for fov in fovs]
+    assert get_channel_names(sdata.images[f"{fovs[0]}_image"]) == ["Au", "CD45"]
+    assert sdata.labels[f"{fovs[1]}_whole_cell_labels"]["scale0"]["image"].values.max() == 2
+    assert f"{fovs[0]}_epithelium_labels" in sdata.labels
+    sdata.write(tmp_path / "x.zarr")
+
+    # one FOV folder on its own, as the hub extracts it for a one-FOV record
+    one = mibi(root / fovs[0], channel_folder="TIFs", labels={"whole_cell": cells[fovs[0]]})
+    assert list(one.images) == [f"{fovs[0]}_image"]
+    with pytest.raises(ValueError, match="no path in `labels`"):
+        mibi(root, channel_folder="TIFs", labels={"whole_cell": {fovs[0]: cells[fovs[0]]}})
