@@ -14,7 +14,7 @@ from spatialdata._logging import logger
 from spatialdata.models import ShapesModel, TableModel
 from spatialdata.transformations import BaseTransformation, Identity, Scale
 
-from spatialdata_io.readers._utils._utils import _set_reader_metadata
+from spatialdata_io.readers._utils._utils import _set_observation_unit, _set_reader_metadata
 
 if TYPE_CHECKING:
     from collections.abc import Sequence
@@ -226,6 +226,8 @@ def _build(
         "n_coordinates_unmatched": n_coordinates_unmatched,
     }
     sdata = SpatialData(shapes=shapes_by_region, tables={"table": table})
+    for table in sdata.tables.values():
+        _set_observation_unit(table, "cell", None)
     return _set_reader_metadata(sdata, "cell_table")
 
 

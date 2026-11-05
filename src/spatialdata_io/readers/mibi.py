@@ -11,7 +11,11 @@ from spatialdata.models import Image2DModel, Labels2DModel
 from spatialdata.transformations import BaseTransformation, Identity, Translation
 
 from spatialdata_io.readers._utils._akoya import read_tiff, spatial_chunks
-from spatialdata_io.readers._utils._utils import _initialize_raster_models_kwargs, _set_reader_metadata
+from spatialdata_io.readers._utils._utils import (
+    _initialize_raster_models_kwargs,
+    _set_observation_unit,
+    _set_reader_metadata,
+)
 
 __all__ = ["mibi"]
 
@@ -90,6 +94,8 @@ def mibi(
     sdata.attrs["mibi"] = {"fov": path.name, "pixel_size_um": pixel_size_um}
     if len(fovs) > 1:
         sdata.attrs["mibi"]["fovs"] = [d.name for d in fovs]
+    for table in sdata.tables.values():
+        _set_observation_unit(table, "cell", None)
     return _set_reader_metadata(sdata, "mibi")
 
 

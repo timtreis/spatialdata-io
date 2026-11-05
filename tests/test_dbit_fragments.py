@@ -63,6 +63,7 @@ def test_tiles_counts_shapes_image_and_round_trip(tmp_path: Path) -> None:
     assert table.X[1, chr2] == 2 and table.X.sum() == 6
     np.testing.assert_array_equal(table.obs["n_fragments"], [2, 2])
     uns = table.uns["spatialdata_io"]
+    assert (uns["observation_unit"], uns["unit_size_um"]) == ("spot_or_bin", 50.0)
     assert uns["feature_space"] == "tiles_5kb" and uns["counting"] == "tn5_insertions"
     assert (uns["n_unassigned"], uns["n_insertions_outside_features"], uns["n_fragments"]) == (1, 2, 4)
     assert uns["um_per_image_px"] == pytest.approx(50 / 15)
@@ -89,6 +90,7 @@ def test_peaks_and_peak_matrix(tmp_path: Path) -> None:
     assert list(table.var_names) == ["chr1:90-110", "chr2:0-20"]
     np.testing.assert_array_equal(table.X.toarray(), [[1, 0], [0, 1]])
     assert table.uns["spatialdata_io"]["pitch_unknown"] is True
+    assert table.uns["spatialdata_io"]["unit_size_um"] is None
     assert not sdata.images
 
     h5 = tmp_path / "raw_peak_bc_matrix.h5"

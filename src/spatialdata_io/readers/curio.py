@@ -11,7 +11,7 @@ from spatialdata.models import ShapesModel, TableModel
 
 from spatialdata_io._constants._constants import CurioKeys
 from spatialdata_io._docs import inject_docs
-from spatialdata_io.readers._utils._utils import _set_reader_metadata
+from spatialdata_io.readers._utils._utils import _set_observation_unit, _set_reader_metadata
 
 __all__ = ["curio"]
 
@@ -89,6 +89,7 @@ def curio(
     obs[CurioKeys.INSTANCE_KEY] = obs.index
     adata.obs = obs
 
+    _set_observation_unit(adata, None, 10)  # bead diameter
     table = TableModel.parse(
         adata,
         region=CurioKeys.REGION.value,

@@ -25,6 +25,9 @@ def test_tsv_rna_and_protein_on_one_grid(tmp_path: Path) -> None:
     np.testing.assert_array_equal(rna.X.toarray(), [[1, 0], [0, 3], [2, 0]])
     assert list(adt.var_names) == ["CD4"] and list(adt.obs_names) == ["1x2", "1x1"]
     np.testing.assert_array_equal(adt.X.toarray(), [[5], [7]])
+    for t in (rna, adt):
+        uns = t.uns["spatialdata_io"]
+        assert (uns["observation_unit"], uns["unit_size_um"]) == ("spot_or_bin", 10.0)
     np.testing.assert_array_equal(adt.obs["instance_id"], [2, 0])  # the RNA table's pixels
     assert sdata.shapes["spots"].geometry.iloc[2].bounds == (15, 35, 25, 45)  # pixel 1x2: centre (20, 40)
     sdata.write(tmp_path / "x.zarr")

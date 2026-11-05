@@ -25,7 +25,7 @@ from spatialdata.transformations import Affine, BaseTransformation, Identity
 
 from spatialdata_io._constants._constants import MerscopeKeys
 from spatialdata_io._docs import inject_docs
-from spatialdata_io.readers._utils._utils import _set_reader_metadata
+from spatialdata_io.readers._utils._utils import _set_observation_unit, _set_reader_metadata
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
@@ -266,6 +266,8 @@ def merscope(
             )
 
     sdata = SpatialData(shapes=shapes, points=points, images=images, tables=tables)
+    for table in sdata.tables.values():
+        _set_observation_unit(table, "cell", None)
     return _set_reader_metadata(sdata, "merscope")
 
 

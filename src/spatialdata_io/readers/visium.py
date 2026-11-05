@@ -22,7 +22,7 @@ from xarray import DataArray
 
 from spatialdata_io._constants._constants import VisiumKeys
 from spatialdata_io._docs import inject_docs
-from spatialdata_io.readers._utils._utils import _read_counts, _set_reader_metadata
+from spatialdata_io.readers._utils._utils import _read_counts, _set_observation_unit, _set_reader_metadata
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -256,6 +256,7 @@ def visium(
             raise ValueError(f"{counts_file} already holds Antibody Capture features; drop `protein_file`.")
         tables["table_protein"] = _read_protein(path / protein_file, adata.obs)
     for key, t in tables.items():
+        _set_observation_unit(t, None, 55)
         tables[key] = TableModel.parse(t, region=dataset_id, region_key="region", instance_key="spot_id")
         if var_names_make_unique:
             tables[key].var_names_make_unique()

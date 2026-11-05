@@ -25,7 +25,11 @@ from tqdm import tqdm
 
 from spatialdata_io._constants._constants import StereoseqKeys as SK
 from spatialdata_io._docs import inject_docs
-from spatialdata_io.readers._utils._utils import _initialize_raster_models_kwargs, _set_reader_metadata
+from spatialdata_io.readers._utils._utils import (
+    _initialize_raster_models_kwargs,
+    _set_observation_unit,
+    _set_reader_metadata,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -202,6 +206,7 @@ def stereoseq(
         for name in image_filenames
     }
 
+    _set_observation_unit(adata, "cell", None)
     cells_table = TableModel.parse(
         adata,
         region=f"{SK.REGION.value}_circles",
@@ -228,7 +233,7 @@ def stereoseq(
             bin_attrs = dict(squarebin_gef[SK.GENE_EXP][i][SK.EXPRESSION].attrs)
             # this is the center to center distance between bins and could be used to calculate the radius of the
             # circles (or side of the square) to represent the bins as circles (squares)
-            bin_attrs[SK.RESOLUTION].item()
+            resolution_nm = bin_attrs[SK.RESOLUTION].item()
             # get gene info
             arr = squarebin_gef[SK.GENE_EXP][i][SK.FEATURE_KEY][:]
             df_gene = pd.DataFrame(arr, columns=[SK.FEATURE_KEY, SK.OFFSET, SK.COUNT])
@@ -297,6 +302,7 @@ def stereoseq(
             df_gene = df_gene.loc[df_points[SK.FEATURE_KEY].cat.categories, :]
             adata = ad.AnnData(expression, obs=obs, var=df_gene)
 
+            _set_observation_unit(adata, None, int(re.sub(r"\D", "", i)) * resolution_nm / 1000)
             table = TableModel.parse(
                 adata,
                 region=name_points_element,
@@ -851,6 +857,7 @@ def stereoseq_gef(
         if cell_f is not None:
             adata, cell_shapes, n_fallback = _read_cells(cell_f, dataset_id=dataset_id, transform=transform)
             adata.uns["spatialdata_io"] = meta | {"n_cells_fallback_geometry": n_fallback}
+            _set_observation_unit(adata, "cell", None)
             region = f"{dataset_id}_cell_boundaries"
             tables["table"] = TableModel.parse(adata, region=region, region_key="region", instance_key="cell_id")
             shapes[region] = cell_shapes
@@ -859,6 +866,7 @@ def stereoseq_gef(
                 gef_f, bin_size=bin_size, dataset_id=dataset_id, transform=transform, resolution_nm=resolution_nm
             )
             adata.uns["spatialdata_io"] = meta | {"gef_kind": gef_kind, "source_bins": source_bins}
+            _set_observation_unit(adata, None, meta["bin_size_um"])
             region = str(adata.obs["region"].iloc[0])
             name = _bin_name(bin_size, resolution_nm) if cell_f is not None else "table"
             tables[name] = TableModel.parse(adata, region=region, region_key="region", instance_key="bin_id")

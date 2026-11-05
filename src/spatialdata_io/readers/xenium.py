@@ -44,7 +44,11 @@ from xarray import DataArray, DataTree
 from spatialdata_io._constants._constants import XeniumKeys
 from spatialdata_io._docs import inject_docs
 from spatialdata_io._utils import deprecation_alias
-from spatialdata_io.readers._utils._utils import _initialize_raster_models_kwargs, _set_reader_metadata
+from spatialdata_io.readers._utils._utils import (
+    _initialize_raster_models_kwargs,
+    _set_observation_unit,
+    _set_reader_metadata,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -527,6 +531,8 @@ def xenium(
         for key, value in extra_images.items():
             sdata.images[key] = value
 
+    for table in sdata.tables.values():
+        _set_observation_unit(table, "cell", None)
     return _set_reader_metadata(sdata, "xenium")
 
 
