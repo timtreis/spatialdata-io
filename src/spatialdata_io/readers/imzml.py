@@ -86,6 +86,8 @@ def imzml(
     ``mz_high``) annotating one square per pixel, the shapes ``"msi_pixels"``. With a pixel size, the shapes are
     scaled to µm in ``"global"``; without, they are in grid units and ``uns["spatialdata_io"]["pitch_unknown"]`` is
     ``True``. ``uns["spatialdata_io"]`` also records the mode, polarity, analyser, m/z range, ``ppm`` and their sources.
+    ``tic`` is the sum of every intensity stored in the pixel's spectrum, over all m/z and as deposited (profile or
+    centroid), before the feature summary, so it's larger than the row sum of the kept features.
     """
     try:
         from pyimzml.ImzMLParser import INFER_IBD_FROM_IMZML, ImzMLParser
