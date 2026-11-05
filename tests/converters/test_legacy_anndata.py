@@ -1,8 +1,11 @@
 from typing import Literal
 
+import numpy as np
+import pandas as pd
 import pytest
 from anndata import AnnData
 from anndata.tests.helpers import assert_equal
+from scipy.sparse import csr_matrix
 from spatialdata import SpatialData, get_element_instances
 from spatialdata.datasets import blobs
 from spatialdata.models import TableModel
@@ -80,3 +83,64 @@ def test_bidirectional_conversion(name: BlobsTypes, include_images: bool) -> Non
 
     idempotency_check_to_anndata(sdata1, include_images=include_images)
     idempotency_check_from_anndata(adata0, include_images=include_images)
+
+
+def _two_library_adata() -> AnnData:
+    rng = np.random.default_rng(0)
+    n_obs = {"A": 3, "B": 5}
+    library = np.repeat(list(n_obs), list(n_obs.values()))
+    adata = AnnData(
+        X=csr_matrix(rng.integers(0, 50, size=(len(library), 4)).astype(np.float32)),
+        obs=pd.DataFrame({"sample": pd.Categorical(library)}, index=[f"spot{i}" for i in range(len(library))]),
+    )
+    adata.obsm["spatial"] = rng.uniform(0, 100, size=(len(library), 2))
+    adata.uns["spatial"] = {
+        lib: {
+            "images": {"hires": np.full((20, 30, 3), i, dtype=np.uint8)},
+            "scalefactors": {"tissue_hires_scalef": 0.1 * (i + 1), "spot_diameter_fullres": 10.0 * (i + 1)},
+        }
+        for i, lib in enumerate(n_obs)
+    }
+    return adata
+
+
+@pytest.mark.parametrize("library_id", ["A", "B"])
+def test_from_legacy_anndata_library_id(library_id: str) -> None:
+    adata = _two_library_adata()
+    sdata = from_legacy_anndata(adata, library_id=library_id, library_key="sample")
+    mask = (adata.obs["sample"] == library_id).to_numpy()
+    i = ["A", "B"].index(library_id)
+    cs = f"{library_id}_hires"
+
+    assert list(sdata.images) == [cs]
+    assert int(sdata.images[cs].data[0, 0, 0]) == i
+    table = sdata["table"]
+    assert table.obs_names.tolist() == adata.obs_names[mask].tolist()
+    np.testing.assert_array_equal(table.X.toarray(), adata.X[mask].toarray())
+    shapes = sdata["locations"]
+    np.testing.assert_array_equal(np.column_stack([shapes.geometry.x, shapes.geometry.y]), adata.obsm["spatial"][mask])
+    assert shapes["radius"].iloc[0] == 5.0 * (i + 1)
+    assert set(get_transformation(shapes, get_all=True)) == {cs}
+    np.testing.assert_allclose(get_transformation(shapes, to_coordinate_system=cs).scale, [0.1 * (i + 1)] * 2)
+    assert list(adata.uns["spatial"]) == ["A", "B"]  # input not modified
+
+
+def test_from_legacy_anndata_library_value() -> None:
+    # obs holds a short sample name while uns['spatial'] is keyed by the longer Space Ranger run name
+    adata = _two_library_adata()
+    adata.uns["spatial"] = {f"run_{k}_GRCh38": v for k, v in adata.uns["spatial"].items()}
+    sdata = from_legacy_anndata(adata, library_id="run_B_GRCh38", library_key="sample", library_value="B")
+    assert list(sdata.images) == ["run_B_GRCh38_hires"]
+    assert set(sdata["table"].obs["sample"]) == {"B"}
+    assert sdata["table"].n_obs == 5
+
+
+def test_from_legacy_anndata_library_id_errors() -> None:
+    adata = _two_library_adata()
+    with pytest.raises(ValueError, match="library_key"):
+        from_legacy_anndata(adata, library_id="A")
+    with pytest.raises(ValueError, match="not in adata.uns"):
+        from_legacy_anndata(adata, library_id="C", library_key="sample")
+    adata.obs["other"] = "x"
+    with pytest.raises(ValueError, match="No observations"):
+        from_legacy_anndata(adata, library_id="A", library_key="other")
