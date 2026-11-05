@@ -228,12 +228,13 @@ def stereoseq(
         # create points model using SquareBin.gef
         path_squarebin = path / SK.TISSUECUT / squarebin_gef_filename[0]
         squarebin_gef = h5py.File(str(path_squarebin), "r")
+        resolution_nm = _resolution_nm(squarebin_gef)[0]
 
         for i in squarebin_gef[SK.GENE_EXP].keys():
             bin_attrs = dict(squarebin_gef[SK.GENE_EXP][i][SK.EXPRESSION].attrs)
             # this is the center to center distance between bins and could be used to calculate the radius of the
             # circles (or side of the square) to represent the bins as circles (squares)
-            resolution_nm = bin_attrs[SK.RESOLUTION].item()
+            bin_attrs[SK.RESOLUTION].item()
             # get gene info
             arr = squarebin_gef[SK.GENE_EXP][i][SK.FEATURE_KEY][:]
             df_gene = pd.DataFrame(arr, columns=[SK.FEATURE_KEY, SK.OFFSET, SK.COUNT])

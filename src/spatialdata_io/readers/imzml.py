@@ -267,7 +267,7 @@ def _sdata_3d(
     adata = ad.AnnData(X=X, obs=obs, var=var)
     adata.obsm["spatial"] = pos[:, :2]
     adata.uns["spatialdata_io"] = uns | {"n_planes": len(set(regions))}
-    _set_observation_unit(adata, None, None)
+    _set_observation_unit(adata, None, px)
     names = sorted({str(r) for r in regions}, key=lambda r: float(r.rsplit("_z", 1)[1]))
     table = TableModel.parse(adata, region=names, region_key="region", instance_key="instance_id")
     h = px / 2

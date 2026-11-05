@@ -126,6 +126,7 @@ def test_bruker_3d_positions(tmp_path: Path) -> None:
     assert list(table.obs["z_um"]) == [0, 0, 1500, 1500] and table.n_obs == 4
     uns = table.uns["spatialdata_io"]
     assert (uns["pixel_size_um"], uns["pixel_size_source"], uns["n_planes"]) == (400.0, "3DPosition spacing", 2)
+    assert (uns["observation_unit"], uns["unit_size_um"]) == ("spot_or_bin", 400.0)
     assert sdata.shapes["msi_pixels_z1500"].geometry.iloc[0].bounds == (4810, -2200, 5210, -1800)
 
     # a stated pixel size wins over the measured spacing, which is kept (MTBLS176 pancreas: 60 stated, 64.2 measured)
