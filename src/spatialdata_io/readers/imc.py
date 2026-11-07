@@ -26,7 +26,8 @@ __all__ = ["imc", "imc_mcd"]
 
 # Hyperion/XTi ablate a 1 µm spot per pixel; no IMC export states it
 PIXEL_SIZE_UM = 1.0
-_CHANNEL_NAME = re.compile(r'<Channel [^>]*Name="([^"]+)"')
+_CHANNEL_NAME = re.compile(r'<(?:\w+:)?Channel [^>]*Name="([^"]+)"')
+_ROI_SUFFIX = re.compile(r"(\.ome)?\.tiff?$|\.zarr(\.zip)?$", re.IGNORECASE)
 
 
 def imc(
@@ -44,14 +45,16 @@ def imc(
         - an OME-NGFF ``.zarr`` folder or ``.zarr.zip`` (e.g. IDR/BioImage Archive conversions): the full-resolution
           level, with the ``omero`` channel labels;
         - an OME-TIFF with one single-channel OME-XML document per page (e.g. MCD Viewer exports, which lack
-          ``SizeC``): the channel names come from each page's ``<Channel Name>``;
+          ``SizeC``), or with one OME-XML document on the first page for all channels (e.g. imctools ``full_stack`` exports): the
+          channel names come from the ``<Channel Name>`` entries;
         - a multi-page TIFF or ImageJ hyperstack (e.g. a steinbock ``img/<roi>.tiff``): the channel names are the
           ``name`` column of ``panel`` (steinbock ``panel.csv``) for the rows with ``keep`` 1 (all rows without a
           ``keep`` column), else ``ch0``, ``ch1``, ...
 
-    The image is stored as ``<roi>_image``, ``<roi>`` being the file name without its extensions, made a valid
-    element name by :func:`spatialdata.sanitize_name`. IMC ablates 1 µm per pixel, so pixels are µm: all elements
-    have ``Identity`` to ``"global"``, and ``sdata.attrs["imc"]`` records ``pixel_size_um`` 1.0 with its source.
+    The image is stored as ``<roi>_image``, ``<roi>`` being the file name without its image extension (``.ome.tiff``,
+    ``.zarr.zip``, ...), made a valid element name by :func:`spatialdata.sanitize_name`. IMC ablates 1 µm per pixel,
+    so pixels are µm: all elements have ``Identity`` to ``"global"``, and ``sdata.attrs["imc"]`` records
+    ``pixel_size_um`` 1.0 with its source.
 
     ``path`` may also be a sequence of ROI images (e.g. all ROIs of one patient), each read as above into its own
     elements of one :class:`spatialdata.SpatialData`. Exported ROIs carry no stage position, so each ROI then gets
@@ -86,7 +89,7 @@ def imc(
     images: dict[str, Any] = {}
     label_elements: dict[str, Any] = {}
     for i, roi_path in enumerate(paths):
-        cs = "global" if len(paths) == 1 else sanitize_name(roi_path.name.split(".")[0])
+        cs = "global" if len(paths) == 1 else _roi_name(roi_path)
         im, lab = _read_roi(
             roi_path,
             panel,
@@ -95,6 +98,8 @@ def imc(
             image_models_kwargs,
             labels_models_kwargs,
         )
+        if im.keys() & images.keys():
+            raise ValueError(f"Two ROIs are both named {_roi_name(roi_path)}.")
         images |= im
         label_elements |= lab
 
@@ -224,7 +229,7 @@ def _read_roi(
     if len(names) != image.shape[0]:
         raise ValueError(f"{path.name} has {image.shape[0]} channels, but {len(names)} channel names were found.")
 
-    roi = sanitize_name(path.name.split(".")[0])
+    roi = _roi_name(path)
     images = {
         f"{roi}_image": Image2DModel.parse(
             image, dims=("c", "y", "x"), c_coords=names, transformations=transformations, **image_models_kwargs
@@ -242,12 +247,13 @@ def _read_roi(
 
 
 def _read_tiff(path: Path) -> tuple[da.Array, list[str] | None]:
-    """The ``(c, y, x)`` image of a TIFF and its per-page OME channel names (``None`` if not every page has one)."""
+    """The ``(c, y, x)`` image of a TIFF and its OME channel names (``None`` if there is not one per channel)."""
     # is_ome=False: per-page OME-XML without SizeC breaks tifffile's OME series parsing
     with tifffile.TiffFile(path, is_ome=False) as tf:
-        names = [
-            m.group(1) if (m := _CHANNEL_NAME.search(getattr(p, "description", "") or "")) else None for p in tf.pages
-        ]
+        descriptions = [getattr(p, "description", "") or "" for p in tf.pages]
+    names = [m.group(1) if (m := _CHANNEL_NAME.search(d)) else None for d in descriptions]
+    if not all(names):  # one OME-XML document on the first page for all channels (e.g. imctools stacks)
+        names = _CHANNEL_NAME.findall(descriptions[0])
     image = da.from_zarr(zarr.open(tifffile.imread(path, is_ome=False, aszarr=True), mode="r"))
     image = image.reshape((-1, *image.shape[-2:]))
     return image, names if all(names) and len(names) == image.shape[0] else None  # type: ignore[return-value]
@@ -270,6 +276,11 @@ def _read_ngff(path: Path) -> tuple[da.Array, list[str]]:
     image = image[index]
     names = [str(c.get("label", f"ch{i}")) for i, c in enumerate(attrs.get("omero", {}).get("channels", []))]
     return image, names or [f"ch{i}" for i in range(image.shape[0])]
+
+
+def _roi_name(path: Path) -> str:
+    """The file name without its image extension (``.ome.tiff``, ``.tiff``, ``.zarr.zip``, ...), as an element name."""
+    return sanitize_name(_ROI_SUFFIX.sub("", path.name))
 
 
 def _panel_names(panel: Path) -> list[str]:
