@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -17,6 +18,14 @@ if TYPE_CHECKING:
     from spatialdata import SpatialData
 
 PathLike = os.PathLike | str  # type:ignore[type-arg]
+
+# an Ensembl gene id, optionally after a reference prefix (GRCh38_, mm10___) and before a version
+_ENSEMBL_ID = re.compile(r"(?:([A-Za-z0-9.]+)_+)?(ENS[A-Z]*G\d+)(?:\.\d+)?")
+# reference prefix of a gene id or name in a combined or prefixed reference
+_REFERENCE_PREFIX = re.compile(r"^(GRCh\d+|GRCm\d+|hg\d+|mm\d+)_")
+# 10x marks retired genes this way; such an id isn't a current gene
+_RETIRED_PREFIX = "DEPRECATED"
+_ENSEMBL_SPECIES = {"ENSG": "human", "ENSMUSG": "mouse"}
 
 
 def _read_counts(
@@ -116,6 +125,35 @@ def _set_reader_metadata(sdata: SpatialData, reader: str) -> SpatialData:
     sdata.attrs["spatialdata_io_software_version"] = __version__
     sdata.attrs["spatialdata_io_reader"] = reader
     return sdata
+
+
+def _add_gene_id_and_genome(adata: AnnData) -> AnnData:
+    """Add ``gene_id`` and ``genome_ref`` to ``adata.var``; deposited names, ``gene_ids``, ``genome`` and counts are kept.
+
+    ``gene_id`` is the Ensembl id without reference prefix or version, empty if there is none (symbols aren't mapped to
+    ids, and retired ``DEPRECATED_`` ids stay empty). ``genome_ref`` is the ``genome`` column where it names a genome,
+    else the reference prefix, else the species of the Ensembl id, else ``unknown``. Tables with several genomes (e.g.
+    ``GRCh38`` and ``mm10``) stay as they are, and these columns tell the genes apart.
+    """
+    names = adata.var_names.astype(str)
+    ids = adata.var["gene_ids"].astype(str) if "gene_ids" in adata.var else names
+    genome = adata.var["genome"].astype(str) if "genome" in adata.var else [""] * adata.n_vars
+    gene_id, genome_ref = [], []
+    for i, name, g in zip(ids, names, genome, strict=True):
+        m = _ENSEMBL_ID.fullmatch(i)
+        retired = m is not None and m[1] == _RETIRED_PREFIX
+        gene_id.append(m[2] if m and not retired else None)
+        prefix = _REFERENCE_PREFIX.match(i) or _REFERENCE_PREFIX.match(name)
+        if g and g not in ("unknown", "nan"):
+            genome_ref.append(g)
+        elif prefix:
+            genome_ref.append(prefix[1])
+        else:
+            genome_ref.append(
+                _ENSEMBL_SPECIES.get(m[2].rstrip("0123456789"), "unknown") if m and not retired else "unknown"
+            )
+    adata.var["gene_id"], adata.var["genome_ref"] = gene_id, genome_ref
+    return adata
 
 
 def walk_visible(root: Path) -> Iterator[tuple[Path, list[str], list[str]]]:
