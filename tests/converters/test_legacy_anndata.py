@@ -144,3 +144,15 @@ def test_from_legacy_anndata_library_id_errors() -> None:
     adata.obs["other"] = "x"
     with pytest.raises(ValueError, match="No observations"):
         from_legacy_anndata(adata, library_id="A", library_key="other")
+
+
+def test_from_legacy_anndata_observation_unit() -> None:
+    adata = _two_library_adata()
+    for lib in adata.uns["spatial"].values():
+        lib["metadata"] = {"chemistry_description": "Spatial 3' v1", "software_version": "spaceranger-1.3.0"}
+    uns = from_legacy_anndata(adata, library_id="A", library_key="sample").tables["table"].uns["spatialdata_io"]
+    assert (uns["observation_unit"], uns["unit_size_um"]) == ("spot_or_bin", 55.0)
+    # two libraries mixed, or no chemistry stated: the unit stays unset
+    assert "spatialdata_io" not in from_legacy_anndata(adata).tables["table"].uns
+    plain = _two_library_adata()
+    assert "spatialdata_io" not in from_legacy_anndata(plain, library_id="A", library_key="sample").tables["table"].uns

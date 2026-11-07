@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import pandas as pd
@@ -16,6 +16,8 @@ from spatialdata._core.operations._utils import transform_to_data_extent
 from spatialdata._logging import logger
 from spatialdata.models import Image2DModel, ShapesModel, TableModel, get_table_keys
 from spatialdata.transformations import Identity, Scale
+
+from spatialdata_io.readers._utils._utils import _set_observation_unit
 
 if TYPE_CHECKING:
     from anndata import AnnData
@@ -392,6 +394,19 @@ def from_legacy_anndata(
         new_table.obs[REGION_KEY] = new_table.obs[REGION_KEY].astype("category")
         new_table.obs[INSTANCE_KEY] = shapes[REGION].index.values
         new_table = TableModel.parse(new_table, region=REGION, region_key=REGION_KEY, instance_key=INSTANCE_KEY)
+        if _is_visium_spot_library(adata.uns.get(SPATIAL, {})):
+            _set_observation_unit(new_table, None, 55)  # Visium spots are 55 µm by design; the scale factors give no µm
     else:
         new_table = adata.copy()
     return SpatialData(tables={"table": new_table}, images=images, shapes=shapes)
+
+
+def _is_visium_spot_library(libraries: Mapping[str, Any]) -> bool:
+    """Whether ``uns['spatial']`` holds exactly one library whose Space Ranger chemistry is a Visium spot assay."""
+    if len(libraries) != 1:
+        return False
+    (library,) = libraries.values()
+    meta = library.get("metadata", {}) if isinstance(library, Mapping) else {}
+    chem = meta.get("chemistry_description", "") if isinstance(meta, Mapping) else ""
+    chem = (chem.decode() if isinstance(chem, bytes) else str(chem)).lower()
+    return "spatial" in chem and "hd" not in chem.split()
