@@ -222,7 +222,13 @@ def to_legacy_anndata(
     return adata
 
 
-def from_legacy_anndata(adata: AnnData, rgb: bool | None = None) -> SpatialData:
+def from_legacy_anndata(
+    adata: AnnData,
+    rgb: bool | None = None,
+    library_id: str | None = None,
+    library_key: str | None = None,
+    library_value: str | None = None,
+) -> SpatialData:
     """Convert (legacy) spatial AnnData object to SpatialData object.
 
     This is useful for parsing a (legacy) spatial AnnData object, for example the ones produced by Scanpy and older
@@ -235,6 +241,15 @@ def from_legacy_anndata(adata: AnnData, rgb: bool | None = None) -> SpatialData:
     rgb
         Argument passed to `spatialdata.models.Image2DModel.parse()`. If `None`,
         3-(4) channels images will be interpreted as RGB(A).
+    library_id
+        Key in `adata.uns['spatial']` of the one library to convert. If given, only the observations with
+        `adata.obs[library_key] == library_value` and only this library's images and scale factors are kept, so a
+        merged multi-sample AnnData object can be converted one sample at a time. Requires `library_key`.
+    library_key
+        Column in `adata.obs` that holds the library of each observation.
+    library_value
+        Value in `adata.obs[library_key]` of the observations of `library_id`, for files where it differs from the
+        `adata.uns['spatial']` key. Defaults to `library_id`.
 
     Returns
     -------
@@ -246,6 +261,19 @@ def from_legacy_anndata(adata: AnnData, rgb: bool | None = None) -> SpatialData:
     """
     # AnnData keys
     SPATIAL = "spatial"
+
+    if library_id is not None:
+        if library_key is None:
+            raise ValueError("`library_key` is required when `library_id` is given.")
+        libraries = adata.uns.get(SPATIAL, {})
+        if library_id not in libraries:
+            raise ValueError(f"Library '{library_id}' not in adata.uns['{SPATIAL}']; found {list(libraries)}.")
+        value = library_id if library_value is None else library_value
+        mask = (adata.obs[library_key] == value).to_numpy()
+        if not mask.any():
+            raise ValueError(f"No observations with adata.obs['{library_key}'] == '{value}'.")
+        adata = adata[mask].copy()
+        adata.uns[SPATIAL] = {library_id: libraries[library_id]}
 
     SCALEFACTORS = "scalefactors"
     TISSUE_HIRES_SCALEF = "tissue_hires_scalef"
