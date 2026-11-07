@@ -20,7 +20,7 @@ from spatialdata._logging import logger
 from spatialdata.models import ShapesModel, TableModel
 from spatialdata.transformations import Identity, Scale
 
-from spatialdata_io.readers._utils._utils import _set_reader_metadata
+from spatialdata_io.readers._utils._utils import _set_observation_unit, _set_reader_metadata
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -212,6 +212,7 @@ def imzml(
     adata = ad.AnnData(X=X[keep], obs=obs, var=var)
     adata.obsm["spatial"] = xy.astype(float) - 0.5
     adata.uns["spatialdata_io"] = uns
+    _set_observation_unit(adata, None, px)
     table = TableModel.parse(adata, region=_SHAPES, region_key="region", instance_key="instance_id")
 
     transform = Scale([px, px], axes=("x", "y")) if px is not None else Identity()
@@ -268,6 +269,7 @@ def _sdata_3d(
     adata = ad.AnnData(X=X, obs=obs, var=var)
     adata.obsm["spatial"] = pos[:, :2]
     adata.uns["spatialdata_io"] = uns | {"n_planes": len(set(regions))}
+    _set_observation_unit(adata, None, px)
     names = sorted({str(r) for r in regions}, key=lambda r: float(r.rsplit("_z", 1)[1]))
     table = TableModel.parse(adata, region=names, region_key="region", instance_key="instance_id")
     h = px / 2

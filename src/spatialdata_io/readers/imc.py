@@ -16,7 +16,11 @@ from spatialdata._logging import logger
 from spatialdata.models import Image2DModel, Labels2DModel
 from spatialdata.transformations import Affine, BaseTransformation, Identity, Scale
 
-from spatialdata_io.readers._utils._utils import _initialize_raster_models_kwargs, _set_reader_metadata
+from spatialdata_io.readers._utils._utils import (
+    _initialize_raster_models_kwargs,
+    _set_observation_unit,
+    _set_reader_metadata,
+)
 
 __all__ = ["imc", "imc_mcd"]
 
@@ -100,6 +104,8 @@ def imc(
         "pixel_size_um": PIXEL_SIZE_UM,
         "pixel_size_source": "instrument spec (Hyperion/XTi ablation)",
     }
+    for table in sdata.tables.values():
+        _set_observation_unit(table, "cell", None)
     return _set_reader_metadata(sdata, "imc")
 
 
@@ -181,6 +187,8 @@ def imc_mcd(
         "acquisitions": info,
         "pixel_size_source": "MCD AblationDistanceBetweenShots",
     }
+    for table in sdata.tables.values():
+        _set_observation_unit(table, "cell", None)
     return _set_reader_metadata(sdata, "imc")
 
 

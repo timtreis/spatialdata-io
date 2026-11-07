@@ -156,6 +156,20 @@ def _add_gene_id_and_genome(adata: AnnData) -> AnnData:
     return adata
 
 
+def _set_observation_unit(table: AnnData, unit: str | None, size_um: float | None) -> AnnData:
+    """Record what a table row is in ``table.uns["spatialdata_io"]``.
+
+    ``unit`` is ``"cell"`` or ``None``; with ``None`` it is derived from ``size_um`` (the side of a square bin or the
+    diameter of a spot, in µm): below 10 µm ``"subcellular_bin"``, otherwise ``"spot_or_bin"``.
+    """
+    if unit is None:
+        unit = "subcellular_bin" if size_um is not None and size_um < 10 else "spot_or_bin"
+    meta = table.uns.setdefault("spatialdata_io", {})
+    meta["observation_unit"] = unit
+    meta["unit_size_um"] = None if size_um is None else float(size_um)
+    return table
+
+
 def walk_visible(root: Path) -> Iterator[tuple[Path, list[str], list[str]]]:
     """Like :func:`os.walk` of ``root`` in sorted order, without hidden files and folders, following symlinks.
 

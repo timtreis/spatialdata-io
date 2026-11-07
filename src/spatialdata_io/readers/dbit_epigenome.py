@@ -23,7 +23,7 @@ from spatialdata._logging import logger
 from spatialdata.models import Image2DModel, ShapesModel, TableModel
 from spatialdata.transformations import Identity, Scale
 
-from spatialdata_io.readers._utils._utils import _set_reader_metadata
+from spatialdata_io.readers._utils._utils import _set_observation_unit, _set_reader_metadata
 
 __all__ = ["dbit_fragments"]
 
@@ -249,6 +249,7 @@ def dbit_fragments(
     adata = ad.AnnData(X=X.astype(np.int32), obs=obs, var=var)
     adata.obsm["spatial"] = sel[["x", "y"]].to_numpy(dtype=float)
     adata.uns["spatialdata_io"] = uns
+    _set_observation_unit(adata, None, pixel_width_um)
     table = TableModel.parse(adata, region=_SHAPES, region_key="region", instance_key="instance_id")
 
     h = side / 2

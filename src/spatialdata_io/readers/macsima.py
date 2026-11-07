@@ -19,6 +19,7 @@ from spatialdata._logging import logger
 
 from spatialdata_io._constants._enum import ModeEnum
 from spatialdata_io.readers._utils._utils import (
+    _set_observation_unit,
     _set_reader_metadata,
     calc_scale_factors,
     parse_physical_size,
@@ -846,6 +847,8 @@ def create_sdata(
         sdata.images[f"{filtered_name}_nuclei_image"] = nuclei_image_element
         sdata.tables[f"{filtered_name}_nuclei_table"] = table_nuclei
 
+    for table in sdata.tables.values():
+        _set_observation_unit(table, "cell", None)
     return _set_reader_metadata(sdata, "macsima")
 
 

@@ -27,7 +27,7 @@ from spatialdata.transformations.transformations import Identity, Scale
 
 from spatialdata_io._constants._constants import SeqfishKeys as SK
 from spatialdata_io._docs import inject_docs
-from spatialdata_io.readers._utils._utils import _set_reader_metadata
+from spatialdata_io.readers._utils._utils import _set_observation_unit, _set_reader_metadata
 
 if TYPE_CHECKING:
     from collections.abc import Mapping
@@ -271,6 +271,8 @@ def seqfish(
 
     sdata = SpatialData(images=images, labels=labels, points=points, tables=tables, shapes=shapes)
 
+    for table in sdata.tables.values():
+        _set_observation_unit(table, "cell", None)
     return _set_reader_metadata(sdata, "seqfish")
 
 

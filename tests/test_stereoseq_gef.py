@@ -121,6 +121,7 @@ def test_cellbin_only_basic(tmp_path: Path) -> None:
     assert meta["reader"] == "stereoseq_gef"
     assert meta["n_cells_fallback_geometry"] == 0
     assert meta["gef_kind"] is None and meta["source_bins"] is None
+    assert (meta["observation_unit"], meta["unit_size_um"]) == ("cell", None)
     assert table.uns["spatialdata_attrs"]["instance_key"] == "cell_id"
     assert table.uns["spatialdata_attrs"]["region_key"] == "region"
     for col in ["area", "dnbCount", "geneCount", "expCount", "clusterID", "cellTypeID"]:
@@ -477,6 +478,7 @@ def test_tissue_resolution_from_bin1_header(tmp_path: Path) -> None:
     path = _tissue(tmp_path, attrs={}, exp_attrs={"resolution": [715]})
     meta = stereoseq_gef(gef=path, bin_size=2).tables["table"].uns["spatialdata_io"]
     assert (meta["resolution_nm"], meta["resolution_source"]) == (715, "header")
+    assert (meta["observation_unit"], meta["unit_size_um"]) == ("subcellular_bin", 1.43)
 
 
 def test_gef_rejections(tmp_path: Path) -> None:
@@ -539,6 +541,8 @@ def test_pair_names_and_tables(tmp_path: Path) -> None:
     for meta in (cells_meta, bins_meta):
         assert (meta["resolution_nm"], meta["resolution_source"], meta["bin_size_dnb"]) == (500, "header", 50)
         assert meta["bin_size_um"] == 25.0
+    assert (cells_meta["observation_unit"], cells_meta["unit_size_um"]) == ("cell", None)
+    assert (bins_meta["observation_unit"], bins_meta["unit_size_um"]) == ("spot_or_bin", 25.0)
 
 
 def test_pair_gene_lists_independent(tmp_path: Path) -> None:

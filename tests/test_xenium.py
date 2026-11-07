@@ -232,6 +232,8 @@ def test_xenium_csv_only_bundle() -> None:
         aligned_images=False,
     )
     assert sdata["table"].n_obs == 30
+    uns = sdata["table"].uns["spatialdata_io"]
+    assert (uns["observation_unit"], uns["unit_size_um"]) == ("cell", None)
     assert len(sdata["cell_boundaries"]) == 30
     assert len(sdata["nucleus_boundaries"]) == 30
     assert len(sdata["transcripts"]) > 0

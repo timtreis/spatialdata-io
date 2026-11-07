@@ -14,7 +14,7 @@ from spatialdata import SpatialData
 from spatialdata.models import ShapesModel, TableModel
 from spatialdata.transformations import Identity
 
-from spatialdata_io.readers._utils._utils import _set_reader_metadata
+from spatialdata_io.readers._utils._utils import _set_observation_unit, _set_reader_metadata
 
 __all__ = ["dbit_matrix"]
 
@@ -95,6 +95,7 @@ def dbit_matrix(
             "pitch_um": pitch_um,
             "pitch_unknown": pitch_unknown,
         }
+        _set_observation_unit(a, None, pixel_width_um)
         tables[key] = TableModel.parse(a, region=_SHAPES, region_key="region", instance_key="instance_id")
     return _set_reader_metadata(SpatialData(shapes={_SHAPES: shapes}, tables=tables), "dbit_matrix")
 

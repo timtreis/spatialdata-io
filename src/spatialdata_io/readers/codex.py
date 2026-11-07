@@ -44,6 +44,7 @@ from spatialdata_io.readers._utils._qptiff import (
 )
 from spatialdata_io.readers._utils._utils import (
     _initialize_raster_models_kwargs,
+    _set_observation_unit,
     _set_reader_metadata,
     walk_visible,
 )
@@ -296,6 +297,8 @@ def codex(
         image_models_kwargs=image_models_kwargs,
         labels_models_kwargs=labels_models_kwargs,
     )
+    for table in sdata.tables.values():
+        _set_observation_unit(table, "cell", None)
     return _set_reader_metadata(sdata, "codex")
 
 

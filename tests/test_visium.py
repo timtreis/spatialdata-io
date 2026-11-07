@@ -108,6 +108,8 @@ def test_visium_table(sdata: SpatialData) -> None:
     assert table.obs["in_tissue"].eq(1).all()
 
     assert get_table_keys(table) == (DATASET_ID, "region", "spot_id")
+    uns = table.uns["spatialdata_io"]
+    assert (uns["observation_unit"], uns["unit_size_um"]) == ("spot_or_bin", 55.0)
 
 
 def test_visium_circles_are_the_spot_coordinates(sdata: SpatialData, dataset_path: Path) -> None:

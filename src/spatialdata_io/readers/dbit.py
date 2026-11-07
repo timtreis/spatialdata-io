@@ -18,7 +18,7 @@ from xarray import DataArray
 
 from spatialdata_io._constants._constants import DbitKeys
 from spatialdata_io._docs import inject_docs
-from spatialdata_io.readers._utils._utils import _set_reader_metadata
+from spatialdata_io.readers._utils._utils import _set_observation_unit, _set_reader_metadata
 
 if TYPE_CHECKING:
     from numpy.typing import NDArray
@@ -339,6 +339,7 @@ def dbit(
     # the second column in 'array_B'.
     adata.obsm["spatial"] = adata.obs[["array_A", "array_B"]].values
     # parse data from annData using SpatialData parser
+    _set_observation_unit(adata, None, None)
     table_data = sd.models.TableModel.parse(adata)
 
     # read and convert image for SpatialData

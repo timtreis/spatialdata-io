@@ -43,6 +43,8 @@ def csv(tmp_path: Path) -> Path:
 
 def test_wide_csv_basic(csv: Path) -> None:
     sdata = cell_table(csv, unit="um")
+    uns = sdata["table"].uns["spatialdata_io"]
+    assert (uns["observation_unit"], uns["unit_size_um"]) == ("cell", None)
     table = sdata.tables["table"]
     assert table.shape == (3, 2)
     assert list(table.var_names) == ["GeneA", "GeneB"]

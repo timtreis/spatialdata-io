@@ -45,7 +45,7 @@ from spatialdata.transformations import Scale, Sequence, Translation, get_transf
 
 from spatialdata_io._constants._constants import CosmxKeys
 from spatialdata_io._docs import inject_docs
-from spatialdata_io.readers._utils._utils import _set_reader_metadata
+from spatialdata_io.readers._utils._utils import _set_observation_unit, _set_reader_metadata
 
 from ._discovery import (
     _infer_dataset_id,
@@ -1233,6 +1233,8 @@ def _assemble_sdata(
             sdata.tables[table_name] = _parse_cell_table(raw, region=main_label)
             sdata.set_table_annotates_spatialelement(table_name, region=main_label)
 
+    for table in sdata.tables.values():
+        _set_observation_unit(table, "cell", None)
     return _set_reader_metadata(sdata, "cosmx")
 
 

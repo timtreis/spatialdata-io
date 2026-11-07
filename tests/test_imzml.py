@@ -52,6 +52,7 @@ def test_top_bins_header_pixel_size_and_round_trip(tmp_path: Path) -> None:
     assert uns["feature_space"] == "mz_top3_5ppm" and uns["imzml_mode"] == "processed"
     assert (uns["pixel_size_um"], uns["pixel_size_source"], uns["pitch_unknown"]) == (50.0, "imzml header", False)
     assert uns["n_pixels_empty"] == 0 and uns["mz_range"] == [100.0, 450.0]
+    assert (uns["observation_unit"], uns["unit_size_um"]) == ("spot_or_bin", 50.0)
     # totals: 200 -> 9, 100 (+100.0002, 2 ppm) -> 4, 300 -> 3, 450 -> 0.5 dropped
     np.testing.assert_allclose(table.var["mz"], [100, 200, 300], rtol=5e-6)
     assert list(table.obs_names) == ["1_1", "2_1", "1_2"]
@@ -81,6 +82,7 @@ def test_pitch_unknown_and_3d_error(tmp_path: Path) -> None:
     sdata = imzml(_write(tmp_path / "s.imzML"), ppm=50)
     uns = sdata["table"].uns["spatialdata_io"]
     assert uns["pitch_unknown"] is True and uns["ppm_source"] == "kwarg"
+    assert (uns["observation_unit"], uns["unit_size_um"]) == ("spot_or_bin", None)
     assert sdata.coordinate_systems == ["global"]
     with pytest.raises(ValueError, match="z planes"):
         imzml(_write(tmp_path / "z.imzML", z=2))
@@ -124,6 +126,7 @@ def test_bruker_3d_positions(tmp_path: Path) -> None:
     assert list(table.obs["z_um"]) == [0, 0, 1500, 1500] and table.n_obs == 4
     uns = table.uns["spatialdata_io"]
     assert (uns["pixel_size_um"], uns["pixel_size_source"], uns["n_planes"]) == (400.0, "3DPosition spacing", 2)
+    assert (uns["observation_unit"], uns["unit_size_um"]) == ("spot_or_bin", 400.0)
     assert sdata.shapes["msi_pixels_z1500"].geometry.iloc[0].bounds == (4810, -2200, 5210, -1800)
 
     # a stated pixel size wins over the measured spacing, which is kept (MTBLS176 pancreas: 60 stated, 64.2 measured)

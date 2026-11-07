@@ -28,7 +28,7 @@ from spatialdata_io.readers._utils._qptiff import (
     read_qptiff_image,
     read_qptiff_metadata,
 )
-from spatialdata_io.readers._utils._utils import _set_reader_metadata, walk_visible
+from spatialdata_io.readers._utils._utils import _set_observation_unit, _set_reader_metadata, walk_visible
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -173,6 +173,8 @@ def phenocycler(
         labels_models_kwargs=labels_models_kwargs,
         duplicate_scans=duplicates,
     )
+    for table in sdata.tables.values():
+        _set_observation_unit(table, "cell", None)
     return _set_reader_metadata(sdata, "phenocycler")
 
 
