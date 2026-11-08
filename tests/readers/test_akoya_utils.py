@@ -14,6 +14,7 @@ from spatialdata.transformations import Identity, Translation
 from spatialdata_io.readers._utils._akoya import (
     apply_channel_names,
     dedupe_channel_names,
+    lazy_tiff_array,
     read_tiff,
     region_transformations,
 )
@@ -125,3 +126,16 @@ def test_read_tiff_does_not_keep_files_open(tmp_path: Path, compression: str | N
 
     assert len(os.listdir("/dev/fd")) - n_open <= 2
     np.testing.assert_array_equal(chunks[-1][0], data[48:, 80:])
+
+
+def test_lazy_tiff_array_opens_the_file_once_per_chunk(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # every tile read used to open the file, and an open costs ~20 ms on Lustre: 64 tiles per chunk here
+    import builtins
+
+    data = np.arange(256 * 256, dtype=np.uint16).reshape(256, 256)
+    tifffile.imwrite(tmp_path / "a.tif", data, compression="zlib", tile=(16, 16))
+    image = lazy_tiff_array(tmp_path / "a.tif", chunks=(128, 128))
+    opened, real_open = [], builtins.open
+    monkeypatch.setattr(builtins, "open", lambda f, *a, **k: opened.append(f) or real_open(f, *a, **k))
+    np.testing.assert_array_equal(image.compute(scheduler="synchronous"), data)
+    assert len([f for f in opened if str(f).endswith("a.tif")]) == image.npartitions == 4

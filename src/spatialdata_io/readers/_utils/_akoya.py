@@ -9,7 +9,8 @@ import re
 import threading
 import warnings
 from collections import Counter
-from collections.abc import Iterable, Mapping, Sequence, Set
+from collections.abc import Iterable, Iterator, Mapping, Sequence, Set
+from contextlib import contextmanager
 from dataclasses import asdict
 from typing import TYPE_CHECKING, Any
 
@@ -343,7 +344,7 @@ class _TiffZarrSource:
 
     Neither the ``TiffFile`` nor its zarr store are pickled, but opened again in each process that reads chunks, so
     dask graphs built on it work across processes. The file is read through a :class:`_TransientFile`, so the parsed
-    tiff stays cached without holding a file descriptor.
+    tiff stays cached without holding a file descriptor between chunk reads.
     """
 
     def __init__(self, path: Path, *, series: int = 0, page: int | None = None) -> None:
@@ -363,30 +364,55 @@ class _TiffZarrSource:
     def _open(self) -> zarr.Array:
         with self._lock:
             if self._array is None:
-                tiff = tifffile.TiffFile(io.BufferedReader(_TransientFile(self.path)))
+                self._file = _TransientFile(self.path)
+                tiff = tifffile.TiffFile(io.BufferedReader(self._file))
                 data = tiff.pages[self.page] if self.page is not None else tiff.series[self.series]
                 self.axes = data.axes
                 self._array = zarr.open_array(data.aszarr(level=0), mode="r")
             return self._array
 
     def __getitem__(self, key: Any) -> np.ndarray:
-        return np.asarray(self._open()[key])
+        array = self._open()
+        with self._file.held():  # one open per chunk, not per tile (an open costs ~20 ms on Lustre)
+            return np.asarray(array[key])
 
     def __getstate__(self) -> dict[str, Any]:
-        return {key: value for key, value in self.__dict__.items() if key not in ("_lock", "_array")}
+        return {key: value for key, value in self.__dict__.items() if key not in ("_lock", "_array", "_file")}
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         self.__dict__.update(state, _lock=threading.Lock(), _array=None)
 
 
 class _TransientFile(io.RawIOBase):
-    """Read-only binary file that opens ``path`` for every read, so it holds no file descriptor in between."""
+    """Read-only binary file that holds no file descriptor between reads.
+
+    Outside :meth:`held` every read opens ``path``; inside it the reads share one descriptor, closed when the last
+    holder leaves.
+    """
 
     def __init__(self, path: Path) -> None:
         super().__init__()
         self.name = str(path)
         self._size = path.stat().st_size
         self._position = 0
+        self._lock = threading.Lock()
+        self._holders = 0
+        self._handle: io.BufferedReader | None = None
+
+    @contextmanager
+    def held(self) -> Iterator[None]:
+        with self._lock:
+            if self._holders == 0:
+                self._handle = open(self.name, "rb")  # closed by the last holder
+            self._holders += 1
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._holders -= 1
+                if self._holders == 0:
+                    self._handle.close()
+                    self._handle = None
 
     def readable(self) -> bool:
         return True
@@ -402,10 +428,15 @@ class _TransientFile(io.RawIOBase):
         return self._position
 
     def readinto(self, buffer: Any) -> int:
-        with open(self.name, "rb") as f:
-            f.seek(self._position)
-            n = f.readinto(buffer)
-        self._position += n
+        with self._lock:
+            if self._handle is not None:
+                self._handle.seek(self._position)
+                n = self._handle.readinto(buffer)
+            else:
+                with open(self.name, "rb") as f:
+                    f.seek(self._position)
+                    n = f.readinto(buffer)
+            self._position += n
         return n
 
 
