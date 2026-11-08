@@ -150,8 +150,11 @@ def test_from_legacy_anndata_observation_unit() -> None:
     adata = _two_library_adata()
     for lib in adata.uns["spatial"].values():
         lib["metadata"] = {"chemistry_description": "Spatial 3' v1", "software_version": "spaceranger-1.3.0"}
-    uns = from_legacy_anndata(adata, library_id="A", library_key="sample").tables["table"].uns["spatialdata_io"]
+    adata.var["gene_ids"] = [f"ENSG{i:011d}.1" for i in range(adata.n_vars)]
+    table = from_legacy_anndata(adata, library_id="A", library_key="sample").tables["table"]
+    uns = table.uns["spatialdata_io"]
     assert (uns["observation_unit"], uns["unit_size_um"]) == ("spot_or_bin", 55.0)
+    assert table.var["gene_id"].iloc[0] == "ENSG00000000000" and set(table.var["genome_ref"]) == {"human"}
     # two libraries mixed, or no chemistry stated: the unit stays unset
     assert "spatialdata_io" not in from_legacy_anndata(adata).tables["table"].uns
     plain = _two_library_adata()

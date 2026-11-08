@@ -17,7 +17,7 @@ from spatialdata._logging import logger
 from spatialdata.models import Image2DModel, ShapesModel, TableModel, get_table_keys
 from spatialdata.transformations import Identity, Scale
 
-from spatialdata_io.readers._utils._utils import _set_observation_unit
+from spatialdata_io.readers._utils._utils import _add_gene_id_and_genome, _set_observation_unit
 
 if TYPE_CHECKING:
     from anndata import AnnData
@@ -396,6 +396,7 @@ def from_legacy_anndata(
         new_table = TableModel.parse(new_table, region=REGION, region_key=REGION_KEY, instance_key=INSTANCE_KEY)
         if _is_visium_spot_library(adata.uns.get(SPATIAL, {})):
             _set_observation_unit(new_table, None, 55)  # Visium spots are 55 µm by design; the scale factors give no µm
+            _add_gene_id_and_genome(new_table)  # as the visium reader
     else:
         new_table = adata.copy()
     return SpatialData(tables={"table": new_table}, images=images, shapes=shapes)
