@@ -131,3 +131,26 @@ def test_reads_channels_from_a_subfolder_with_per_fov_mask_paths(tmp_path: Path)
     assert list(one.images) == [f"{fovs[0]}_image"]
     with pytest.raises(ValueError, match="no path in `labels`"):
         mibi(root, channel_folder="TIFs", labels={"whole_cell": {fovs[0]: cells[fovs[0]]}})
+
+
+def test_hubmap_multichannel_ome_tiff_with_stacked_masks(tmp_path: Path) -> None:
+    # HuBMAP SPRM: one multichannel OME-TIFF per FOV, channel names in the OME-XML; masks stacked in one OME-TIFF
+    rng = np.random.default_rng(0)
+    expr = rng.integers(0, 255, size=(3, 40, 30), dtype=np.uint8)
+    tifffile.imwrite(
+        tmp_path / "3D_image_stack_expr.ome.tiff",
+        expr,
+        ome=True,
+        metadata={"axes": "CYX", "Channel": {"Name": ["CD45", "Ki67", "dsDNA"]}},
+    )
+    masks = np.stack([np.full((40, 30), i, dtype=np.uint32) for i in (1, 2, 3, 4)])
+    names = ["cells", "nuclei", "cell_boundaries", "nucleus_boundaries"]
+    tifffile.imwrite(tmp_path / "mask.ome.tiff", masks, ome=True, metadata={"axes": "CYX", "Channel": {"Name": names}})
+    sdata = mibi(tmp_path / "3D_image_stack_expr.ome.tiff", labels={"cells": tmp_path / "mask.ome.tiff"})
+    image = sdata.images["3D_image_stack_expr_image"]
+    assert list(get_channel_names(image)) == ["CD45", "Ki67", "dsDNA"]
+    level0 = lambda el: el["scale0"].image if hasattr(el, "keys") else el
+    np.testing.assert_array_equal(level0(image).data.compute(), expr)
+    np.testing.assert_array_equal(level0(sdata.labels["3D_image_stack_expr_cells_labels"]).data.compute(), masks[0])
+    with pytest.raises(ValueError, match="none is named 'whole_cell'"):
+        mibi(tmp_path / "3D_image_stack_expr.ome.tiff", labels={"whole_cell": tmp_path / "mask.ome.tiff"})

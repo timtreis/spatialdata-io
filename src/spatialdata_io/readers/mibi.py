@@ -43,6 +43,9 @@ def mibi(
     ``path`` may instead hold one such folder per FOV (e.g. the tiles of one tissue region): each FOV is read as
     above into its own elements of one :class:`spatialdata.SpatialData`.
 
+    ``path`` may also be one multichannel OME-TIFF of a FOV (HuBMAP's MIBI deposits): the channels are named from
+    its OME-XML, and ``<fov>`` is the file name without ``.ome.tif(f)``.
+
     Parameters
     ----------
     path
@@ -52,7 +55,8 @@ def mibi(
         ".../<fov>_nuclear.tiff"}`` (Mesmer/``deepcell_output``). Each is stored as ``<fov>_<name>_labels`` and must
         have the image's shape. ``{fov}`` in a path is replaced by each FOV's folder name; a mapping from FOV folder
         name to path instead gives each FOV its own mask file, for names that ``{fov}`` can't express (e.g.
-        ``Point2311_labels.tiff`` for the FOV ``Point2311_pt1053_20698``).
+        ``Point2311_labels.tiff`` for the FOV ``Point2311_pt1053_20698``). A mask file that stacks several masks
+        (HuBMAP SPRM's ``mask.ome.tiff``) gives the plane whose OME channel is named like the mask, e.g. ``cells``.
     channel_folder
         Subfolder of each FOV folder that holds the channel files, e.g. ``"TIFs"`` for ``<fov>/TIFs/CD45.tif``
         (Risom et al. 2022), where ``<fov>`` itself also holds compartment masks. The FOV is named after ``<fov>``.
@@ -77,11 +81,14 @@ def mibi(
         image_models_kwargs, labels_models_kwargs
     )
     chunks = spatial_chunks(image_models_kwargs["chunks"], (4096, 4096))
-    fovs = (
-        [path]
-        if _channel_files(path / channel_folder)
-        else sorted(d for d in path.iterdir() if _channel_files(d / channel_folder))
-    )
+    if path.is_file():
+        fovs = [path]
+    else:
+        fovs = (
+            [path]
+            if _channel_files(path / channel_folder)
+            else sorted(d for d in path.iterdir() if _channel_files(d / channel_folder))
+        )
     if not fovs:
         raise ValueError(f"No channel .tif(f) files in {path / channel_folder} or its subfolders.")
     if unmasked := [(n, d.name) for n, p in labels.items() if isinstance(p, Mapping) for d in fovs if d.name not in p]:
@@ -101,7 +108,7 @@ def mibi(
             name: Path(p[fov.name] if isinstance(p, Mapping) else str(p).replace("{fov}", fov.name))
             for name, p in labels.items()
         }
-        files = _channel_files(fov / channel_folder)
+        files = [fov] if fov.is_file() else _channel_files(fov / channel_folder)
         i, lab = _read_fov(fov, files, fov_labels, chunks, transformations, image_models_kwargs, labels_models_kwargs)
         images |= i
         label_elements |= lab
@@ -130,23 +137,31 @@ def _read_fov(
     image_models_kwargs: Mapping[str, Any],
     labels_models_kwargs: Mapping[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any]]:
-    """The image and label elements of one FOV folder, from its channel ``files``."""
-    planes = []
-    for file in files:
-        plane, _, _ = read_tiff(file, chunks)
-        if plane.shape[0] != 1:
-            raise ValueError(f"{file} holds {plane.shape[0]} planes; expected one 2-D channel image.")
-        planes.append(plane[0])
+    """The image and label elements of one FOV folder from its channel ``files``, or of one multichannel OME-TIFF."""
+    if path.is_file():
+        stack, _, _ = read_tiff(path, chunks)
+        names = _ome_channel_names(path)
+        if names is None or len(names) != stack.shape[0]:
+            raise ValueError(f"{path}: {stack.shape[0]} planes but OME channel names {names}; expected one per plane.")
+        planes = list(stack)
+    else:
+        names = [f.stem for f in files]
+        planes = []
+        for file in files:
+            plane, _, _ = read_tiff(file, chunks)
+            if plane.shape[0] != 1:
+                raise ValueError(f"{file} holds {plane.shape[0]} planes; expected one 2-D channel image.")
+            planes.append(plane[0])
     if len({(p.shape, p.dtype) for p in planes}) > 1:
         found = {f.name: (p.shape, str(p.dtype)) for f, p in zip(files, planes, strict=True)}
         raise ValueError(f"The channel images of one FOV must share shape and dtype, got {found}.")
 
-    fov = sanitize_name(path.name)
+    fov = sanitize_name(_fov_name(path))
     images = {
         f"{fov}_image": Image2DModel.parse(
             da.stack(planes),
             dims=("c", "y", "x"),
-            c_coords=[f.stem for f in files],
+            c_coords=names,
             transformations=transformations,
             **image_models_kwargs,
         )
@@ -154,9 +169,44 @@ def _read_fov(
     label_elements = {}
     for name, mask_path in labels.items():
         mask, _, _ = read_tiff(mask_path, chunks)
+        if mask.shape[0] > 1:  # a stack of masks (HuBMAP SPRM): take the plane whose OME channel is named ``name``
+            mask_names = [n.lower() for n in _ome_channel_names(mask_path) or []]
+            if name.lower() not in mask_names:
+                raise ValueError(
+                    f"Mask {mask_path} stacks {mask.shape[0]} planes; none is named {name!r}: {mask_names}."
+                )
+            mask = mask[mask_names.index(name.lower()) : mask_names.index(name.lower()) + 1]
         if mask.shape[0] != 1 or mask.shape[1:] != planes[0].shape:
             raise ValueError(f"Mask {mask_path} has shape {mask.shape}; expected one plane of {planes[0].shape}.")
         label_elements[f"{fov}_{sanitize_name(name)}_labels"] = Labels2DModel.parse(
             mask[0], dims=("y", "x"), transformations=transformations, **labels_models_kwargs
         )
     return images, label_elements
+
+
+def _fov_name(path: Path) -> str:
+    """A FOV folder's name, or an OME-TIFF's file name without ``.ome.tif(f)``."""
+    if not path.is_file():
+        return path.name
+    name = path.name
+    for suffix in (".ome.tiff", ".ome.tif", ".tiff", ".tif"):
+        if name.lower().endswith(suffix):
+            return name[: -len(suffix)]
+    return path.stem
+
+
+def _ome_channel_names(path: Path) -> list[str] | None:
+    """The ``Name`` of every ``Channel`` of the first OME ``Image``, or None when there is no OME-XML or a name is missing."""
+    import xml.etree.ElementTree as ET
+
+    import tifffile
+
+    with tifffile.TiffFile(path) as tf:
+        xml = tf.ome_metadata
+    if not xml:
+        return None
+    image = next((e for e in ET.fromstring(xml) if e.tag.endswith("}Image")), None)
+    if image is None:
+        return None
+    names = [c.get("Name") for c in image.iter() if c.tag.endswith("}Channel")]
+    return names if names and all(names) else None
