@@ -58,7 +58,8 @@ def test_top_bins_header_pixel_size_and_round_trip(tmp_path: Path) -> None:
     assert list(table.obs_names) == ["1_1", "2_1", "1_2"]
     np.testing.assert_allclose(table.X.toarray(), [[1, 5, 2], [3, 4, 0], [0, 0, 1]])
     assert table.X.dtype == np.float32
-    np.testing.assert_allclose(table.obs["tic"], [8, 7, 1.5])
+    np.testing.assert_allclose(table.obs["total_ion_current"], [8, 7, 1.5])  # all stored peaks, kept or not
+    assert "tic" not in table.obs
     square = sdata.shapes["msi_pixels"].geometry.iloc[1]
     assert square.bounds == (1, 0, 2, 1)
     scale = get_transformation(sdata.shapes["msi_pixels"], "global").to_affine_matrix(("x", "y"), ("x", "y"))

@@ -82,11 +82,11 @@ def imzml(
     Returns
     -------
     :class:`spatialdata.SpatialData` with the table ``"table"`` (pixels with at least one peak x features, raw summed
-    intensities as CSR float32; ``obs`` ``x``/``y`` grid indices from 1 and ``tic``; ``var`` ``mz``, ``mz_low``,
+    intensities as CSR float32; ``obs`` ``x``/``y`` grid indices from 1 and ``total_ion_current``; ``var`` ``mz``, ``mz_low``,
     ``mz_high``) annotating one square per pixel, the shapes ``"msi_pixels"``. With a pixel size, the shapes are
     scaled to µm in ``"global"``; without, they are in grid units and ``uns["spatialdata_io"]["pitch_unknown"]`` is
     ``True``. ``uns["spatialdata_io"]`` also records the mode, polarity, analyser, m/z range, ``ppm`` and their sources.
-    ``tic`` is the sum of every intensity stored in the pixel's spectrum, over all m/z and as deposited (profile or
+    ``total_ion_current`` is the sum of every intensity stored in the pixel's spectrum, over all m/z and as deposited (profile or
     centroid), before the feature summary, so it's larger than the row sum of the kept features.
     """
     try:
@@ -203,7 +203,7 @@ def imzml(
         {
             "x": xy[:, 0],
             "y": xy[:, 1],
-            "tic": tic[keep],
+            "total_ion_current": tic[keep],
             "region": pd.Categorical([_SHAPES] * len(keep)),
             "instance_id": keep,
         },
@@ -260,7 +260,7 @@ def _sdata_3d(
             "x_um": pos[:, 0],
             "y_um": pos[:, 1],
             "z_um": pos[:, 2],
-            "tic": tic,
+            "total_ion_current": tic,
             "region": pd.Categorical(regions),
             "instance_id": keep,
         },
