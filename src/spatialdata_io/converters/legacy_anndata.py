@@ -302,6 +302,8 @@ def from_legacy_anndata(
         dataset_ids = list(adata.uns[SPATIAL].keys())
         for dataset_id in dataset_ids:
             dataset_data = adata.uns[SPATIAL][dataset_id]
+            if not isinstance(dataset_data, Mapping):  # e.g. CELLxGENE's uns['spatial']['is_single'] flag
+                continue
             keys = set(dataset_data.keys())
             scalefactors_raw = dataset_data.get(SCALEFACTORS, {}) if isinstance(dataset_data, Mapping) else {}
             scalefactors = scalefactors_raw if isinstance(scalefactors_raw, Mapping) else {}
@@ -404,10 +406,11 @@ def from_legacy_anndata(
 
 def _is_visium_spot_library(libraries: Mapping[str, Any]) -> bool:
     """Whether ``uns['spatial']`` holds exactly one library whose Space Ranger chemistry is a Visium spot assay."""
+    libraries = [lib for lib in libraries.values() if isinstance(lib, Mapping)]
     if len(libraries) != 1:
         return False
-    (library,) = libraries.values()
-    meta = library.get("metadata", {}) if isinstance(library, Mapping) else {}
+    (library,) = libraries
+    meta = library.get("metadata", {})
     chem = meta.get("chemistry_description", "") if isinstance(meta, Mapping) else ""
     chem = (chem.decode() if isinstance(chem, bytes) else str(chem)).lower()
     return "spatial" in chem and "hd" not in chem.split()

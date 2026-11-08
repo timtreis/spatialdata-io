@@ -159,3 +159,13 @@ def test_from_legacy_anndata_observation_unit() -> None:
     assert "spatialdata_io" not in from_legacy_anndata(adata).tables["table"].uns
     plain = _two_library_adata()
     assert "spatialdata_io" not in from_legacy_anndata(plain, library_id="A", library_key="sample").tables["table"].uns
+
+
+def test_from_legacy_anndata_skips_non_library_entries() -> None:
+    # CELLxGENE (schema 5+) stores a bool flag next to the library in uns['spatial']
+    adata = _two_library_adata()
+    adata.uns["spatial"] = {"is_single": np.True_, "A": adata.uns["spatial"]["A"]}
+    adata.uns["spatial"]["A"]["metadata"] = {"chemistry_description": "Spatial 3' v1"}
+    sdata = from_legacy_anndata(adata)
+    assert list(sdata.images) == ["A_hires"]
+    assert sdata.tables["table"].uns["spatialdata_io"]["observation_unit"] == "spot_or_bin"
