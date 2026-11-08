@@ -139,3 +139,25 @@ def test_lazy_tiff_array_opens_the_file_once_per_chunk(tmp_path: Path, monkeypat
     monkeypatch.setattr(builtins, "open", lambda f, *a, **k: opened.append(f) or real_open(f, *a, **k))
     np.testing.assert_array_equal(image.compute(scheduler="synchronous"), data)
     assert len([f for f in opened if str(f).endswith("a.tif")]) == image.npartitions == 4
+
+
+@pytest.mark.parametrize(
+    ("tile", "compression", "chunks"),
+    [((16, 16), "zlib", (40, 24)), ((32, 16), "lzw", (64, 64)), (None, None, (24, 50)), (None, "zlib", (7, 61))],
+)
+def test_lazy_tiff_array_tile_reads_equal_tifffile(
+    tmp_path: Path, tile: tuple[int, int] | None, compression: str | None, chunks: tuple[int, int]
+) -> None:
+    # the direct tile path (bypassing zarr) must give the file's pixels for any chunking, incl. partial edge tiles
+    rng = np.random.default_rng(0)
+    data = rng.integers(0, 255, size=(3, 70, 53), dtype=np.uint8)
+    kw = {"tile": tile} if tile else {"rowsperstrip": 9}
+    tifffile.imwrite(tmp_path / "a.tif", data, photometric="minisblack", compression=compression, **kw)
+    image = lazy_tiff_array(tmp_path / "a.tif", chunks=chunks)
+    assert image.dask.values()  # build the graph
+    source = next(v for v in image.dask.values() if hasattr(v, "_read_tiles"))
+    assert source._pages is not None  # the tile path is used, not the zarr fallback
+    assert image.chunksize[-1] == 53  # whole rows of tiles: one sequential read per chunk
+    np.testing.assert_array_equal(image.compute(scheduler="threads"), data)
+    np.testing.assert_array_equal(image[1:3, 5:61, 7:50].compute(), data[1:3, 5:61, 7:50])
+    np.testing.assert_array_equal(lazy_tiff_array(tmp_path / "a.tif", page=2).compute(), data[2])

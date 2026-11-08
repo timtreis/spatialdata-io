@@ -319,7 +319,8 @@ def lazy_tiff_array(
         The index of the page to read instead of a series.
     chunks
         The ``(y, x)`` chunk size to aim for: the native tiles or strips are grouped into chunks of about as many
-        pixels (the default is that of the raster models), so the graph does not get one task per strip.
+        pixels (the default is that of the raster models), so the graph does not get one task per strip. Chunks
+        span whole rows of tiles when a row is at most 4 times that size, so each chunk is one sequential read.
 
     Returns
     -------
@@ -329,7 +330,11 @@ def lazy_tiff_array(
     y, x = source.axes.index("Y"), source.axes.index("X")
     grouped = list(source.chunks)
     native_y, native_x = grouped[y], grouped[x]
-    grouped[x] = min(source.shape[x], max(native_x, chunks[1] // native_x * native_x))
+    if source.shape[x] * native_y <= 4 * chunks[0] * chunks[1]:
+        # whole rows of tiles: one sequential read per chunk, ~5x faster on Lustre than square blocks of rows
+        grouped[x] = source.shape[x]
+    else:
+        grouped[x] = min(source.shape[x], max(native_x, chunks[1] // native_x * native_x))
     grouped[y] = min(source.shape[y], max(native_y, chunks[0] * chunks[1] // grouped[x] // native_y * native_y))
     return da.from_array(
         source,
@@ -369,18 +374,69 @@ class _TiffZarrSource:
                 data = tiff.pages[self.page] if self.page is not None else tiff.series[self.series]
                 self.axes = data.axes
                 self._array = zarr.open_array(data.aszarr(level=0), mode="r")
+                self._pages = _plain_pages(data)
+                self._read_lock = threading.Lock()
             return self._array
 
     def __getitem__(self, key: Any) -> np.ndarray:
         array = self._open()
         with self._file.held():  # one open per chunk, not per tile (an open costs ~20 ms on Lustre)
+            if self._pages is not None and isinstance(key, tuple) and all(isinstance(k, slice) for k in key):
+                return self._read_tiles(key)
             return np.asarray(array[key])
 
+    def _read_tiles(self, key: tuple[slice, ...]) -> np.ndarray:
+        """The ``key`` region read straight from the tiles that cover it, bypassing zarr.
+
+        tifffile's zarr store reads and decodes every tile alone on zarr's one event-loop thread: small reads,
+        no parallel decoding. Here the tiles of a chunk are read in one sorted, coalesced pass, and decoded in
+        the calling (dask worker) thread.
+        """
+        (*lead, (y0, y1, _), (x0, x1, _)) = (k.indices(n) for k, n in zip(key, self.shape, strict=True))
+        pages = self._pages[slice(*lead[0][:2])] if lead else self._pages
+        first = pages[0].keyframe
+        th, tw = (first.tilelength, first.tilewidth) if first.is_tiled else (first.rowsperstrip, first.imagewidth)
+        nx = -(-first.imagewidth // tw)
+        tiles = [ty * nx + tx for ty in range(y0 // th, -(-y1 // th)) for tx in range(x0 // tw, -(-x1 // tw))]
+        out = np.zeros((len(pages), y1 - y0, x1 - x0), dtype=self.dtype)
+        fh = first.parent.filehandle
+        decode, jpegtables = first.decode, first.jpegtables
+        for c, page in enumerate(pages):
+            offsets = [page.dataoffsets[i] for i in tiles]
+            bytecounts = [page.databytecounts[i] for i in tiles]
+            for data, index in fh.read_segments(offsets, bytecounts, indices=tiles, sort=True, lock=self._read_lock):
+                tile, (_, _, ty, tx, _), _ = decode(data, index, jpegtables=jpegtables, _fullsize=True)
+                if tile is None:  # an empty tile reads as zeros, as tifffile fills it
+                    continue
+                ya, yb, xa, xb = max(ty, y0), min(ty + th, y1), max(tx, x0), min(tx + tw, x1)
+                out[c, ya - y0 : yb - y0, xa - x0 : xb - x0] = tile[0, ya - ty : yb - ty, xa - tx : xb - tx, 0]
+        return out if lead else out[0]
+
     def __getstate__(self) -> dict[str, Any]:
-        return {key: value for key, value in self.__dict__.items() if key not in ("_lock", "_array", "_file")}
+        return {
+            key: value
+            for key, value in self.__dict__.items()
+            if key not in ("_lock", "_array", "_file", "_pages", "_read_lock")
+        }
 
     def __setstate__(self, state: dict[str, Any]) -> None:
         self.__dict__.update(state, _lock=threading.Lock(), _array=None)
+
+
+def _plain_pages(data: tifffile.TiffPage | tifffile.TiffPageSeries) -> list[Any] | None:
+    """The pages (or frames) of a ``YX`` page or a ``?YX`` series of single-sample 2D pages with one tiling, else None."""
+    pages = [data] if isinstance(data, tifffile.TiffPage) else list(data.levels[0].pages)
+    if data.axes[-2:] != "YX" or len(data.shape) != 2 + (len(data.axes) == 3) or len(data.axes) > 3:
+        return None
+    if len(data.shape) == 3 and len(pages) != data.shape[0]:
+        return None
+    keys = [p.keyframe for p in pages]  # a TiffFrame shares its keyframe's layout
+    layout = lambda k: (k.shape, k.dtype, k.is_tiled, k.tilelength, k.tilewidth, k.rowsperstrip, k.compression)
+    if not all(k.samplesperpixel == 1 and k.imagedepth == 1 for k in keys):
+        return None
+    if keys[0].shape != data.shape[-2:] or any(layout(k) != layout(keys[0]) for k in keys):
+        return None
+    return pages
 
 
 class _TransientFile(io.RawIOBase):
