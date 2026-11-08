@@ -11,7 +11,7 @@ from h5py import File
 from spatialdata._logging import logger
 
 if TYPE_CHECKING:
-    from collections.abc import Iterator, Mapping
+    from collections.abc import Iterator, Mapping, Sequence
 
     from anndata import AnnData
     from ome_types.model import Pixels
@@ -218,3 +218,21 @@ def parse_physical_size(path: Path | None = None, ome_pixels: Pixels | None = No
         logger.error(f"Physical unit not recognized: '{pixels.physical_size_x_unit}'.")
         raise NotImplementedError
     return float(physical_size)
+
+
+def _fit_scale_factors(kwargs: Mapping[str, Any], shape_yx: Sequence[int]) -> dict[str, Any]:
+    """``kwargs`` with its integer ``scale_factors`` cut to the levels an image of ``shape_yx`` can have.
+
+    A pyramid level whose size falls below one pixel fails to parse; small ROIs (under 16 px a side with the default
+    ``[2, 2, 2, 2]``, or 1 x N line scans) then get fewer levels, or none.
+    """
+    factors = kwargs.get("scale_factors")
+    if not factors or not all(isinstance(f, int) for f in factors):
+        return dict(kwargs)
+    kept, size = [], min(shape_yx)
+    for f in factors:
+        if size / f < 1:
+            break
+        size /= f
+        kept.append(f)
+    return {**kwargs, "scale_factors": kept or None}

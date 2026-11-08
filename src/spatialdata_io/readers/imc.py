@@ -17,6 +17,7 @@ from spatialdata.models import Image2DModel, Labels2DModel
 from spatialdata.transformations import Affine, BaseTransformation, Identity, Scale
 
 from spatialdata_io.readers._utils._utils import (
+    _fit_scale_factors,
     _initialize_raster_models_kwargs,
     _set_observation_unit,
     _set_reader_metadata,
@@ -174,7 +175,7 @@ def imc_mcd(
                     dims=("c", "y", "x"),
                     c_coords=names,
                     transformations={cs: transform},
-                    **image_models_kwargs,
+                    **_fit_scale_factors(image_models_kwargs, data.shape[-2:]),
                 )
                 info.append(
                     {
@@ -232,16 +233,24 @@ def _read_roi(
     roi = _roi_name(path)
     images = {
         f"{roi}_image": Image2DModel.parse(
-            image, dims=("c", "y", "x"), c_coords=names, transformations=transformations, **image_models_kwargs
+            image,
+            dims=("c", "y", "x"),
+            c_coords=names,
+            transformations=transformations,
+            **_fit_scale_factors(image_models_kwargs, image.shape[1:]),
         )
     }
     label_elements = {}
     for name, mask_path in labels.items():
-        mask = tifffile.imread(mask_path, is_ome=False).squeeze()
+        mask = tifffile.imread(mask_path, is_ome=False)
+        mask = mask.reshape(mask.shape[-2:]) if mask.ndim > 2 and mask.size == mask.shape[-2] * mask.shape[-1] else mask
         if mask.shape != image.shape[1:]:
             raise ValueError(f"Mask {mask_path} has shape {mask.shape}; expected {image.shape[1:]}.")
         label_elements[f"{roi}_{sanitize_name(name)}_labels"] = Labels2DModel.parse(
-            mask, dims=("y", "x"), transformations=transformations, **labels_models_kwargs
+            mask,
+            dims=("y", "x"),
+            transformations=transformations,
+            **_fit_scale_factors(labels_models_kwargs, mask.shape),
         )
     return images, label_elements
 

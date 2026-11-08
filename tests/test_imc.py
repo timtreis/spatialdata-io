@@ -174,3 +174,18 @@ def test_mcd_acquisitions_placed_on_the_slide(tmp_path: Path, monkeypatch: pytes
     assert set(get_transformation(sdata.images["slide_1_2_image"], get_all=True)) == {"slide_1_2"}
     assert [a["coordinate_system"] for a in sdata.attrs["imc"]["acquisitions"]] == ["global", "slide_1_2"]
     assert list(imc_mcd(tmp_path / "x.mcd", acquisitions=[2]).images) == ["x_2_image"]
+
+
+@pytest.mark.parametrize("shape", [(12, 13), (801, 802), (3, 5), (2, 2), (1, 50)])
+def test_small_and_odd_rois_get_the_levels_they_fit(tmp_path: Path, shape: tuple[int, int]) -> None:
+    # the default 2x2x2x2 pyramid needs >= 16 px a side; smaller ROIs keep fewer levels instead of failing
+    data = np.arange(3 * shape[0] * shape[1], dtype=np.float32).reshape(3, *shape)
+    tifffile.imwrite(tmp_path / "roi_001.tiff", data, imagej=True)
+    mask = (np.arange(shape[0] * shape[1]).reshape(1, *shape) % 7).astype(np.uint16)  # a leading singleton axis
+    tifffile.imwrite(tmp_path / "mask.tiff", mask)
+    sdata = imc(tmp_path / "roi_001.tiff", labels={"cells": tmp_path / "mask.tiff"})
+    sdata.write(tmp_path / "out.zarr")
+    back = read_zarr(tmp_path / "out.zarr")
+    image, labels = back.images["roi_001_image"], back.labels["roi_001_cells_labels"]
+    np.testing.assert_array_equal(np.asarray(image["scale0"].image if hasattr(image, "keys") else image), data)
+    np.testing.assert_array_equal(np.asarray(labels["scale0"].image if hasattr(labels, "keys") else labels), mask[0])
