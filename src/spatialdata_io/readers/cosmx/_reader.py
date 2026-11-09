@@ -1043,6 +1043,7 @@ def _cosmx_multi(
     add_fovs_as_shapes: bool,
     skip_empty_fovs: bool,
     preview_fovs: bool,
+    fov_locs: pd.DataFrame | None = None,
 ) -> SpatialData | None:
     """Read a multimodal CosMx dataset (e.g. RNA + Protein)."""
     modalities = dataset.modalities
@@ -1057,10 +1058,12 @@ def _cosmx_multi(
         (ds for ds in modalities.values() if ds.polygons_file is not None or ds.cell_labels_dir is not None),
         next(iter(modalities.values())),
     )
-    if label_ds.fov_positions_file is None:
+    if fov_locs is not None:
+        fov_locs = _given_fov_locs(fov_locs, fovs=sorted(fov_set) if fov_set else None)
+    elif label_ds.fov_positions_file is None:
         raise ValueError("FOV positions file required for multimodal runs.")
-
-    fov_locs = _read_fov_locs(label_ds.fov_positions_file, fovs=sorted(fov_set) if fov_set else None)
+    else:
+        fov_locs = _read_fov_locs(label_ds.fov_positions_file, fovs=sorted(fov_set) if fov_set else None)
 
     if skip_empty_fovs and (read_images or read_labels):
         fov_locs = _prune_empty_fovs(dataset, fov_locs, fov_set)
@@ -1243,6 +1246,28 @@ def _assemble_sdata(
 # ---------------------------------------------------------------------------
 
 
+def _given_fov_locs(fov_locs: pd.DataFrame, *, fovs: list[int] | None = None) -> pd.DataFrame:
+    """A caller's per-FOV origins in the shape :func:`_read_fov_locs` returns (``xmax``/``ymax`` added)."""
+    missing = {"xmin", "ymin", "flip_y"} - set(fov_locs.columns)
+    if missing:
+        raise ValueError(f"fov_locs needs columns xmin, ymin and flip_y; missing {sorted(missing)}")
+    df = fov_locs[["xmin", "ymin", "flip_y"]].copy()
+    df.index = pd.Index(pd.to_numeric(df.index).astype(int), name="fov")
+    if not df.index.is_unique:
+        raise ValueError("fov_locs has duplicate FOVs")
+    df["xmin"], df["ymin"] = df["xmin"].astype(float), df["ymin"].astype(float)
+    df["flip_y"] = df["flip_y"].astype(bool)
+    df["xmax"] = df["xmin"] + COSMX_FOV_SIZE_PX
+    df["ymax"] = df["ymin"] + COSMX_FOV_SIZE_PX
+    df = df.sort_index()
+    if fovs is not None:
+        absent = set(fovs) - set(df.index)
+        if absent:
+            raise KeyError(f"Requested FOVs not in fov_locs: {sorted(absent)}")
+        df = df.loc[sorted(fovs)]
+    return df
+
+
 def _normalize_fovs(fovs: list[int | str] | int | str | None) -> set[int] | None:
     """Convert the user-facing ``fovs`` argument to an optional set of ints."""
     if fovs is None:
@@ -1384,6 +1409,7 @@ def cosmx(
     add_fovs_as_shapes: bool = True,
     skip_empty_fovs: bool = True,
     preview_fovs: bool = False,
+    fov_locs: pd.DataFrame | None = None,
 ) -> SpatialData | None:
     """Read *CosMx Nanostring* data into a :class:`spatialdata.SpatialData` object.
 
@@ -1458,6 +1484,10 @@ def cosmx(
         to keep every listed FOV.
     preview_fovs
         Show a preview plot of FOV positions and return ``None``.
+    fov_locs
+        Per-FOV origins to use instead of the FOV positions file: indexed by FOV number, with columns ``xmin`` and
+        ``ymin`` (global px) and ``flip_y`` (bool; ``False`` places ``y = ymin + (FOV_SIZE - y_local)``, ``True``
+        places ``y = ymin + y_local``). For exports whose positions file cannot express their own placement.
 
     Returns
     -------
@@ -1508,6 +1538,7 @@ def cosmx(
             add_fovs_as_shapes=add_fovs_as_shapes,
             skip_empty_fovs=skip_empty_fovs,
             preview_fovs=preview_fovs,
+            fov_locs=fov_locs,
         )
 
     # --- Single-modality path ---
@@ -1522,7 +1553,10 @@ def cosmx(
     image_models_kwargs, imread_kwargs = _default_image_kwargs(image_models_kwargs, imread_kwargs)
 
     try:
-        fov_locs = _read_fov_locs(dataset.fov_positions_file) if dataset.fov_positions_file else None
+        if fov_locs is not None:
+            fov_locs = _given_fov_locs(fov_locs)
+        else:
+            fov_locs = _read_fov_locs(dataset.fov_positions_file) if dataset.fov_positions_file else None
     except NoFovCoordinatesError as e:
         # Nothing per-FOV (images, labels, polygons, transcripts, FOV boxes) can be placed without FOV origins.
         logger.warning("%s Reading the cell tables only; cell positions stay in the metadata columns.", e)
