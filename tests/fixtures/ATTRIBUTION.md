@@ -30,3 +30,16 @@ Both source datasets are © 10x Genomics and licensed under
   `cell_id` and `label_id` columns), the `cell_feature_matrix.h5` (subset to the same
   cells), and `experiment.xenium`; removed the zarr/parquet outputs, transcripts,
   images, and auxiliary outputs. No values were altered.
+
+## `merscope-legacy-hdf5-tiny/`
+
+A small subset of a public MERSCOPE deposit in the older output layout (per-FOV `cell_boundaries/feature_data_<fov>.hdf5`
+instead of `cell_boundaries.parquet`), used only to test reading of those boundaries.
+
+- **Source:** NCBI GEO series GSE329718, sample GSM9709838 (`CTB_mouse5_6`), files `*_cell_boundaries.tar.gz`,
+  `*_cell_metadata.csv.gz` and `*_cell_by_gene.csv.gz`.
+  <https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSM9709838>
+- **Author:** Yi Zhang, Boston Children's Hospital / Harvard Medical School (GEO submitter).
+- **License:** NCBI GEO places no restrictions on the use of submitted data.
+- **Edits:** kept 5 cells, 3 from `feature_data_0.hdf5` and 2 from `feature_data_1.hdf5` (all z-planes copied as
+  they are), and the same 5 rows of `cell_metadata.csv` and `cell_by_gene.csv`. No values were altered.

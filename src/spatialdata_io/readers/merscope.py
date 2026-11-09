@@ -31,6 +31,8 @@ if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
 
 SUPPORTED_BACKENDS = ["dask_image", "rioxarray"]
+# The output before cell_boundaries.parquet: one feature_data_<fov>.hdf5 per FOV in this folder
+LEGACY_BOUNDARIES_DIR = "cell_boundaries"
 
 
 def _get_channel_names(images_dir: Path) -> list[str]:
@@ -127,7 +129,8 @@ def merscope(
           transcript in ``{ms.TRANSCRIPTS_FILE!r}`` (unassigned transcripts, ``cell_id`` -1, are dropped).
         - ``{ms.TRANSCRIPTS_FILE!r}``: Transcript file.
         - ``{ms.CELL_METADATA_FILE!r}``: Per-cell metadata file.
-        - ``{ms.BOUNDARIES_FILE!r}``: Cell polygon boundaries.
+        - ``{ms.BOUNDARIES_FILE!r}``: Cell polygon boundaries. Without it, the older per-FOV
+          ``cell_boundaries/feature_data_<fov>.hdf5`` files are read instead.
         - `mosaic_**_z*.tif` images inside the ``{ms.IMAGES_DIR!r}`` directory.
 
     Parameters
@@ -244,8 +247,11 @@ def merscope(
     shapes = {}
 
     if cells_boundaries:
+        legacy = boundaries_path.parent / LEGACY_BOUNDARIES_DIR
         if boundaries_path.exists():
             shapes[f"{dataset_id}_polygons"] = _get_polygons(boundaries_path, transformations)
+        elif sorted(legacy.glob("feature_data_*.hdf5")):
+            shapes[f"{dataset_id}_polygons"] = _get_polygons(legacy, transformations)
         else:
             logger.warning(f"Boundary file {boundaries_path} does not exist. Cell boundaries are not loaded.")
 
@@ -401,9 +407,35 @@ def _one_boundary_per_cell(geo_df: geopandas.GeoDataFrame) -> geopandas.GeoDataF
     return pd.concat([at_z0, rest])
 
 
+def _read_legacy_boundaries(folder: Path) -> geopandas.GeoDataFrame:
+    """Cell polygons from the older per-FOV ``feature_data_<fov>.hdf5`` files, shaped like the parquet.
+
+    Each file holds ``featuredata/<cell id>/zIndex_<k>/p_<n>/coordinates`` (1 x vertices x 2, micron space),
+    one MultiPolygon per cell and z-plane.
+    """
+    import h5py
+
+    rows = []
+    for file in sorted(folder.glob("feature_data_*.hdf5")):
+        with h5py.File(file, "r") as h5:
+            for cell, planes in h5["featuredata"].items():
+                for name, plane in planes.items():
+                    if not name.startswith("zIndex_"):
+                        continue
+                    rings = [shapely.Polygon(plane[p]["coordinates"][0]) for p in plane]
+                    rows.append((cell, int(name.removeprefix("zIndex_")), MultiPolygon(rings)))
+    cells, z, geoms = zip(*rows, strict=True) if rows else ((), (), ())
+    return geopandas.GeoDataFrame(
+        {MerscopeKeys.METADATA_CELL_KEY: list(cells), MerscopeKeys.Z_INDEX: list(z)}, geometry=list(geoms)
+    )
+
+
 def _get_polygons(boundaries_path: Path, transformations: dict[str, BaseTransformation]) -> geopandas.GeoDataFrame:
-    geo_df = geopandas.read_parquet(boundaries_path)
-    geo_df = geo_df.rename_geometry("geometry")
+    """Cell polygons from the boundaries parquet, or from a folder of legacy per-FOV hdf5 files."""
+    if boundaries_path.is_dir():
+        geo_df = _read_legacy_boundaries(boundaries_path)
+    else:
+        geo_df = geopandas.read_parquet(boundaries_path).rename_geometry("geometry")
     geo_df = _one_boundary_per_cell(geo_df)
     # Repair invalid (e.g. self-intersecting) boundaries instead of dropping them: a dropped polygon leaves
     # its cell in the table annotating a shape that does not exist.

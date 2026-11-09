@@ -1,16 +1,20 @@
 from __future__ import annotations
 
+import shutil
 import sys
 import warnings
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import numpy as np
 import pandas as pd
 import pytest
+import shapely
 from scipy.sparse import issparse
 from shapely.geometry import MultiPolygon, Polygon
 from spatialdata.transformations import Identity, get_transformation
 
+from spatialdata_io._constants._constants import MerscopeKeys
 from spatialdata_io.readers.merscope import (
     _dask_image_load_merscope,
     _get_channel_names,
@@ -20,8 +24,6 @@ from spatialdata_io.readers.merscope import (
 )
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from _pytest.monkeypatch import MonkeyPatch
 
 
@@ -379,3 +381,40 @@ def test_transcripts_fov_with_missing_values(tmp_path: Path) -> None:
     points = next(iter(sdata.points.values()))
     assert str(points["fov"].dtype) == "Int64"  # read nullable up front, so later partitions can't disagree
     assert points["fov"].compute().isna().sum() == 1
+
+
+LEGACY_FIXTURE = Path(__file__).parent / "fixtures" / "merscope-legacy-hdf5-tiny"
+
+
+def test_legacy_hdf5_boundaries_are_read_without_parquet(tmp_path: Path) -> None:
+    """GEO GSE329718 (GSM9709838) ships cell_boundaries/feature_data_<fov>.hdf5 instead of the parquet."""
+    region = tmp_path / "region_0"
+    shutil.copytree(LEGACY_FIXTURE, region)
+    meta = pd.read_csv(region / "cell_metadata.csv", index_col=0)
+    meta.index = meta.index.astype(str)
+
+    sdata = merscope(region, transcripts=False, mosaic_images=False)
+
+    (key,) = sdata.shapes
+    polygons = sdata.shapes[key]
+    assert sorted(polygons.index) == sorted(meta.index)  # 5 cells over 2 FOV files, one polygon each
+    # z=0 when the cell has a polygon there; 1031974... has none on planes 0-2, so its largest (z=6) is kept
+    z = polygons[MerscopeKeys.Z_INDEX].to_dict()
+    assert z.pop("103197424733985720356507711758054607796") == 6 and set(z.values()) == {0}
+    for cell, geom in polygons.geometry.items():  # micron space: each polygon sits on its cell's metadata box
+        row = meta.loc[cell]
+        assert geom.is_valid and geom.area > 0
+        assert geom.bounds[0] >= row["min_x"] - 1 and geom.bounds[2] <= row["max_x"] + 1
+        assert geom.bounds[1] >= row["min_y"] - 1 and geom.bounds[3] <= row["max_y"] + 1
+        assert geom.distance(shapely.Point(row["center_x"], row["center_y"])) < 5  # the centre is the 3D centroid
+    table = sdata.tables["table"]
+    assert table.uns["spatialdata_attrs"]["region"] == key
+    assert sorted(table.obs[MerscopeKeys.METADATA_CELL_KEY].astype(str)) == sorted(meta.index)
+
+
+def test_parquet_wins_over_legacy_hdf5(tmp_path: Path) -> None:
+    region = _write_dataset(tmp_path)
+    (region / "cell_boundaries").mkdir()
+    shutil.copy(LEGACY_FIXTURE / "cell_boundaries" / "feature_data_0.hdf5", region / "cell_boundaries")
+    polygons = next(iter(merscope(region, transcripts=False, mosaic_images=False).shapes.values()))
+    assert sorted(polygons.index) == sorted(CELL_IDS)
