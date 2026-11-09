@@ -1998,3 +1998,109 @@ def test_dataset_id_selects_only_its_own_flat_files(tmp_path: Path) -> None:
     assert found["exprMat_file"] == tmp_path / "Run5452_S2_exprMat_file.csv"
     (tmp_path / "Run5452_S2_tx_file.csv").unlink()
     assert _scan_for_files_to_read(tmp_path, ["tx_file"], dataset_id="Run5452_S2")["tx_file"] is None
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CALLER-SUPPLIED FOV ORIGINS
+# ═══════════════════════════════════════════════════════════════════════════
+
+
+class TestGivenFovLocs:
+    """Zenodo 16782547 (CLL tonsil): positions only in mm, and within a FOV ``y_global = C - y_local``.
+
+    A px-only positions file always places ``y = ymin + y_local`` (``flip_y=True``), so the export's own global px
+    can only be reproduced from origins the caller derives from the deposit:
+    ``xmin = x_global - x_local`` and ``ymin = (y_global + y_local) - FOV_SIZE`` with ``flip_y=False``.
+    """
+
+    ORIGINS = {1: (13475.0, 125000.0), 2: (17731.0, 125000.0)}  # (x_global - x_local, y_global + y_local)
+
+    def _build(self, root: Path) -> Path:
+        root.mkdir(parents=True, exist_ok=True)
+        pfx = "S1"
+        cells, poly, tx = [], [], []
+        for fov, (ox, c) in self.ORIGINS.items():
+            for cid in (1, 2):
+                xl, yl = 300.0 * cid, 200.0 * cid
+                cells.append({"fov": fov, "cell_ID": cid, "G1": cid, "G2": 0})
+                for dx, dy in ((0, 0), (40, 0), (40, 40), (0, 40)):
+                    poly.append(
+                        {
+                            "fov": fov,
+                            "cellID": cid,
+                            "cell": f"c_1_{fov}_{cid}",
+                            "x_local_px": xl + dx,
+                            "y_local_px": yl + dy,
+                            "x_global_px": ox + xl + dx,
+                            "y_global_px": c - yl - dy,
+                        }
+                    )
+                tx.append(
+                    {
+                        "fov": fov,
+                        "cell_ID": cid,
+                        "cell": f"c_1_{fov}_{cid}",
+                        "x_local_px": xl + 20,
+                        "y_local_px": yl + 20,
+                        "x_global_px": ox + xl + 20,
+                        "y_global_px": c - yl - 20,
+                        "z": 0,
+                        "target": "G1",
+                        "CellComp": "Nuclear",
+                    }
+                )
+        meta = [
+            {"fov": r["fov"], "cell_ID": r["cell_ID"], "Area": 1600, "CenterX_global_px": 0.0, "CenterY_global_px": 0.0}
+            for r in cells
+        ]
+        _write_csv(root / f"{pfx}_exprMat_file.csv.gz", pd.DataFrame(cells), compress=True)
+        _write_csv(root / f"{pfx}_metadata_file.csv.gz", pd.DataFrame(meta), compress=True)
+        _write_csv(root / f"{pfx}-polygons.csv.gz", pd.DataFrame(poly), compress=True)
+        _write_csv(root / f"{pfx}_tx_file.csv.gz", pd.DataFrame(tx), compress=True)
+        return root
+
+    @staticmethod
+    def _global_xy(elem, xs, ys):
+        import numpy as np
+        from spatialdata.transformations import get_transformation
+
+        m = get_transformation(elem, "global").to_affine_matrix(input_axes=("x", "y"), output_axes=("x", "y"))
+        xy = np.c_[np.asarray(xs, float), np.asarray(ys, float), np.ones(len(xs))] @ m.T
+        return xy[:, 0], xy[:, 1]
+
+    def test_origins_reproduce_the_deposit_global_px(self, sdio, tmp_path):
+        import numpy as np
+
+        root = self._build(tmp_path / "given")
+        locs = pd.DataFrame(
+            {
+                "xmin": [o[0] for o in self.ORIGINS.values()],
+                "ymin": [o[1] - SPEC_FOV_SIZE for o in self.ORIGINS.values()],
+                "flip_y": False,
+            },
+            index=list(self.ORIGINS),
+        )
+        sdata = sdio.cosmx(
+            root, n_workers=1, read_images=False, read_labels=False, polygons_as_labels=False, fov_locs=locs
+        )
+        tx = pd.read_csv(root / "S1_tx_file.csv.gz")
+        pts = next(iter(sdata.points.values())).compute()
+        gx, gy = self._global_xy(next(iter(sdata.points.values())), pts["x"], pts["y"])
+        got = sorted(zip(np.round(gx, 6), np.round(gy, 6), strict=True))
+        assert got == sorted(zip(tx["x_global_px"].astype(float), tx["y_global_px"].astype(float), strict=True))
+        poly = pd.read_csv(root / "S1-polygons.csv.gz")
+        shp = next(v for k, v in sdata.shapes.items() if "box" not in k.lower())
+        b = shp.geometry.bounds
+        bx0, by0 = self._global_xy(shp, b["minx"], b["miny"])
+        bx1, by1 = self._global_xy(shp, b["maxx"], b["maxy"])
+        assert np.isclose(min(bx0.min(), bx1.min()), poly["x_global_px"].min())
+        assert np.isclose(max(by0.max(), by1.max()), poly["y_global_px"].max())
+        assert np.isclose(min(by0.min(), by1.min()), poly["y_global_px"].min())
+
+    def test_bad_fov_locs_raise(self):
+        from spatialdata_io.readers.cosmx._reader import _given_fov_locs
+
+        with pytest.raises(ValueError, match="flip_y"):
+            _given_fov_locs(pd.DataFrame({"xmin": [0.0], "ymin": [0.0]}, index=[1]))
+        with pytest.raises(KeyError, match="not in fov_locs"):
+            _given_fov_locs(pd.DataFrame({"xmin": [0.0], "ymin": [0.0], "flip_y": False}, index=[1]), fovs=[2])
