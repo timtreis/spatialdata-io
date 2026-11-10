@@ -6,6 +6,7 @@ __version__ = version("spatialdata-io")
 
 _LAZY_IMPORTS: dict[str, str] = {
     # readers
+    "atera": "spatialdata_io.readers.atera",
     "cell_table": "spatialdata_io.readers.cell_table",
     "codex": "spatialdata_io.readers.codex",
     "cosmx": "spatialdata_io.readers.cosmx",
@@ -35,11 +36,13 @@ _LAZY_IMPORTS: dict[str, str] = {
     "geojson": "spatialdata_io.readers.generic",
     "image": "spatialdata_io.readers.generic",
     # converters
+    "atera_to_parquet": "spatialdata_io.converters.atera_to_parquet",
     "generic_to_zarr": "spatialdata_io.converters.generic_to_zarr",
 }
 
 __all__ = [
     # readers
+    "atera",
     "cell_table",
     "codex",
     "cosmx",
@@ -69,6 +72,7 @@ __all__ = [
     "geojson",
     "image",
     # converters
+    "atera_to_parquet",
     "generic_to_zarr",
 ]
 
@@ -93,9 +97,11 @@ def __dir__() -> list[str]:
 
 if TYPE_CHECKING:
     # converters
+    from spatialdata_io.converters.atera_to_parquet import atera_to_parquet
     from spatialdata_io.converters.generic_to_zarr import generic_to_zarr
 
     # readers
+    from spatialdata_io.readers.atera import atera
     from spatialdata_io.readers.cell_table import cell_table
     from spatialdata_io.readers.codex import codex
     from spatialdata_io.readers.cosmx import cosmx

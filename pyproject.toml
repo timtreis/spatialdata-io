@@ -168,6 +168,7 @@ module = [
   "flowio.*",
   "h5py.*",
   "multiscale_spatial_image.*",
+  "numcodecs.*",
   "pyarrow.*",
   "pyimzml.*",
   "rasterio.*",
