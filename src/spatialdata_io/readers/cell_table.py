@@ -324,7 +324,12 @@ def _infer_rows_are_genes(
 
 
 def _read_counts(
-    path: Path, *, genes_as_rows: bool | None, coord_ids: pd.Index, skiprows: int
+    path: Path,
+    *,
+    genes_as_rows: bool | None,
+    coord_ids: pd.Index,
+    skiprows: int,
+    id_columns: Sequence[str] | None = None,
 ) -> tuple[pd.DataFrame | sp.spmatrix, pd.Index, pd.Index]:
     """Read a counts file with its own axis labels and return cells x genes.
 
@@ -341,6 +346,8 @@ def _read_counts(
         String cell ids of the coordinates file.
     skiprows
         Leading lines to skip in a delimited file.
+    id_columns
+        Columns of a delimited file whose joined values are the cell ids (cells in rows).
 
     Returns
     -------
@@ -369,7 +376,12 @@ def _read_counts(
             )
         return (mat.T.tocsr(), feats, barcodes) if genes_as_rows else (mat, feats, barcodes)
 
-    df = _read_delimited(path, skiprows, dtype={0: str})
+    if id_columns is not None:  # a separate counts file keyed by several columns, e.g. CosMx exprMat (fov, cell_ID)
+        df = _composite_index(
+            _read_delimited(path, skiprows, dtype=dict.fromkeys(id_columns, str)), id_columns, path.name
+        )
+    else:
+        df = _read_delimited(path, skiprows, dtype={0: str})
     if isinstance(df.index, pd.RangeIndex):
         df = df.set_index(df.columns[0])
     df.index = df.index.astype(str)
@@ -380,7 +392,22 @@ def _read_counts(
     return df, pd.Index(df.columns), pd.Index(df.index)
 
 
-def _read_coordinates(path: Path, *, cell_id: str | None, skiprows: int) -> pd.DataFrame:
+def _composite_index(df: pd.DataFrame, columns: Sequence[str], name: str) -> pd.DataFrame:
+    """Index ``df`` by its ``columns`` joined with ``_`` (e.g. CosMx ``fov`` + ``cell_ID``) and drop them."""
+    missing = [c for c in columns if c not in df.columns]
+    if missing:
+        raise ValueError(f"Id columns {missing} not found in {name}; available columns: {list(df.columns)[:10]}.")
+    df.index = pd.Index(df[list(columns)].astype(str).agg("_".join, axis=1), name="_".join(columns))
+    return df.drop(columns=list(columns))
+
+
+def _read_coordinates(path: Path, *, cell_id: str | Sequence[str] | None, skiprows: int) -> pd.DataFrame:
+    if cell_id is not None and not isinstance(cell_id, str):
+        df = _composite_index(_read_delimited(path, skiprows, dtype=dict.fromkeys(cell_id, str)), cell_id, path.name)
+        if not df.index.is_unique:
+            dup = df.index[df.index.duplicated()].unique()[:5].tolist()
+            raise ValueError(f"Found duplicate cell ids in {path.name}, for example {dup}.")
+        return df
     header = _read_delimited(path, skiprows, nrows=0).columns
     named = [c for c in header if not str(c).startswith("Unnamed:")]
     id_col = cell_id if cell_id is not None else (named[0] if named else header[0])
@@ -400,13 +427,18 @@ def _read_split(
     counts: Path,
     coordinates: Path,
     *,
-    cell_id: str | None,
+    cell_id: str | Sequence[str] | None,
     genes_as_rows: bool | None,
     skiprows: int,
 ) -> tuple[pd.DataFrame | sp.spmatrix, pd.Index, pd.DataFrame, int]:
     coords = _read_coordinates(coordinates, cell_id=cell_id, skiprows=skiprows)
+    composite = cell_id is not None and not isinstance(cell_id, str)
     X, var_names, cell_ids = _read_counts(
-        counts, genes_as_rows=genes_as_rows, coord_ids=coords.index, skiprows=skiprows
+        counts,
+        genes_as_rows=False if composite else genes_as_rows,
+        coord_ids=coords.index,
+        skiprows=skiprows,
+        id_columns=cell_id if composite else None,
     )
     obs, n_unmatched = _join_coordinates(cell_ids, coords, counts.name, coordinates.name)
     return X, var_names, obs, n_unmatched
@@ -501,7 +533,7 @@ def cell_table(
     pixel_size: float | None = None,
     x: str = "center_x",
     y: str = "center_y",
-    cell_id: str | None = None,
+    cell_id: str | Sequence[str] | None = None,
     genes_as_rows: bool | None = None,
     split_by: str | None = None,
     metadata_columns: Sequence[str] | None = None,
@@ -538,7 +570,9 @@ def cell_table(
     cell_id
         Name of the id column (of the wide file, or of the coordinates file). Defaults to the first column.
         For the wide file the first column is used even if unnamed (Vizgen exports keep the EntityID there);
-        for a coordinates file unnamed index columns are skipped.
+        for a coordinates file unnamed index columns are skipped. With a ``coordinates`` file it can also be a
+        list of columns present in both files, whose values joined with ``_`` are the cell id: CosMx flat files key
+        ``exprMat_file`` and ``metadata_file`` by ``["fov", "cell_ID"]``.
     genes_as_rows
         Orientation of a separate counts file (``True``: genes in rows). ``None`` infers it from which axis
         matches the coordinate cell ids. Not used by the wide layout.
@@ -599,6 +633,8 @@ def cell_table(
     var: pd.DataFrame | None = None
     if layer is not None and not name.endswith(".h5ad"):
         raise ValueError(f"layer={layer!r} only applies to .h5ad input, not {counts.name}.")
+    if cell_id is not None and not isinstance(cell_id, str) and (coordinates is None or name.endswith(".h5ad")):
+        raise ValueError("A list of cell_id columns needs a delimited counts file and a separate coordinates file.")
     if metadata_columns is not None and coordinates is not None:
         raise ValueError(
             "metadata_columns only applies to a wide counts file; with coordinates, all its columns go to obs."

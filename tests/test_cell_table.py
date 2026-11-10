@@ -845,3 +845,29 @@ def test_coordinates_id_column_named_cell_id_writes(tmp_path: Path) -> None:
     obs = sdata["table"].obs
     assert obs.index.name is None and list(obs.index) == ["3", "5"] and list(obs["cell_id"]) == [0, 1]
     sdata.write(tmp_path / "x.zarr")
+
+
+def test_cosmx_flat_files_composite_id(tmp_path: Path) -> None:
+    # CosMx exprMat and metadata are keyed by (fov, cell_ID); cell_ID restarts in each fov
+    (tmp_path / "exprMat_file.csv").write_text("fov,cell_ID,GENE_A,GENE_B\n1,1,3,0\n1,2,0,1\n2,1,5,2\n")
+    (tmp_path / "metadata_file.csv").write_text(
+        "fov,cell_ID,CenterX_global_px,CenterY_global_px,cell_id\n2,1,900,40,c_1_2_1\n1,1,100,20,c_1_1_1\n1,2,110,25,c_1_1_2\n"
+    )
+    sdata = cell_table(
+        tmp_path / "exprMat_file.csv",
+        tmp_path / "metadata_file.csv",
+        unit="px",
+        pixel_size=0.12028,
+        x="CenterX_global_px",
+        y="CenterY_global_px",
+        cell_id=["fov", "cell_ID"],
+    )
+    t = sdata.tables["table"]
+    assert list(t.var_names) == ["GENE_A", "GENE_B"]
+    assert t.obs.index.tolist() == ["1_1", "1_2", "2_1"]  # counts order, joined on (fov, cell_ID)
+    assert t.obs["cell_id_original"].tolist() == ["c_1_1_1", "c_1_1_2", "c_1_2_1"]
+    np.testing.assert_array_equal(
+        np.asarray(t.X.todense() if hasattr(t.X, "todense") else t.X), [[3, 0], [0, 1], [5, 2]]
+    )
+    with pytest.raises(ValueError, match="separate coordinates file"):
+        cell_table(tmp_path / "exprMat_file.csv", unit="px", pixel_size=0.12, cell_id=["fov", "cell_ID"])
