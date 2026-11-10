@@ -207,16 +207,16 @@ def test_keypoints_check(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> No
     assert _check_keypoints(tmp_path) is None
 
 
-def test_similarity_from_keypoints_reproduces_alignment(tmp_path: Path) -> None:
-    from spatialdata_io.readers.xenium import _similarity_from_keypoints
+def test_affine_from_keypoints_reproduces_alignment(tmp_path: Path) -> None:
+    from spatialdata_io.readers.xenium import _affine_from_keypoints
 
-    # a rotation by -90 degrees, scale 1.289 (the Atera v1 kidney alignment, rounded)
-    affine = np.array([[0.0086, 1.2889, 914.1], [-1.2889, 0.0086, 32040.6], [0.0, 0.0, 1.0]])
+    # about the Atera v1 kidney alignment, with 0.2% anisotropy as in the preview scans
+    affine = np.array([[0.0086, 1.2898, 914.1], [-1.2871, 0.0086, 32040.6], [0.0, 0.0, 1.0]])
     src = np.array([[16690.0, 14065.0], [22114.0, 25667.0], [13029.0, 25846.0], [16798.0, 35944.0]])
     dst = (np.c_[src, np.ones(len(src))] @ affine.T)[:, :2]
     kp = pd.DataFrame({"fixedX": dst[:, 0], "fixedY": dst[:, 1], "alignmentX": src[:, 0], "alignmentY": src[:, 1]})
     kp.to_csv(tmp_path / "S1_keypoints.csv", index=False)
-    m = _similarity_from_keypoints(tmp_path / "S1_keypoints.csv").to_affine_matrix(
+    m = _affine_from_keypoints(tmp_path / "S1_keypoints.csv").to_affine_matrix(
         input_axes=("x", "y"), output_axes=("x", "y")
     )
     np.testing.assert_allclose(m, affine, atol=1e-6)

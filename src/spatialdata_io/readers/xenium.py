@@ -1220,30 +1220,23 @@ def _add_aligned_images(
             keypoints = [f for f in csv_files if f.name.endswith("keypoints.csv")]
             if alignment_file is None and element_name == "he_image" and len(keypoints) == 1:
                 # bundles with keypoints but no alignment CSV (the Atera previews): 10x's alignment CSV is the
-                # least-squares similarity fit to the keypoints, so the same fit places the image
-                set_transformation(image, _similarity_from_keypoints(keypoints[0]), "global")
-                logging.info(f"{file.name} placed by a similarity fit to {keypoints[0].name} (no alignment CSV).")
+                # least-squares fit to the keypoints, so an affine fit to them places the image
+                set_transformation(image, _affine_from_keypoints(keypoints[0]), "global")
+                logging.info(f"{file.name} placed by an affine fit to {keypoints[0].name} (no alignment CSV).")
             images[element_name] = image
     return images
 
 
-def _similarity_from_keypoints(kp_file: Path) -> Affine:
-    """Fit the least-squares similarity from the keypoints' aligned-image px onto their morphology px.
+def _affine_from_keypoints(kp_file: Path) -> Affine:
+    """Fit the least-squares affine from the keypoints' aligned-image px onto their morphology px.
 
-    Rotation, uniform scale and translation, no reflection (``alignmentX/Y`` -> ``fixedX/Y``).
+    ``alignmentX/Y`` -> ``fixedX/Y``. A full affine rather than a similarity: the Atera preview scans carry about 0.2% anisotropy, which leaves 22 px
+    residuals under a similarity fit and under 8 px under an affine (the Atera preview bundles).
     """
     kp = pd.read_csv(kp_file)
-    src = kp[["alignmentX", "alignmentY"]].to_numpy(dtype=float)
-    dst = kp[["fixedX", "fixedY"]].to_numpy(dtype=float)
-    a, b = src - src.mean(0), dst - dst.mean(0)
-    u, sv, vt = np.linalg.svd(a.T @ b)
-    d = np.diag([1.0, np.sign(np.linalg.det(u @ vt))])
-    rot = (u @ d @ vt).T
-    scale = float((sv * np.diag(d)).sum() / (a**2).sum())
-    m = np.eye(3)
-    m[:2, :2] = scale * rot
-    m[:2, 2] = dst.mean(0) - scale * rot @ src.mean(0)
-    return Affine(m, input_axes=("x", "y"), output_axes=("x", "y"))
+    src = np.c_[kp[["alignmentX", "alignmentY"]].to_numpy(dtype=float), np.ones(len(kp))]
+    coef, *_ = np.linalg.lstsq(src, kp[["fixedX", "fixedY"]].to_numpy(dtype=float), rcond=None)
+    return Affine(np.r_[coef.T, [[0.0, 0.0, 1.0]]], input_axes=("x", "y"), output_axes=("x", "y"))
 
 
 def xenium_aligned_image(
