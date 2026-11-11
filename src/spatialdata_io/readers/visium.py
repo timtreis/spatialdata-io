@@ -273,13 +273,21 @@ def visium(
         fullres_image_file = path / Path(fullres_image_file)
         if fullres_image_file.exists():
             image = _read_image(fullres_image_file, imread_kwargs)
-            inside = _fraction_inside(spot_coords, image.shape[-2:])
-            if inside < _MIN_SPOTS_INSIDE_FULLRES:
+            hires_file = path / VisiumKeys.IMAGE_HIRES_FILE
+            hires_scalef = scalefactors.get(VisiumKeys.SCALEFACTORS_HIRES)
+            in_tissue = adata.obs["in_tissue"].to_numpy() == 1 if "in_tissue" in adata.obs else None
+            reason = _not_fullres_reason(
+                image.shape[-2:],
+                spot_coords,
+                in_tissue,
+                hires_scalef,
+                _read_png(hires_file, imread_kwargs).shape[-2:] if hires_file.exists() else None,
+            )
+            if reason is not None:
                 # e.g. a deposited crop or the CytAssist capture image: not the frame the spots were measured in
                 logger.warning(
-                    f"Only {inside:.1%} of the spots fall inside {fullres_image_file.name} "
-                    f"({image.shape[-1]} x {image.shape[-2]} px), so it is not the full-resolution image the spot "
-                    "coordinates refer to; skipping it."
+                    f"{fullres_image_file.name} ({image.shape[-1]} x {image.shape[-2]} px) is not the full-resolution "
+                    f"image the spot coordinates refer to ({reason}); skipping it."
                 )
             else:
                 full_image = DataArray(image, dims=("c", "y", "x"))
@@ -364,8 +372,38 @@ def _read_image(image_file: Path, imread_kwargs: dict[str, Any]) -> Any:
     return image
 
 
-# a full-resolution image must contain (almost) all spots; deposited crops and CytAssist images do not
+# a full-resolution image must contain (almost) all in-tissue spots; deposited crops and CytAssist images do not
 _MIN_SPOTS_INSIDE_FULLRES = 0.99
+# Space Ranger makes the hires image by scaling the full-resolution image by tissue_hires_scalef (then rounding)
+_MAX_HIRES_SIZE_ERROR = 0.01
+
+
+def _not_fullres_reason(
+    shape_yx: tuple[int, ...],
+    spot_xy: np.ndarray,
+    in_tissue: np.ndarray | None,
+    hires_scalef: float | None,
+    hires_shape_yx: tuple[int, ...] | None,
+) -> str | None:
+    """Why an image is not the full-resolution image the spots were measured in, or ``None`` if it is.
+
+    With a hires image and its scale factor, the image must scale to the hires image's size: an image merely larger
+    than the spot array passes a containment test but not this one. Otherwise at least 99% of the in-tissue spots
+    (all spots without an ``in_tissue`` flag) must fall inside it, so an image cropped to the tissue is kept.
+    """
+    if hires_scalef is not None and hires_shape_yx is not None:
+        err = max(abs(n * hires_scalef - m) / m for n, m in zip(shape_yx, hires_shape_yx, strict=True))
+        if err > _MAX_HIRES_SIZE_ERROR:
+            return (
+                f"scaled by tissue_hires_scalef {hires_scalef:g} it is off from the "
+                f"{hires_shape_yx[-1]} x {hires_shape_yx[-2]} px hires image by {err:.1%}"
+            )
+        return None
+    xy = spot_xy if in_tissue is None or not in_tissue.any() else spot_xy[in_tissue]
+    inside = _fraction_inside(xy, shape_yx)
+    if inside < _MIN_SPOTS_INSIDE_FULLRES:
+        return f"only {inside:.1%} of the {'in-tissue ' if in_tissue is not None else ''}spots fall inside it"
+    return None
 
 
 def _fraction_inside(spot_xy: np.ndarray, shape_yx: tuple[int, ...]) -> float:
