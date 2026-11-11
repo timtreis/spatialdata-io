@@ -176,6 +176,22 @@ def test_radius_from_area(tmp_path: Path) -> None:
     assert np.isclose(radius["min"], 5.0, atol=1e-3)
 
 
+def test_radius_from_area_column(tmp_path: Path) -> None:
+    # CosMx-style: px coordinates, area in px^2 under its own name; radius = sqrt(A / pi) px = 10 px = 5 um
+    rows = [r.replace(",523.6,", ",314.159265,", 1) for r in ROWS[:1]] + ROWS[1:]
+    path = _write(tmp_path / "a.csv", rows, HEADER.replace("volume", "Area"))
+    kw = {"unit": "px", "pixel_size": 0.5, "metadata_columns": ["Area", "center_x", "center_y"]}
+    sdata = cell_table(path, area_column="Area", **kw)
+    radius = sdata.tables["table"].uns["spatialdata_io"]["radius"]
+    assert radius["source"] == "derived:Area"
+    assert np.isclose(sdata["cells"]["radius"].to_numpy()[0], 10.0)
+    assert np.isclose(radius["min"], 0.5 * np.sqrt(113.1 / np.pi))  # c3, in um
+    with pytest.raises(ValueError, match="not both"):
+        cell_table(path, area_column="Area", cell_radius=3.0, **kw)
+    with pytest.raises(ValueError, match="Missing"):
+        cell_table(path, area_column="Area.um2", **kw)
+
+
 def test_uns_metadata(csv: Path) -> None:
     uns = cell_table(csv, unit="px", pixel_size=0.108).tables["table"].uns["spatialdata_io"]
     assert uns["reader"] == "cell_table"

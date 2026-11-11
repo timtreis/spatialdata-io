@@ -80,9 +80,17 @@ def _positive(obs: pd.DataFrame, column: str) -> np.ndarray:
     return values
 
 
-def _resolve_radius(obs: pd.DataFrame, unit: str, cell_radius: float | None) -> tuple[str, float | np.ndarray]:
+def _resolve_radius(
+    obs: pd.DataFrame, unit: str, cell_radius: float | None, area_column: str | None, factor: float
+) -> tuple[str, float | np.ndarray]:
+    if cell_radius is not None and area_column is not None:
+        raise ValueError("Pass cell_radius or area_column, not both.")
     if cell_radius is not None:
         return "stated", float(cell_radius)
+    if area_column is not None:
+        if area_column not in obs.columns:
+            raise ValueError(f"Missing area_column {area_column!r} in the cell metadata.")
+        return f"derived:{area_column}", factor * np.sqrt(_positive(obs, area_column) / np.pi)
     if unit == "um":
         if "volume" in obs.columns:
             volume = _positive(obs, "volume")
@@ -105,6 +113,7 @@ def _build(
     split_by: str | None,
     cell_radius: float | None,
     n_coordinates_unmatched: int,
+    area_column: str | None = None,
     coordinate_labels: tuple[str, str] | None = None,
     var: pd.DataFrame | None = None,
 ) -> SpatialData:
@@ -118,7 +127,7 @@ def _build(
         Gene names; columns containing ``blank`` (case-insensitive) go to ``obsm["blank"]``.
     obs
         Per-cell metadata indexed by the string cell id; must contain the ``x`` and ``y`` columns.
-    unit, pixel_size, x, y, split_by, cell_radius
+    unit, pixel_size, x, y, split_by, cell_radius, area_column
         See :func:`cell_table`.
     n_coordinates_unmatched
         Number of coordinate rows dropped because they have no counts; recorded in ``uns``.
@@ -189,7 +198,7 @@ def _build(
     # the string ids stay the index; an index named like the id column ("cell_id") clashes with the instance key on write
     obs.index.name = None
     transformation, factor = _transformation(unit, pixel_size)
-    source, radius_um = _resolve_radius(obs, unit, cell_radius)
+    source, radius_um = _resolve_radius(obs, unit, cell_radius, area_column, factor)
 
     var_frame = var.loc[is_gene] if var is not None else pd.DataFrame(index=var_names[is_gene])
     adata = ad.AnnData(X=genes, obs=obs, var=var_frame)
@@ -540,6 +549,7 @@ def cell_table(
     skiprows: int = 0,
     layer: str | None = None,
     cell_radius: float | None = None,
+    area_column: str | None = None,
 ) -> SpatialData:
     """Read a cell x gene counts table with per-cell centroids.
 
@@ -603,6 +613,10 @@ def cell_table(
         ``table.uns["spatialdata_io"]["radius"]`` together with the median, minimum and maximum radius
         over all cells in µm (``median``, ``min``, ``max``). The per-cell radius is the ``radius`` column
         of the shapes.
+    area_column
+        Metadata column holding each cell's area in the coordinate unit squared (e.g. px² for ``unit="px"``).
+        The radius is derived per cell as ``sqrt(A / π)``, converted to µm, and recorded as
+        ``derived:<area_column>``. Cannot be combined with `cell_radius`.
 
     Returns
     -------
@@ -678,6 +692,7 @@ def cell_table(
         y=y,
         split_by=split_by,
         cell_radius=cell_radius,
+        area_column=area_column,
         n_coordinates_unmatched=n_unmatched,
         coordinate_labels=(labels[x], labels[y]) if labels else None,
         var=var,
