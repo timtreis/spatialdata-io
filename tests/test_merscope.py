@@ -12,6 +12,7 @@ import pytest
 import shapely
 from scipy.sparse import issparse
 from shapely.geometry import MultiPolygon, Polygon
+from spatialdata import read_zarr
 from spatialdata.transformations import Identity, get_transformation
 
 from spatialdata_io._constants._constants import MerscopeKeys
@@ -133,8 +134,31 @@ def test_table_is_sparse_and_values_aligned(tmp_path: Path) -> None:
     # values / var names stay correct (reader preserves the count-matrix row order)
     counts = pd.read_csv(region / "cell_by_gene.csv", index_col=0)
     np.testing.assert_array_equal(adata.to_df()[GENES].to_numpy(), counts[GENES].to_numpy())
-    assert list(adata.var_names) == GENES
-    assert adata.obsm["blank"].shape[1] == len(BLANKS)
+    assert list(adata.var_names) == GENES + BLANKS
+
+
+def test_blanks_stay_in_x(tmp_path: Path) -> None:
+    region = _write_dataset(tmp_path)
+    sdata = merscope(region, mosaic_images=False, transcripts=False, cells_boundaries=False)
+    table = sdata["table"]
+    counts = pd.read_csv(region / "cell_by_gene.csv", index_col=0)
+    assert table.var_names.tolist() == counts.columns.tolist()
+    assert table.var["feature_types"].tolist() == ["Gene Expression"] * len(GENES) + ["Blank Codeword"] * len(BLANKS)
+    np.testing.assert_array_equal(table.X.toarray(), counts.to_numpy())
+    assert "blank" not in table.obsm
+
+    sdata.write(tmp_path / "x.zarr")
+    back = read_zarr(tmp_path / "x.zarr")["table"]
+    pd.testing.assert_frame_equal(back.var, table.var)
+    np.testing.assert_array_equal(back.X.toarray(), counts.to_numpy())
+
+
+def test_drop_controls(tmp_path: Path) -> None:
+    region = _write_dataset(tmp_path)
+    table = merscope(region, mosaic_images=False, transcripts=False, cells_boundaries=False, controls="drop")["table"]
+    counts = pd.read_csv(region / "cell_by_gene.csv", index_col=0)
+    assert table.var_names.tolist() == GENES
+    np.testing.assert_array_equal(table.X.toarray(), counts[GENES].to_numpy())
 
 
 def test_reading_does_not_warn_about_deprecated_dtype(tmp_path: Path) -> None:
@@ -297,7 +321,7 @@ def test_geo_export_unnamed_id_column_and_shuffled_metadata(tmp_path: Path) -> N
     assert list(table.obs_names) == ids
     np.testing.assert_array_equal(table.obs["center_x"].to_numpy(), meta["center_x"].to_numpy())
     np.testing.assert_array_equal(table.to_df()[GENES].to_numpy(), counts[GENES].to_numpy())
-    assert list(table.obsm["blank"].index) == ids
+    np.testing.assert_array_equal(table.to_df()[BLANKS].to_numpy(), counts[BLANKS].to_numpy())
 
 
 def test_counts_cells_missing_from_metadata_raise(tmp_path: Path) -> None:

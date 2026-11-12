@@ -25,6 +25,7 @@ from spatialdata.transformations import Affine, BaseTransformation, Identity
 
 from spatialdata_io._constants._constants import MerscopeKeys
 from spatialdata_io._docs import inject_docs
+from spatialdata_io.readers._utils._features import BLANK_NAME_RULES, feature_types_by_name, split_by_feature_type
 from spatialdata_io.readers._utils._utils import _set_observation_unit, _set_reader_metadata
 
 if TYPE_CHECKING:
@@ -118,6 +119,7 @@ def merscope(
     cells_boundaries: bool = True,
     cells_table: bool = True,
     mosaic_images: bool = True,
+    controls: Literal["keep", "drop"] = "keep",
     imread_kwargs: Mapping[str, Any] = MappingProxyType({}),
     image_models_kwargs: Mapping[str, Any] = MappingProxyType({}),
 ) -> SpatialData:
@@ -169,6 +171,10 @@ def merscope(
         Whether to read cells table.
     mosaic_images
         Whether to read the mosaic images.
+    controls
+        ``"keep"`` keeps the blank codewords in the table, ``"drop"`` removes them. Every feature is typed in
+        ``var["feature_types"]`` by name: one containing ``blank`` (case-insensitive) is ``Blank Codeword``, the
+        rest ``Gene Expression``.
     imread_kwargs
         Keyword arguments to pass to the image reader.
     image_models_kwargs
@@ -260,11 +266,13 @@ def merscope(
 
     if cells_table:
         if obs_path.exists() and count_path.exists():
-            tables["table"] = _get_table(count_path, obs_path, vizgen_region, slide_name, dataset_id, region)
+            tables["table"] = _get_table(
+                count_path, obs_path, vizgen_region, slide_name, dataset_id, region, controls=controls
+            )
         elif obs_path.exists() and transcript_path.exists():
             logger.warning(f"{count_path.name} not found; counting the transcripts of {transcript_path.name} per cell.")
             tables["table"] = _get_table(
-                count_path, obs_path, vizgen_region, slide_name, dataset_id, region, transcript_path
+                count_path, obs_path, vizgen_region, slide_name, dataset_id, region, transcript_path, controls=controls
             )
         else:
             logger.warning(
@@ -510,6 +518,7 @@ def _get_table(
     dataset_id: str,
     region: str,
     transcript_path: Path | None = None,
+    controls: Literal["keep", "drop"] = "keep",
 ) -> anndata.AnnData:
     obs = _read_csv_str_index(obs_path)
     if count_path.exists() or transcript_path is None:
@@ -529,15 +538,12 @@ def _get_table(
         )
     obs = obs.loc[data.index]
 
-    is_gene = ~data.columns.str.lower().str.contains("blank")
-    genes = data.loc[:, is_gene]
-    adata = anndata.AnnData(genes, obs=obs)
     # Store counts as a sparse matrix, like the other scverse readers (xenium/cosmx/...): MERSCOPE
     # matrices are only ~10% dense, so a dense `int64` X wastes roughly an order of magnitude of memory.
-    adata.X = csr_matrix(genes.to_numpy())
+    adata = anndata.AnnData(csr_matrix(data.to_numpy()), obs=obs, var=pd.DataFrame(index=data.columns.astype(str)))
+    adata.var["feature_types"] = feature_types_by_name(adata.var_names, BLANK_NAME_RULES)
 
     assert isinstance(adata.obs, pd.DataFrame)
-    adata.obsm["blank"] = data.loc[:, ~is_gene]  # blank fields are excluded from adata.X
     adata.obsm["spatial"] = adata.obs[[MerscopeKeys.CELL_X, MerscopeKeys.CELL_Y]].values
     adata.obs["region"] = pd.Series(vizgen_region, index=adata.obs_names, dtype="category")
     adata.obs["slide"] = pd.Series(slide_name, index=adata.obs_names, dtype="category")
@@ -545,6 +551,7 @@ def _get_table(
     adata.obs[MerscopeKeys.REGION_KEY] = pd.Series(region, index=adata.obs_names, dtype="category")
     adata.obs[MerscopeKeys.METADATA_CELL_KEY] = adata.obs.index
 
+    adata = split_by_feature_type(adata, controls=controls)["table"]  # by name only genes and blanks
     sanitize_table(adata)  # lab-added metadata columns such as "Custom cell groups" (GSE269617)
     table = TableModel.parse(
         adata,
