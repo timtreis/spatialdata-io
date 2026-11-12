@@ -14,6 +14,12 @@ from spatialdata._logging import logger
 from spatialdata.models import ShapesModel, TableModel
 from spatialdata.transformations import BaseTransformation, Identity, Scale
 
+from spatialdata_io.readers._utils._features import (
+    BLANK_NAME_RULES,
+    FEATURE_TYPES,
+    feature_types_by_name,
+    split_by_feature_type,
+)
 from spatialdata_io.readers._utils._utils import _set_observation_unit, _set_reader_metadata
 
 if TYPE_CHECKING:
@@ -116,6 +122,7 @@ def _build(
     area_column: str | None = None,
     coordinate_labels: tuple[str, str] | None = None,
     var: pd.DataFrame | None = None,
+    controls: Literal["keep", "drop"] = "keep",
 ) -> SpatialData:
     """Validate counts and assemble the SpatialData object.
 
@@ -124,7 +131,7 @@ def _build(
     X
         Cells x genes counts, in the row order of ``obs``.
     var_names
-        Gene names; columns containing ``blank`` (case-insensitive) go to ``obsm["blank"]``.
+        Feature names; those containing ``blank`` (case-insensitive) are typed ``Blank Codeword``.
     obs
         Per-cell metadata indexed by the string cell id; must contain the ``x`` and ``y`` columns.
     unit, pixel_size, x, y, split_by, cell_radius, area_column
@@ -134,7 +141,10 @@ def _build(
     coordinate_labels
         Names recorded in ``uns`` for ``x`` and ``y`` instead of the column names (e.g. for ``obsm`` sources).
     var
-        Per-gene metadata indexed by ``var_names`` (e.g. from an h5ad file); gene rows are kept in ``table.var``.
+        Per-feature metadata indexed by ``var_names`` (e.g. from an h5ad file), kept in ``table.var``. Its
+        ``feature_types`` column, if any, types the features instead of the names.
+    controls
+        See :func:`cell_table`.
     """
     for col in (x, y):
         if col not in obs.columns:
@@ -185,13 +195,10 @@ def _build(
             "Found non-integer values in the counts; this looks like a normalized matrix. "
             "cell_table() only reads raw integer counts."
         )
-    is_gene = ~var_names.str.lower().str.contains("blank")
-    genes = csr[:, np.flatnonzero(is_gene)]
     i32 = np.iinfo(np.int32)
-    fits = genes.data.size == 0 or (genes.data.min() >= 0 and genes.data.max() <= i32.max)
+    fits = csr.data.size == 0 or (csr.data.min() >= 0 and csr.data.max() <= i32.max)
     x_dtype = "int32" if fits else "int64"
-    genes = sp.csr_matrix(genes.astype(x_dtype))
-    blank = pd.DataFrame(csr[:, np.flatnonzero(~is_gene)].toarray(), index=obs.index, columns=var_names[~is_gene])
+    csr = sp.csr_matrix(csr.astype(x_dtype))
 
     n = len(obs)
     obs[_INSTANCE_KEY] = np.arange(n)
@@ -200,10 +207,11 @@ def _build(
     transformation, factor = _transformation(unit, pixel_size)
     source, radius_um = _resolve_radius(obs, unit, cell_radius, area_column, factor)
 
-    var_frame = var.loc[is_gene] if var is not None else pd.DataFrame(index=var_names[is_gene])
-    adata = ad.AnnData(X=genes, obs=obs, var=var_frame)
+    var_frame = var.copy() if var is not None else pd.DataFrame(index=var_names)
+    if FEATURE_TYPES not in var_frame:
+        var_frame[FEATURE_TYPES] = feature_types_by_name(var_frame.index, BLANK_NAME_RULES)
+    adata = ad.AnnData(X=csr, obs=obs, var=var_frame)
     adata.obsm["spatial"] = obs[[x, y]].to_numpy(dtype=float)
-    adata.obsm["blank"] = blank
 
     adata.obs[_REGION_KEY] = pd.Categorical(region_of)
 
@@ -234,7 +242,7 @@ def _build(
         "x_dtype": x_dtype,
         "n_coordinates_unmatched": n_coordinates_unmatched,
     }
-    sdata = SpatialData(shapes=shapes_by_region, tables={"table": table})
+    sdata = SpatialData(shapes=shapes_by_region, tables=split_by_feature_type(table, controls=controls))
     for table in sdata.tables.values():
         _set_observation_unit(table, "cell", None)
     return _set_reader_metadata(sdata, "cell_table")
@@ -550,13 +558,15 @@ def cell_table(
     layer: str | None = None,
     cell_radius: float | None = None,
     area_column: str | None = None,
+    controls: Literal["keep", "drop"] = "keep",
 ) -> SpatialData:
     """Read a cell x gene counts table with per-cell centroids.
 
     Reads a single wide delimited file holding the id, the centroids, optional metadata and one column per
     gene (cells x genes); a counts file (delimited in either orientation, or ``.mtx(.gz)`` with label files
     next to it) plus a separate ``coordinates`` file; or an ``.h5ad`` file. The raw integer counts go to
-    ``table.X`` (CSR), columns whose name contains ``blank`` (case-insensitive) go to ``table.obsm["blank"]``,
+    ``table.X`` (CSR) with every column, typed in ``table.var["feature_types"]`` (``Blank Codeword`` for a name
+    containing ``blank``, case-insensitive, else ``Gene Expression``),
     the deposited centroids to ``table.obsm["spatial"]``, and each cell becomes a circle in the ``cells``
     shapes element.
 
@@ -617,6 +627,10 @@ def cell_table(
         Metadata column holding each cell's area in the coordinate unit squared (e.g. px² for ``unit="px"``).
         The radius is derived per cell as ``sqrt(A / π)``, converted to µm, and recorded as
         ``derived:<area_column>``. Cannot be combined with `cell_radius`.
+    controls
+        ``"keep"`` keeps the blank codewords (and any other control type an h5ad ``var["feature_types"]`` names)
+        in ``table``, ``"drop"`` removes them. Protein and other types of such a column go to ``table_protein`` and
+        ``table_<type>``.
 
     Returns
     -------
@@ -696,5 +710,6 @@ def cell_table(
         n_coordinates_unmatched=n_unmatched,
         coordinate_labels=(labels[x], labels[y]) if labels else None,
         var=var,
+        controls=controls,
     )
     return sdata

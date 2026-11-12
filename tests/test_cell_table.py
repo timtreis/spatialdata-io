@@ -46,9 +46,11 @@ def test_wide_csv_basic(csv: Path) -> None:
     uns = sdata["table"].uns["spatialdata_io"]
     assert (uns["observation_unit"], uns["unit_size_um"]) == ("cell", None)
     table = sdata.tables["table"]
-    assert table.shape == (3, 2)
-    assert list(table.var_names) == ["GeneA", "GeneB"]
-    assert table.obsm["blank"].shape == (3, 1)
+    assert table.shape == (3, 3)
+    assert list(table.var_names) == ["GeneA", "GeneB", "Blank-1"]
+    assert list(table.var["feature_types"]) == ["Gene Expression", "Gene Expression", "Blank Codeword"]
+    assert table.X.toarray().tolist() == [[1, 2, 0], [3, 0, 1], [0, 5, 2]]
+    assert table.var["feature_types"].tolist().count("Blank Codeword") == 1
     assert "cells" in sdata.shapes
     assert isinstance(get_transformation(sdata["cells"], "global"), Identity)
     assert list(table.obs.index) == ["c1", "c2", "c3"]
@@ -341,7 +343,7 @@ def test_roundtrip(csv: Path, tmp_path: Path) -> None:
     p = tmp_path / "out.zarr"
     sdata.write(p)
     back = SpatialData.read(p)
-    assert back.tables["table"].shape == (3, 2)
+    assert back.tables["table"].shape == (3, 3)
     assert back.tables["table"].uns["spatialdata_io"]["coordinates"]["unit"] == "um"
 
 
@@ -361,8 +363,8 @@ def test_build_sparse() -> None:
         n_coordinates_unmatched=0,
     )
     table = sdata.tables["table"]
-    assert table.shape == (2, 2)
-    assert table.obsm["blank"].shape == (2, 1)
+    assert table.shape == (2, 3)
+    assert table.var["feature_types"].tolist().count("Blank Codeword") == 1
     assert sp.issparse(table.X)
 
 
@@ -396,16 +398,16 @@ def _split_files(
 def test_split_genes_by_cells(tmp_path: Path) -> None:
     counts, coords, mat = _split_files(tmp_path)
     table = cell_table(counts, coords, unit="um", x="X", y="Y", cell_id="cells").tables["table"]
-    assert table.shape == (20, 2)
-    assert table.obsm["blank"].shape == (20, 1)
-    np.testing.assert_array_equal(_dense(table.X), mat[:, :2])
+    assert table.shape == (20, 3)
+    assert table.var["feature_types"].tolist().count("Blank Codeword") == 1
+    np.testing.assert_array_equal(_dense(table.X), mat)
     assert list(table.obs["X"]) == list(np.arange(20.0))
 
 
 def test_split_cells_by_genes(tmp_path: Path) -> None:
     counts, coords, mat = _split_files(tmp_path, genes_as_rows=False)
     table = cell_table(counts, coords, unit="um", x="X", y="Y", cell_id="cells").tables["table"]
-    np.testing.assert_array_equal(_dense(table.X), mat[:, :2])
+    np.testing.assert_array_equal(_dense(table.X), mat)
 
 
 def test_explicit_orientation_wins(tmp_path: Path) -> None:
@@ -431,9 +433,9 @@ def test_mtx_triplet(tmp_path: Path) -> None:
             f.write("\n".join(labels) + "\n")
     table = cell_table(mtx, coords, unit="um", x="X", y="Y", cell_id="cells").tables["table"]
     assert sp.issparse(table.X)
-    assert table.shape == (20, 2)
-    np.testing.assert_array_equal(table.X.toarray(), mat[:, :2])  # type: ignore[attr-defined]
-    assert table.obsm["blank"].shape == (20, 1)
+    assert table.shape == (20, 3)
+    np.testing.assert_array_equal(table.X.toarray(), mat)  # type: ignore[attr-defined]
+    assert table.var["feature_types"].tolist().count("Blank Codeword") == 1
 
 
 def test_mtx_missing_siblings(tmp_path: Path) -> None:
@@ -450,14 +452,14 @@ def test_gzip_tsv_counts(tmp_path: Path) -> None:
     with gzip.open(gz, "wb") as f:
         f.write(counts.read_bytes())
     table = cell_table(gz, coords, unit="um", x="X", y="Y", cell_id="cells").tables["table"]
-    np.testing.assert_array_equal(_dense(table.X), mat[:, :2])
+    np.testing.assert_array_equal(_dense(table.X), mat)
 
 
 def test_join_numeric_vs_string_ids(tmp_path: Path) -> None:
     counts, coords, mat = _split_files(tmp_path, ids=[str(i) for i in range(20)])
     table = cell_table(counts, coords, unit="um", x="X", y="Y", cell_id="cells").tables["table"]
     assert list(table.obs.index) == [str(i) for i in range(20)]
-    np.testing.assert_array_equal(_dense(table.X), mat[:, :2])
+    np.testing.assert_array_equal(_dense(table.X), mat)
 
 
 def test_unnamed_index_column(tmp_path: Path) -> None:
@@ -466,7 +468,7 @@ def test_unnamed_index_column(tmp_path: Path) -> None:
     lines = [",cell,x,y"] + [f"{i},c{i},{i}.5,1.5" for i in range(20)]
     cpath.write_text("\n".join(lines) + "\n")
     table = cell_table(counts, cpath, unit="um", x="x", y="y", cell_id="cell").tables["table"]
-    assert table.shape == (20, 2)
+    assert table.shape == (20, 3)
     assert not any(c.startswith("Unnamed") for c in table.obs.columns)
 
 
@@ -533,7 +535,7 @@ def test_unnamed_index_column_default(tmp_path: Path) -> None:
     cpath = tmp_path / "centroids.csv"
     cpath.write_text("\n".join([",cell,x,y"] + [f"{i},c{i},{i}.5,1.5" for i in range(20)]) + "\n")
     table = cell_table(counts, cpath, unit="um", x="x", y="y").tables["table"]
-    assert table.shape == (20, 2)
+    assert table.shape == (20, 3)
     assert list(table.obs.index)[:2] == ["c0", "c1"]
     assert not any(c.startswith("Unnamed") for c in table.obs.columns)
 
@@ -593,8 +595,8 @@ def test_h5ad_obs_coords(tmp_path: Path) -> None:
     table = sdata["table"]
     assert list(table.obs.index) == ["c1", "c2"]
     assert all(isinstance(i, str) for i in table.obs.index)
-    assert list(table.var_names) == ["g1", "g2"]
-    assert table.obsm["blank"].shape == (2, 1)
+    assert list(table.var_names) == ["g1", "g2", "blank-1"]
+    assert table.var["feature_types"].tolist().count("Blank Codeword") == 1
     assert table.uns["spatialdata_io"]["coordinates"]["x"] == "center_x"
     assert sdata["cells"].shape[0] == 2
 
@@ -643,7 +645,7 @@ def test_h5ad_layer_counts(tmp_path: Path) -> None:
         layers={"counts": np.array([[1, 2, 0], [3, 0, 4]])},
     )
     table = cell_table(f, unit="um", layer="counts")["table"]
-    assert table.X.toarray().tolist() == [[1, 2], [3, 0]]
+    assert table.X.toarray().tolist() == [[1, 2, 0], [3, 0, 4]]
 
 
 def test_h5ad_raw(tmp_path: Path) -> None:
@@ -654,9 +656,9 @@ def test_h5ad_raw(tmp_path: Path) -> None:
         raw=(np.array([[5, 6, 0, 1], [7, 0, 8, 2]]), ["r1", "r2", "r3", "blank-9"]),
     )
     table = cell_table(f, unit="um", layer="raw")["table"]
-    assert list(table.var_names) == ["r1", "r2", "r3"]
-    assert table.X.toarray().tolist() == [[5, 6, 0], [7, 0, 8]]
-    assert list(table.obsm["blank"].columns) == ["blank-9"]
+    assert list(table.var_names) == ["r1", "r2", "r3", "blank-9"]
+    assert table.X.toarray().tolist() == [[5, 6, 0, 1], [7, 0, 8, 2]]
+    assert table.var.loc["blank-9", "feature_types"] == "Blank Codeword"
 
 
 def test_h5ad_missing_layer(tmp_path: Path) -> None:
@@ -705,8 +707,7 @@ def test_x_is_csr_on_every_path(csv: Path, tmp_path: Path) -> None:
     ]
     for table in tables:
         assert type(table.X) is sp.csr_matrix
-    np.testing.assert_array_equal(tables[0].X.toarray(), [[1, 2], [3, 0], [0, 5]])  # type: ignore[union-attr]
-    np.testing.assert_array_equal(tables[0].obsm["blank"], [[0], [1], [2]])
+    np.testing.assert_array_equal(tables[0].X.toarray(), [[1, 2, 0], [3, 0, 1], [0, 5, 2]])  # type: ignore[union-attr]
 
 
 def test_wide_string_column_rejected(tmp_path: Path) -> None:
@@ -718,7 +719,7 @@ def test_wide_string_column_rejected(tmp_path: Path) -> None:
 def test_wide_trailing_comma(tmp_path: Path) -> None:
     f = _write(tmp_path / "t.csv", [r + "," for r in ROWS], HEADER + ",")
     table = cell_table(f, unit="um")["table"]
-    assert list(table.var_names) == ["GeneA", "GeneB"]
+    assert list(table.var_names) == ["GeneA", "GeneB", "Blank-1"]
     assert list(table.obs.columns).count("fov") == 1
     assert not any(c.startswith("Unnamed") for c in table.obs.columns)
 
@@ -804,7 +805,7 @@ def test_h5ad_keeps_var_columns(tmp_path: Path) -> None:
     adata.var["symbol"] = ["A", "B", "C"]
     adata.write_h5ad(f)
     table = cell_table(f, unit="um")["table"]
-    assert list(table.var["symbol"]) == ["A", "B"]
+    assert list(table.var["symbol"]) == ["A", "B", "C"]
     f = _h5ad(
         tmp_path / "b.h5ad",
         obs_cols={"center_x": [1.0, 2.0], "center_y": [3.0, 4.0]},
@@ -837,7 +838,7 @@ def test_mtx_geo_prefixed_names(tmp_path: Path) -> None:
         with gzip.open(tmp_path / name, "wt") as f:
             f.write("\n".join(labels) + "\n")
     table = cell_table(mtx, coords, unit="um", x="X", y="Y", cell_id="cells")["table"]
-    np.testing.assert_array_equal(_dense(table.X), mat[:, :2])
+    np.testing.assert_array_equal(_dense(table.X), mat)
 
 
 def test_mtx_does_not_take_coordinates_as_barcodes(tmp_path: Path) -> None:
@@ -887,3 +888,29 @@ def test_cosmx_flat_files_composite_id(tmp_path: Path) -> None:
     )
     with pytest.raises(ValueError, match="separate coordinates file"):
         cell_table(tmp_path / "exprMat_file.csv", unit="px", pixel_size=0.12, cell_id=["fov", "cell_ID"])
+
+
+def test_drop_controls(csv: Path) -> None:
+    table = cell_table(csv, unit="um", controls="drop")["table"]
+    assert list(table.var_names) == ["GeneA", "GeneB"]
+    assert table.X.toarray().tolist() == [[1, 2], [3, 0], [0, 5]]
+
+
+def test_h5ad_feature_types_are_kept(tmp_path: Path) -> None:
+    f = _h5ad(tmp_path / "a.h5ad", obs_cols={"center_x": [1.0, 2.0], "center_y": [3.0, 4.0]})
+    adata = ad.read_h5ad(f)
+    adata.var["feature_types"] = ["Gene Expression", "Antibody Capture", "Gene Expression"]
+    adata.write_h5ad(f)
+    sdata = cell_table(f, unit="um")
+    assert set(sdata.tables) == {"table", "table_protein"}
+    assert list(sdata["table"].var_names) == ["g1", "blank-1"]
+    assert list(sdata["table_protein"].var_names) == ["g2"]
+    assert sdata["table_protein"].obs.equals(sdata["table"].obs)
+
+
+def test_blanks_round_trip(csv: Path, tmp_path: Path) -> None:
+    sdata = cell_table(csv, unit="um")
+    sdata.write(tmp_path / "x.zarr")
+    back = SpatialData.read(tmp_path / "x.zarr")["table"]
+    pd.testing.assert_frame_equal(back.var, sdata["table"].var)
+    assert back.X.toarray().tolist() == sdata["table"].X.toarray().tolist()
