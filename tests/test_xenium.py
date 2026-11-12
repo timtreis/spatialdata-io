@@ -7,9 +7,10 @@ import numpy as np
 import pandas as pd
 import pytest
 import zarr
+from anndata import AnnData
 from click.testing import CliRunner
 from pytest_mock import MockerFixture
-from spatialdata import match_table_to_element, read_zarr
+from spatialdata import SpatialData, match_table_to_element, read_zarr
 from spatialdata.models import get_table_keys
 
 from spatialdata_io.__main__ import xenium_wrapper
@@ -311,6 +312,129 @@ def test_warn_if_scaled_protein() -> None:
         _warn_if_scaled_protein(prot)
 
 
+_XENIUM_TABLE_ONLY = {
+    "morphology_mip": False,
+    "morphology_focus": False,
+    "aligned_images": False,
+    "transcripts": False,
+    "cells_labels": False,
+    "nucleus_labels": False,
+}
+
+
+def _xenium_with_feature_types(path: Path, retype: dict[int, str], scaling: float | None = None) -> Path:
+    """The 30-cell CSV-only bundle in ``path``, with the feature types at the given positions replaced."""
+    import shutil
+
+    import h5py
+
+    path.mkdir(exist_ok=True)
+    for f in XENIUM_CSV_ONLY.iterdir():
+        shutil.copy(f, path / f.name)
+    with h5py.File(path / "cell_feature_matrix.h5", "r+") as f:
+        types = f["matrix/features/feature_type"][:].astype(str)
+        for i, t in retype.items():
+            types[i] = t
+        del f["matrix/features/feature_type"]
+        f["matrix/features/feature_type"] = types.astype("S")
+        if scaling is not None:
+            f.attrs["protein_scaling_factor"] = scaling
+    return path
+
+
+def _source_matrix(path: Path) -> AnnData:
+    import scanpy as sc
+
+    return sc.read_10x_h5(path / "cell_feature_matrix.h5", gex_only=False)
+
+
+def _assert_every_feature_kept(sdata: SpatialData, source: AnnData) -> None:
+    names = [n for t in sdata.tables.values() for n in t.var_names]
+    assert len(names) == len(set(names)) == source.n_vars
+
+
+def test_xenium_keeps_controls() -> None:
+    sdata = xenium(XENIUM_CSV_ONLY, **_XENIUM_TABLE_ONLY)
+    source = _source_matrix(XENIUM_CSV_ONLY)
+    table = sdata["table"]
+    _assert_every_feature_kept(sdata, source)
+    assert set(sdata.tables) == {"table"}
+    # the fixture's 10x feature_type strings
+    assert table.var["feature_types"].value_counts().to_dict() == {
+        "Gene Expression": 248,
+        "Blank Codeword": 225,
+        "Negative Control Codeword": 41,
+        "Negative Control Probe": 27,
+    }
+    assert table.var_names.tolist() == source.var_names.tolist()
+    np.testing.assert_array_equal(table.X.toarray(), source[table.obs_names].X.toarray())
+
+
+def test_xenium_drop_controls() -> None:
+    keep = xenium(XENIUM_CSV_ONLY, **_XENIUM_TABLE_ONLY)["table"]
+    drop = xenium(XENIUM_CSV_ONLY, controls="drop", **_XENIUM_TABLE_ONLY)["table"]
+    genes = keep.var["feature_types"] == "Gene Expression"
+    assert drop.var_names.tolist() == keep.var_names[genes].tolist()
+    np.testing.assert_array_equal(drop.X.toarray(), keep[:, genes.to_numpy()].X.toarray())
+    pd.testing.assert_frame_equal(drop.obs, keep.obs)
+
+
+def test_xenium_controls_round_trip(tmp_path: Path) -> None:
+    sdata = xenium(XENIUM_CSV_ONLY, **_XENIUM_TABLE_ONLY)
+    sdata.write(tmp_path / "x.zarr")
+    back = read_zarr(tmp_path / "x.zarr")["table"]
+    pd.testing.assert_frame_equal(back.var, sdata["table"].var)
+    assert (back.X != sdata["table"].X).nnz == 0
+
+
+@pytest.mark.parametrize("controls", ["keep", "drop"])
+def test_xenium_protein_and_other_tables(tmp_path: Path, controls: str) -> None:
+    # positions 0-2 are genes in the fixture; make two of them protein and one a CRISPR guide
+    retype = {0: "Protein Expression", 1: "Protein Expression", 2: "CRISPR Guide Capture"}
+    path = _xenium_with_feature_types(tmp_path / "in", retype, scaling=2.0)
+    sdata = xenium(path, cells_as_circles=True, controls=controls, **_XENIUM_TABLE_ONLY)
+    source = _source_matrix(path)
+    if controls == "keep":
+        _assert_every_feature_kept(sdata, source)
+    assert set(sdata.tables) == {"table", "table_protein", "table_crispr_guide_capture"}
+
+    keys = get_table_keys(sdata["table"])
+    for name in ("table_protein", "table_crispr_guide_capture"):
+        t = sdata[name]
+        assert get_table_keys(t) == keys
+        pd.testing.assert_frame_equal(t.obs, sdata["table"].obs)
+        assert t.uns["spatialdata_io"]["observation_unit"] == "cell"
+    protein = sdata["table_protein"]
+    assert protein.var_names.tolist() == source.var_names[:2].tolist()
+    # protein counts are descaled by protein_scaling_factor, the other types are as stored
+    source = source[protein.obs_names]
+    np.testing.assert_allclose(protein.X.toarray(), source[:, :2].X.toarray() / 2.0)
+    np.testing.assert_array_equal(sdata["table_crispr_guide_capture"].X.toarray(), source[:, [2]].X.toarray())
+    sdata.write(tmp_path / "x.zarr")
+    assert set(read_zarr(tmp_path / "x.zarr").tables) == set(sdata.tables)
+
+
+@pytest.mark.parametrize(("gex_only", "n_vars"), [(True, 248), (False, 541)])
+def test_xenium_gex_only_is_deprecated(gex_only: bool, n_vars: int) -> None:
+    with pytest.warns(DeprecationWarning, match="gex_only"):
+        sdata = xenium(XENIUM_CSV_ONLY, gex_only=gex_only, **_XENIUM_TABLE_ONLY)
+    assert sdata["table"].n_vars == n_vars
+
+
+def test_xenium_gex_only_keeps_protein(tmp_path: Path) -> None:
+    path = _xenium_with_feature_types(tmp_path / "in", {0: "Protein Expression"})
+    with pytest.warns(DeprecationWarning, match="gex_only"):
+        sdata = xenium(path, gex_only=True, **_XENIUM_TABLE_ONLY)
+    assert sdata["table_protein"].var_names.tolist() == [_source_matrix(path).var_names[0]]
+    assert set(sdata["table"].var["feature_types"]) == {"Gene Expression"}
+
+
+def test_xenium_default_does_not_warn_about_gex_only() -> None:
+    with warnings.catch_warnings():
+        warnings.filterwarnings("error", message=".*gex_only.*")
+        xenium(XENIUM_CSV_ONLY, **_XENIUM_TABLE_ONLY)
+
+
 # A v2/v3 (XOA 3.0.0) CSV-only bundle: hex cell_ids, and a label_id column in the boundary CSVs.
 # Subset to 12 cells of the 10x Xenium Prime Mouse Brain dataset (sddb efli2b4vhc).
 XENIUM_CSV_HEX = Path(__file__).parent / "fixtures" / "xenium-3.0.0-csv-hex-tiny"
@@ -381,29 +505,21 @@ def test_xenium_csv_only_hex_without_label_id(tmp_path: Path) -> None:
 
 @skip_if_below_python_version()
 @pytest.mark.parametrize(
-    (
-        "dataset",
-        "gex_only",
-    ),
+    "dataset",
     [
-        ("Xenium_V1_human_Lung_2fov_outs", False),
-        ("Xenium_V1_human_Lung_2fov_outs", True),
-        ("Xenium_V1_Human_Ovary_tiny_outs", False),
-        ("Xenium_V1_Human_Ovary_tiny_outs", True),
-        ("Xenium_V1_MultiCellSeg_Human_Ovary_tiny_outs", False),
-        ("Xenium_V1_MultiCellSeg_Human_Ovary_tiny_outs", True),
-        ("Xenium_V1_Protein_Human_Kidney_tiny_outs", False),
-        ("Xenium_V1_Protein_Human_Kidney_tiny_outs", True),
+        "Xenium_V1_human_Lung_2fov_outs",
+        "Xenium_V1_Human_Ovary_tiny_outs",
+        "Xenium_V1_MultiCellSeg_Human_Ovary_tiny_outs",
+        "Xenium_V1_Protein_Human_Kidney_tiny_outs",
     ],
 )
-def test_xenium_other_feature_types(dataset: str, gex_only: bool) -> None:
+def test_xenium_other_feature_types(dataset: str) -> None:
     f = Path("./data") / dataset
     assert f.is_dir()
-    sdata = xenium(f, cells_as_circles=False, gex_only=gex_only)
-    if gex_only:
-        assert set(sdata["table"].var["feature_types"]) == {"Gene Expression"}
-    elif dataset == "Xenium_V1_human_Lung_2fov_outs":
-        assert set(sdata["table"].var["feature_types"]) == {
+    sdata = xenium(f, cells_as_circles=False)
+    table = sdata["table"]
+    if dataset == "Xenium_V1_human_Lung_2fov_outs":
+        assert set(table.var["feature_types"]) == {
             "Deprecated Codeword",
             "Gene Expression",
             "Negative Control Codeword",
@@ -411,7 +527,7 @@ def test_xenium_other_feature_types(dataset: str, gex_only: bool) -> None:
             "Unassigned Codeword",
         }
     elif dataset in {"Xenium_V1_Human_Ovary_tiny_outs", "Xenium_V1_MultiCellSeg_Human_Ovary_tiny_outs"}:
-        assert set(sdata["table"].var["feature_types"]) == {
+        assert set(table.var["feature_types"]) == {
             "Gene Expression",
             "Genomic Control",
             "Negative Control Codeword",
@@ -419,25 +535,21 @@ def test_xenium_other_feature_types(dataset: str, gex_only: bool) -> None:
             "Unassigned Codeword",
         }
     elif dataset == "Xenium_V1_Protein_Human_Kidney_tiny_outs":
-        assert set(sdata["table"].var["feature_types"]) == {
+        assert set(table.var["feature_types"]) == {
             "Gene Expression",
             "Genomic Control",
             "Negative Control Codeword",
             "Negative Control Probe",
-            "Protein Expression",
             "Unassigned Codeword",
         }
+        protein = sdata["table_protein"]
+        assert set(protein.var["feature_types"]) == {"Protein Expression"}
         # Protein feature
-        assert np.allclose(
-            sdata["table"].X[0:3, sdata["table"].var_names.str.match("VISTA")].toarray().squeeze(), [0.7, 1.2, 0.0]
-        )
+        assert np.allclose(protein.X[0:3, protein.var_names.str.match("VISTA")].toarray().squeeze(), [0.7, 1.2, 0.0])
         # RNA feature
-        assert np.allclose(
-            sdata["table"].X[[6, 7, 24], sdata["table"].var_names.str.match("ACTG2")].squeeze(), [1, 0, 2]
-        )
-
+        assert np.allclose(table.X[[6, 7, 24], table.var_names.str.match("ACTG2")].toarray().squeeze(), [1, 0, 2])
     else:
-        assert ValueError(f"Unexpected dataset {dataset}")
+        raise ValueError(f"Unexpected dataset {dataset}")
 
 
 # ── CLI JSON kwargs tests (no real data needed) ───────────────────────────────

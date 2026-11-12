@@ -919,10 +919,16 @@ def visium_hd_wrapper(
     help="Whether to read cells annotations in the AnnData table. [default: True]",
 )
 @click.option(
+    "--controls",
+    type=click.Choice(["keep", "drop"]),
+    default="keep",
+    help="Whether to keep the control features in the table. [default: keep]",
+)
+@click.option(
     "--gex-only",
     type=bool,
-    default=True,
-    help="If `True`, only load gene expression features. [default: True]",
+    default=None,
+    help="Deprecated, use --controls: True drops the controls, False keeps them.",
 )
 @click.option(
     "--imread-kwargs",
@@ -956,7 +962,8 @@ def xenium_wrapper(
     morphology_focus: bool = True,
     aligned_images: bool = True,
     cells_table: bool = True,
-    gex_only: bool = True,
+    controls: Literal["keep", "drop"] = "keep",
+    gex_only: bool | None = None,
     imread_kwargs: str = "{}",
     image_models_kwargs: str = "{}",
     labels_models_kwargs: str = "{}",
@@ -976,6 +983,7 @@ def xenium_wrapper(
         morphology_focus=morphology_focus,
         aligned_images=aligned_images,
         cells_table=cells_table,
+        controls=controls,
         gex_only=gex_only,
         imread_kwargs=_parse_json_param(imread_kwargs, "imread_kwargs"),
         image_models_kwargs=_parse_json_param(image_models_kwargs, "image_models_kwargs"),

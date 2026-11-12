@@ -11,7 +11,7 @@ import warnings
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import dask.array as da
 import h5py
@@ -45,6 +45,7 @@ from xarray import DataArray, DataTree
 from spatialdata_io._constants._constants import XeniumKeys
 from spatialdata_io._docs import inject_docs
 from spatialdata_io._utils import deprecation_alias
+from spatialdata_io.readers._utils._features import split_by_feature_type
 from spatialdata_io.readers._utils._utils import (
     _initialize_raster_models_kwargs,
     _set_observation_unit,
@@ -291,7 +292,8 @@ def xenium(
     aligned_images: bool = True,
     cells_table: bool = True,
     n_jobs: int | None = None,
-    gex_only: bool = True,
+    controls: Literal["keep", "drop"] = "keep",
+    gex_only: bool | None = None,
     imread_kwargs: Mapping[str, Any] = MappingProxyType({}),
     image_models_kwargs: Mapping[str, Any] = MappingProxyType({}),
     labels_models_kwargs: Mapping[str, Any] = MappingProxyType({}),
@@ -347,8 +349,15 @@ def xenium(
         .. deprecated::
             ``n_jobs`` is not used anymore and will be removed in a future release. The reading time of shapes is now
             greatly improved and does not require parallelization.
+    controls
+        ``"keep"`` keeps the control features (negative control probes and codewords, genomic controls, unassigned,
+        deprecated and blank codewords) in ``table``, ``"drop"`` removes them. Every feature is typed by
+        ``var["feature_types"]``, the 10x ``feature_type``. "Protein Expression" always goes to ``table_protein``
+        and any other type to ``table_<type>``.
     gex_only
-        Whether to load only the "Gene Expression" feature type.
+        .. deprecated::
+            Use `controls`. `True` maps to ``controls="drop"``, `False` to ``controls="keep"``; protein and other
+            feature types are never dropped.
     imread_kwargs
         Keyword arguments to pass to the image reader.
     image_models_kwargs
@@ -394,6 +403,15 @@ def xenium(
             DeprecationWarning,
             stacklevel=2,
         )
+    if gex_only is not None:
+        warnings.warn(
+            "The `gex_only` parameter is deprecated; use `controls`. "
+            f"gex_only={gex_only} maps to controls={'drop' if gex_only else 'keep'!r}, and protein goes to "
+            "`table_protein` either way.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        controls = "drop" if gex_only else "keep"
     image_models_kwargs, labels_models_kwargs = _initialize_raster_models_kwargs(
         image_models_kwargs, labels_models_kwargs
     )
@@ -443,7 +461,7 @@ def xenium(
     table = None
     circles = None
     if cells_table:
-        table, circles = _get_tables_and_circles(path, specs, gex_only, cells_zarr_ctx)
+        table, circles = _get_tables_and_circles(path, specs, cells_zarr_ctx)
         # Map the table to the cell_labels element when a label_index mapping exists, so the instance
         # key resolves against the raster labels instead of the circles. If any table cell lacks a
         # boundary (so has no label), warn and leave the table on circles rather than crash.
@@ -520,7 +538,8 @@ def xenium(
         images["morphology_focus"] = _get_morphology_focus(path, version, imread_kwargs, image_models_kwargs)
 
     # --- assemble SpatialData ---
-    tables = {"table": table} if table is not None else {}
+    # split after the instance key remap above, so every table annotates the same element
+    tables = split_by_feature_type(table, controls=controls) if table is not None else {}
     shapes = polygons
     if circles is not None and cells_as_circles:
         shapes["cell_circles"] = circles
@@ -965,23 +984,23 @@ def _warn_if_scaled_protein(adata: AnnData) -> AnnData:
         warnings.warn(
             "Protein Expression counts were read from a non-HDF5 matrix (MatrixMarket) and are left in "
             "raw, scaled units: the protein_scaling_factor needed to descale them is only stored in "
-            "cell_feature_matrix.h5, which this bundle lacks. Divide by the factor yourself if you have "
-            "it, or pass gex_only=True to drop protein features.",
+            "cell_feature_matrix.h5, which this bundle lacks. Divide table_protein by the factor "
+            "yourself if you have it.",
             UserWarning,
             stacklevel=3,
         )
     return adata
 
 
-def _read_cell_feature_matrix(path: Path, gex_only: bool) -> AnnData:
-    """Read the cell feature matrix, preferring the HDF5 file.
+def _read_cell_feature_matrix(path: Path) -> AnnData:
+    """Read the cell feature matrix with every feature type, preferring the HDF5 file.
 
     CSV-only bundles (e.g. GEO deposits) often drop ``cell_feature_matrix.h5`` and keep only the
     MatrixMarket form, as a ``cell_feature_matrix/`` directory or a ``cell_feature_matrix.tar.gz``.
     """
     h5 = path / XeniumKeys.CELL_FEATURE_MATRIX_FILE
     if h5.is_file():
-        adata = sc.read_10x_h5(h5, gex_only=gex_only)
+        adata = sc.read_10x_h5(h5, gex_only=False)
         # Undo fixed-point scaling factor applied to Xenium Protein data stored in HDF5.
         with h5py.File(h5, "r") as f:
             if "protein_scaling_factor" in f.attrs:
@@ -990,7 +1009,7 @@ def _read_cell_feature_matrix(path: Path, gex_only: bool) -> AnnData:
                     adata.X[:, protein_feats] /= f.attrs["protein_scaling_factor"]
         return adata
     if (path / XeniumKeys.CELL_FEATURE_MATRIX_DIR).is_dir():
-        return _warn_if_scaled_protein(sc.read_10x_mtx(path / XeniumKeys.CELL_FEATURE_MATRIX_DIR, gex_only=gex_only))
+        return _warn_if_scaled_protein(sc.read_10x_mtx(path / XeniumKeys.CELL_FEATURE_MATRIX_DIR, gex_only=False))
     if (path / XeniumKeys.CELL_FEATURE_MATRIX_TAR).is_file():
         with tempfile.TemporaryDirectory() as tmp:
             with tarfile.open(path / XeniumKeys.CELL_FEATURE_MATRIX_TAR) as tar:
@@ -998,9 +1017,7 @@ def _read_cell_feature_matrix(path: Path, gex_only: bool) -> AnnData:
             # the matrix trio may sit at the root or inside a single top-level directory
             # (ignore archive cruft like __MACOSX/ and dotfiles)
             inner = [p for p in Path(tmp).iterdir() if p.is_dir() and not p.name.startswith((".", "__"))]
-            return _warn_if_scaled_protein(
-                sc.read_10x_mtx(inner[0] if len(inner) == 1 else Path(tmp), gex_only=gex_only)
-            )
+            return _warn_if_scaled_protein(sc.read_10x_mtx(inner[0] if len(inner) == 1 else Path(tmp), gex_only=False))
     raise FileNotFoundError(
         f"No cell feature matrix found in {path}: expected {XeniumKeys.CELL_FEATURE_MATRIX_FILE}, "
         f"a {XeniumKeys.CELL_FEATURE_MATRIX_DIR}/ directory, or {XeniumKeys.CELL_FEATURE_MATRIX_TAR}."
@@ -1010,10 +1027,9 @@ def _read_cell_feature_matrix(path: Path, gex_only: bool) -> AnnData:
 def _get_tables_and_circles(
     path: Path,
     specs: dict[str, Any],
-    gex_only: bool,
     cells_zarr_ctx: _XeniumCells | None,
 ) -> tuple[AnnData, GeoDataFrame]:
-    adata = _read_cell_feature_matrix(path, gex_only)
+    adata = _read_cell_feature_matrix(path)
     # get_cell_metadata decodes cell_id and cross-checks it against cells.zarr.zip; without the
     # zarr (pre-1.3.0 / CSV-only bundles) read the metadata directly from parquet or CSV.
     if cells_zarr_ctx is not None:
