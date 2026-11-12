@@ -23,6 +23,7 @@ _DIR_TARGETS = [
     "ProteinDir",
     "Morphology2D",
     "Morphology3D",
+    "RawMorphologyImages",
 ]
 _SCAN_TARGETS = list(_FLAT_FILE_TARGETS) + _DIR_TARGETS
 
@@ -119,6 +120,7 @@ _WHITELIST_DIRS = {
     "ProteinImages",
     "Morphology2D",
     "Morphology3D",
+    "RawMorphologyImages",
 }
 
 
@@ -370,6 +372,7 @@ def _set_up_cosmx_dataset_for_conversion(
             protein_dir=files.get("ProteinDir"),
             morphology_2d_dir=files.get("Morphology2D"),
             morphology_3d_dir=files.get("Morphology3D"),
+            raw_morphology_dir=files.get("RawMorphologyImages"),
         )
 
     if len(modal_map) > 1:

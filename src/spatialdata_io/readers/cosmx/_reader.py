@@ -18,6 +18,7 @@ CosMxDatasetReader
 
 from __future__ import annotations
 
+import json
 import math
 import re
 import textwrap
@@ -86,6 +87,7 @@ from ._utils import (
     _normalize_image_channels,
     _pandas_categoricals_to_string,
     detect_fovs_with_data,
+    find_cell_label_tifs,
 )
 
 if TYPE_CHECKING:
@@ -129,6 +131,7 @@ class CosMxDataset:
     protein_dir: Path | None = field(default=None)
     morphology_2d_dir: Path | None = field(default=None)
     morphology_3d_dir: Path | None = field(default=None)
+    raw_morphology_dir: Path | None = field(default=None, metadata={"help": "Read only for the TIFF pixel size."})
     modalities: dict[str, CosMxDataset] | None = field(default=None)
 
     def __post_init__(self) -> None:
@@ -864,8 +867,6 @@ class CosMxDatasetReader:
         using the same ``global_cell_id`` formula as :meth:`global_cell_id`
         so that label IDs match the table's global_cell_id values.
         """
-        from ._utils import find_cell_label_tifs
-
         cell_labels_dir = self.dataset.cell_labels_dir
         if cell_labels_dir is None:
             return None
@@ -1065,6 +1066,7 @@ def _cosmx_multi(
     add_fovs_as_shapes: bool,
     skip_empty_fovs: bool,
     preview_fovs: bool,
+    pixel_size_um: float | None,
 ) -> SpatialData | None:
     """Read a multimodal CosMx dataset (e.g. RNA + Protein)."""
     modalities = dataset.modalities
@@ -1178,7 +1180,7 @@ def _cosmx_multi(
                 tables[mod_name] = next(iter(mod_tables.values()))
 
     logger.debug("[5/5] Assembling SpatialData object...")
-    return _assemble_sdata(images, points, labels, shapes, tables, label_ds.fov_positions_file)
+    return _assemble_sdata(images, points, labels, shapes, tables, label_ds, pixel_size_um)
 
 
 # ---------------------------------------------------------------------------
@@ -1186,17 +1188,85 @@ def _cosmx_multi(
 # ---------------------------------------------------------------------------
 
 
-def _pixel_size_um(fov_positions_file: Path | None) -> dict[str, Any]:
-    """The pixel size in µm and its source: the deposit's positions file if it lists px and mm, else the spec."""
+# the spatialdata-db Lead's ruling (T141), not a vendor value: with no FOV image, a current-camera run has its
+# largest cell-centre local px coordinate in this range on each axis
+_CURRENT_CAMERA_LOCAL_EXTENT_PX = (4000.0, COSMX_FOV_SIZE_PX)
+
+
+def _fov_tiff_header(dataset: CosMxDataset) -> tuple[float | None, tuple[int, int] | None, str | None]:
+    """``ImPixelSize_nm``, (height, width) and name of the first FOV TIFF, read from its header only.
+
+    A morphology TIFF (``Morphology2D``, else ``RawMorphologyImages``) gives all three; without one, a
+    ``CellLabels`` TIFF gives the FOV shape.
+    """
+    for directory in (dataset.morphology_2d_dir, dataset.raw_morphology_dir, dataset.cell_labels_dir):
+        if directory is None:
+            continue
+        if directory == dataset.cell_labels_dir:
+            tifs = sorted(find_cell_label_tifs(directory).values())
+        else:
+            tifs = sorted(p for p in directory.rglob("*") if p.suffix.lower() in {".tif", ".tiff"})
+        if not tifs:
+            continue
+        with tifffile.TiffFile(tifs[0]) as tif:
+            page = cast("tifffile.TiffPage", tif.pages[0])
+            shape = (int(page.shape[0]), int(page.shape[1]))
+            nm = None
+            if directory != dataset.cell_labels_dir:
+                try:
+                    nm = json.loads(page.description).get("ImPixelSize_nm")
+                except (json.JSONDecodeError, AttributeError):
+                    nm = None
+        return (float(nm) if isinstance(nm, int | float) else None), shape, tifs[0].name
+    return None, None, None
+
+
+def _local_px_extent(tables: dict[str, Any]) -> tuple[float, float] | None:
+    """Largest ``CenterX_local_px`` and ``CenterY_local_px`` over the tables' cells, else ``None``."""
+    xs, ys = [], []
+    for table in tables.values():
+        obs = (table.table if hasattr(table, "table") else table).obs
+        if {"CenterX_local_px", "CenterY_local_px"}.issubset(obs.columns):
+            xs.append(pd.to_numeric(obs["CenterX_local_px"], errors="coerce").max())
+            ys.append(pd.to_numeric(obs["CenterY_local_px"], errors="coerce").max())
+    if not xs or np.isnan(np.nanmax(xs)) or np.isnan(np.nanmax(ys)):
+        return None
+    return float(np.nanmax(xs)), float(np.nanmax(ys))
+
+
+def _pixel_size_um(dataset: CosMxDataset, tables: dict[str, Any], pixel_size_um: float | None = None) -> dict[str, Any]:
+    """The pixel size in µm and its source, in the order of the :func:`cosmx` docstring."""
+    if pixel_size_um is not None:
+        return {"pixel_size_um": float(pixel_size_um), "pixel_size_source": "argument"}
+    fov_positions_file = dataset.fov_positions_file
     measured = _pixel_size_from_fov_positions(fov_positions_file) if fov_positions_file is not None else None
-    if measured is None:
+    if measured is not None:
+        if abs(measured / COSMX_PIXEL_SIZE - 1) > 0.01:
+            logger.warning(
+                f"{fov_positions_file.name} gives {measured:.6g} µm per pixel, more than 1% off the CosMx spec "  # type: ignore[union-attr]
+                f"{COSMX_PIXEL_SIZE}; using the file's value for the 'microns' coordinate system."
+            )
+        return {"pixel_size_um": measured, "pixel_size_source": "fov_positions"}
+    nm, shape, tif_name = _fov_tiff_header(dataset)
+    if nm is not None and nm > 0:
+        return {"pixel_size_um": nm / 1000.0, "pixel_size_source": "tiff"}
+    lo, hi = _CURRENT_CAMERA_LOCAL_EXTENT_PX
+    if shape is not None:
+        current = shape == (int(COSMX_FOV_SIZE_PX), int(COSMX_FOV_SIZE_PX))
+        geometry = f"FOV image {shape[1]} x {shape[0]} px ({tif_name})"
+    elif (extent := _local_px_extent(tables)) is not None:
+        current = all(lo <= e <= hi for e in extent)
+        geometry = f"largest cell-centre local px extent {extent[0]:g} x {extent[1]:g}"
+    else:
+        current, geometry = False, "no FOV image and no CenterX/Y_local_px columns"
+    if current:
         return {"pixel_size_um": COSMX_PIXEL_SIZE, "pixel_size_source": "spec"}
-    if abs(measured / COSMX_PIXEL_SIZE - 1) > 0.01:
-        logger.warning(
-            f"{fov_positions_file.name} gives {measured:.6g} µm per pixel, more than 1% off the CosMx spec "  # type: ignore[union-attr]
-            f"{COSMX_PIXEL_SIZE}; using the file's value for the 'microns' coordinate system."
-        )
-    return {"pixel_size_um": measured, "pixel_size_source": "fov_positions"}
+    logger.warning(
+        f"CosMx pixel size unknown: no px+mm FOV positions, no TIFF ImPixelSize_nm > 0, and the geometry ({geometry}) "
+        f"is not the {int(COSMX_FOV_SIZE_PX)} x {int(COSMX_FOV_SIZE_PX)} px FOV that the spec value {COSMX_PIXEL_SIZE} "
+        "applies to. Pass pixel_size_um= to set it; no 'microns' coordinate system is added."
+    )
+    return {"pixel_size_um": None, "pixel_size_source": "unknown"}
 
 
 def _add_microns(sdata: SpatialData, pixel_size_um: float) -> None:
@@ -1213,7 +1283,8 @@ def _assemble_sdata(
     labels: dict[str, Any],
     shapes: dict[str, Any],
     tables: dict[str, Any],
-    fov_positions_file: Path | None = None,
+    dataset: CosMxDataset,
+    pixel_size_um: float | None = None,
 ) -> SpatialData:
     """Build and annotate the final SpatialData object."""
     # Move each image's per-channel normalization divisors from the (non-persisted) element
@@ -1236,8 +1307,9 @@ def _assemble_sdata(
         tables=tables,
         attrs=attrs,
     )
-    sdata.attrs["cosmx"] = _pixel_size_um(fov_positions_file)
-    _add_microns(sdata, sdata.attrs["cosmx"]["pixel_size_um"])
+    sdata.attrs["cosmx"] = _pixel_size_um(dataset, tables, pixel_size_um)
+    if sdata.attrs["cosmx"]["pixel_size_um"] is not None:
+        _add_microns(sdata, sdata.attrs["cosmx"]["pixel_size_um"])
 
     # Wire tables to label elements
     if labels and sdata.tables:
@@ -1407,6 +1479,7 @@ def cosmx(
     skip_empty_fovs: bool = True,
     preview_fovs: bool = False,
     controls: Literal["keep", "drop"] = "keep",
+    pixel_size_um: float | None = None,
 ) -> SpatialData | None:
     """Read *CosMx Nanostring* data into a :class:`spatialdata.SpatialData` object.
 
@@ -1487,6 +1560,9 @@ def cosmx(
         ``NegativeAdd``) are ``Negative Control Probe``, ``SystemControl*`` and ``FalseCode*`` ``System Control``,
         the rest ``Gene Expression``. A Protein modality's table is never affected; its targets are
         ``Protein Expression`` and its ``Channel-*`` and IgG isotype columns ``unverified``.
+    pixel_size_um
+        µm per pixel stated by the caller, e.g. from the deposit's description. Overrides every other source; see the
+        pixel size order below.
 
     Returns
     -------
@@ -1495,11 +1571,20 @@ def cosmx(
     Tables: a single-modality run gives one table, ``cell_data``; a multimodal run gives one table per
     modality, ``RNA`` and ``Protein``, annotating the same labels.
 
-    Every element is in pixels in ``"global"`` and in µm in ``"microns"`` (the same transformation followed by a
-    scale). The pixel size is taken from the FOV positions file when it lists each FOV in both ``x_global_px`` and
-    ``x_global_mm`` (a warning is logged if it is more than 1% off the spec), else it is the CosMx spec value
-    0.120280945 µm; ``sdata.attrs["cosmx"]`` records it as ``pixel_size_um`` with ``pixel_size_source``
-    (``"fov_positions"`` or ``"spec"``).
+    Every element is in pixels in ``"global"``, and in µm in ``"microns"`` (the same transformation followed by a
+    scale) when the pixel size is known. ``sdata.attrs["cosmx"]`` records it as ``pixel_size_um`` with
+    ``pixel_size_source``, resolved in this order:
+
+    1. ``"argument"``: ``pixel_size_um``, when given.
+    2. ``"fov_positions"``: the FOV positions file, when it lists each FOV in both ``x_global_px`` and
+       ``x_global_mm`` (a warning is logged if it is more than 1% off the spec).
+    3. ``"tiff"``: ``ImPixelSize_nm`` in the ImageDescription JSON of the first morphology TIFF
+       (``Morphology2D``, else ``RawMorphologyImages``), when it is > 0.
+    4. ``"spec"``: the CosMx value 0.120280945 µm, only when the FOV geometry is the 4256 x 4256 px FOV it applies
+       to: the first FOV image (morphology, else ``CellLabels``) is 4256 x 4256 px or, with no FOV image, the
+       largest ``CenterX_local_px`` and ``CenterY_local_px`` are both within 4000-4256.
+    5. ``"unknown"``: otherwise ``pixel_size_um`` is ``None``, a warning names the geometry found, and there is no
+       ``"microns"`` coordinate system.
     """
     n_workers = n_workers or 1
     path = Path(path).resolve()
@@ -1541,6 +1626,7 @@ def cosmx(
             add_fovs_as_shapes=add_fovs_as_shapes,
             skip_empty_fovs=skip_empty_fovs,
             preview_fovs=preview_fovs,
+            pixel_size_um=pixel_size_um,
         )
 
     # --- Single-modality path ---
@@ -1616,4 +1702,4 @@ def cosmx(
     if add_fovs_as_shapes:
         shapes = {**shapes, **reader.build_fov_shapes()}
 
-    return _assemble_sdata(images, points, labels, shapes, tables, dataset.fov_positions_file)
+    return _assemble_sdata(images, points, labels, shapes, tables, dataset, pixel_size_um)

@@ -391,6 +391,38 @@ class TestFovPositions:
 
 
 class TestMicrons:
+    """``_pixel_size_um`` order: argument > fov_positions > tiff > spec (current-camera geometry only) > unknown."""
+
+    @staticmethod
+    def _dataset(root: Path, *, mm: bool = False, morph=None, raw=None, labels=None):
+        """A px-only (or px+mm) positions file plus optional FOV TIFFs given as ``(shape, ImPixelSize_nm)``."""
+        import tifffile
+
+        from spatialdata_io.readers.cosmx._discovery import _set_up_cosmx_dataset_for_conversion
+
+        root.mkdir(parents=True, exist_ok=True)
+        fov_df = pd.DataFrame({"fov": [1, 2], "x_global_px": [0.0, 4256.0], "y_global_px": [0.0, 0.0]})
+        if mm:
+            fov_df["x_global_mm"] = fov_df["x_global_px"] / MM_TO_PX
+            fov_df["y_global_mm"] = fov_df["y_global_px"] / MM_TO_PX
+        _write_csv(root / "S0_fov_positions_file.csv", fov_df)
+        for sub, spec in (("Morphology2D", morph), ("RawMorphologyImages", raw), ("CellLabels", labels)):
+            if spec is None:
+                continue
+            shape, nm = spec
+            (root / sub).mkdir()
+            desc = None if nm is None else json.dumps({"ChannelOrder": "B", "ImPixelSize_nm": nm})
+            name = "CellLabels_F001.tif" if sub == "CellLabels" else "20240101_S0_F00001.TIF"
+            tifffile.imwrite(root / sub / name, shape=shape, dtype="uint8", description=desc)
+        return _set_up_cosmx_dataset_for_conversion(root)
+
+    @staticmethod
+    def _tables(x_max: float, y_max: float) -> dict:
+        import anndata as ad
+
+        obs = pd.DataFrame({"CenterX_local_px": [10.0, x_max], "CenterY_local_px": [y_max, 20.0]})
+        return {"cell_data": ad.AnnData(obs=obs)}
+
     def test_pixel_size_from_px_and_mm_columns(self, fixture_a, sdio):
         from spatialdata.transformations import get_transformation
 
@@ -404,21 +436,110 @@ class TestMicrons:
             to_um = get_transformation(element, "microns").to_affine_matrix(("x", "y"), ("x", "y"))
             np.testing.assert_allclose(to_um[:2], to_px[:2] * COSMX_PIXEL_SIZE, err_msg=name)
 
-    def test_spec_pixel_size_without_mm_and_warning_off_spec(self, fixture_b, tmp_path, sdio, caplog):
-        from spatialdata_io.readers.cosmx._io import COSMX_PIXEL_SIZE
+    def test_off_spec_fov_positions_warns(self, tmp_path, caplog):
+        from spatialdata_io.readers.cosmx._discovery import _set_up_cosmx_dataset_for_conversion
         from spatialdata_io.readers.cosmx._reader import _pixel_size_um
 
-        sdata = _read(sdio, fixture_b)
-        assert sdata.attrs["cosmx"] == {"pixel_size_um": COSMX_PIXEL_SIZE, "pixel_size_source": "spec"}
-        assert "microns" in sdata.coordinate_systems
-
-        off = tmp_path / "fov_positions_file.csv"
         pd.DataFrame({"fov": [1, 2], "x_global_px": [100, 4356], "x_global_mm": [0.1, 0.1 + 4256 * 0.18e-3]}).to_csv(
-            off, index=False
+            tmp_path / "S0_fov_positions_file.csv", index=False
         )
         with caplog.at_level("WARNING"):
-            assert _pixel_size_um(off)["pixel_size_um"] == pytest.approx(0.18)
+            px = _pixel_size_um(_set_up_cosmx_dataset_for_conversion(tmp_path), {})
+        assert px == {"pixel_size_um": pytest.approx(0.18), "pixel_size_source": "fov_positions"}
         assert "off the CosMx spec" in caplog.text
+
+    def test_argument_overrides_every_source(self, tmp_path):
+        from spatialdata_io.readers.cosmx._reader import _pixel_size_um
+
+        ds = self._dataset(tmp_path, mm=True, morph=((4256, 4256), 120.280945))
+        assert _pixel_size_um(ds, self._tables(4249, 4248), 0.18) == {
+            "pixel_size_um": 0.18,
+            "pixel_size_source": "argument",
+        }
+
+    def test_fov_positions_before_tiff(self, tmp_path):
+        from spatialdata_io.readers.cosmx._reader import _pixel_size_um
+
+        ds = self._dataset(tmp_path, mm=True, morph=((8, 8), 180.0))
+        assert _pixel_size_um(ds, {}) == {
+            "pixel_size_um": pytest.approx(COSMX_PIXEL_SIZE),
+            "pixel_size_source": "fov_positions",
+        }
+
+    @pytest.mark.parametrize("sub", ["morph", "raw"])
+    def test_tiff_im_pixel_size(self, tmp_path, sub):
+        from spatialdata_io.readers.cosmx._reader import _pixel_size_um
+
+        ds = self._dataset(tmp_path, **{sub: ((8, 8), 120.280945)})
+        assert _pixel_size_um(ds, {}) == {"pixel_size_um": pytest.approx(0.120280945), "pixel_size_source": "tiff"}
+
+    def test_tiff_zero_on_current_camera_falls_through_to_spec(self, tmp_path):
+        from spatialdata_io.readers.cosmx._reader import _pixel_size_um
+
+        ds = self._dataset(tmp_path, raw=((4256, 4256), 0))
+        assert _pixel_size_um(ds, {}) == {"pixel_size_um": COSMX_PIXEL_SIZE, "pixel_size_source": "spec"}
+
+    def test_tiff_zero_on_old_camera_is_unknown(self, tmp_path, caplog):
+        from spatialdata_io.readers.cosmx._reader import _pixel_size_um
+
+        # the zenodo 11108209 Run5469 geometry: 5472 x 3648 px FOVs, ImPixelSize_nm = 0, px-only positions
+        ds = self._dataset(tmp_path, raw=((3648, 5472), 0), labels=((3648, 5472), None))
+        with caplog.at_level("WARNING"):
+            assert _pixel_size_um(ds, self._tables(4249, 4248)) == {
+                "pixel_size_um": None,
+                "pixel_size_source": "unknown",
+            }
+        assert "FOV image 5472 x 3648 px (20240101_S0_F00001.TIF)" in caplog.text
+
+    def test_cell_labels_shape_gives_spec(self, tmp_path):
+        from spatialdata_io.readers.cosmx._reader import _pixel_size_um
+
+        ds = self._dataset(tmp_path, labels=((4256, 4256), None))
+        assert _pixel_size_um(ds, self._tables(5464, 3644))["pixel_size_source"] == "spec"
+
+    @pytest.mark.parametrize(
+        ("x_max", "y_max", "source"),
+        [
+            (4249, 4248, "spec"),
+            (4000, 4256, "spec"),
+            (5464, 3644, "unknown"),
+            (3999, 4248, "unknown"),
+            (4257, 4100, "unknown"),
+        ],
+    )
+    def test_local_px_extent_without_images(self, tmp_path, x_max, y_max, source):
+        from spatialdata_io.readers.cosmx._reader import _pixel_size_um
+
+        assert _pixel_size_um(self._dataset(tmp_path), self._tables(x_max, y_max))["pixel_size_source"] == source
+
+    def test_no_geometry_is_unknown(self, tmp_path, caplog):
+        from spatialdata_io.readers.cosmx._reader import _pixel_size_um
+
+        with caplog.at_level("WARNING"):
+            assert _pixel_size_um(self._dataset(tmp_path), {})["pixel_size_source"] == "unknown"
+        assert "no FOV image and no CenterX/Y_local_px columns" in caplog.text
+
+    def test_unknown_read_has_no_microns_and_argument_restores_it(self, fixture_b, sdio, caplog):
+        from spatialdata.transformations import get_transformation
+
+        # fixture_b: px-only positions and 256 x 256 px morphology TIFFs without ImPixelSize_nm
+        with caplog.at_level("WARNING"):
+            sdata = _read(sdio, fixture_b)
+        assert sdata.attrs["cosmx"] == {"pixel_size_um": None, "pixel_size_source": "unknown"}
+        assert "microns" not in sdata.coordinate_systems
+        assert "FOV image 256 x 256 px" in caplog.text
+
+        sdata = _read(sdio, fixture_b, pixel_size_um=0.18)
+        assert sdata.attrs["cosmx"] == {"pixel_size_um": 0.18, "pixel_size_source": "argument"}
+        for _, name, element in sdata.gen_spatial_elements():
+            to_px = get_transformation(element, "global").to_affine_matrix(("x", "y"), ("x", "y"))
+            to_um = get_transformation(element, "microns").to_affine_matrix(("x", "y"), ("x", "y"))
+            np.testing.assert_allclose(to_um[:2], to_px[:2] * 0.18, err_msg=name)
+
+    def test_multimodal_argument(self, fixture_multimodal, sdio):
+        sdata = _read(sdio, fixture_multimodal, pixel_size_um=0.18)
+        assert sdata.attrs["cosmx"] == {"pixel_size_um": 0.18, "pixel_size_source": "argument"}
+        assert "microns" in sdata.coordinate_systems
 
 
 # ═══════════════════════════════════════════════════════════════════════════

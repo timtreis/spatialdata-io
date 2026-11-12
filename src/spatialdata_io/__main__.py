@@ -208,6 +208,12 @@ def codex_wrapper(
     default="keep",
     help="Whether to keep the control features in the table. [default: keep]",
 )
+@click.option(
+    "--pixel-size-um",
+    type=float,
+    default=None,
+    help="Stated µm per pixel; overrides the positions file, the TIFF header and the spec. [default: None]",
+)
 def cosmx_wrapper(
     input: str,
     output: str,
@@ -232,6 +238,7 @@ def cosmx_wrapper(
     skip_empty_fovs: bool = True,
     preview_fovs: bool = False,
     controls: Literal["keep", "drop"] = "keep",
+    pixel_size_um: float | None = None,
 ) -> None:
     """CosMx conversion to SpatialData."""
     from spatialdata_io.readers.cosmx import cosmx
@@ -259,6 +266,7 @@ def cosmx_wrapper(
         skip_empty_fovs=skip_empty_fovs,
         preview_fovs=preview_fovs,
         controls=controls,
+        pixel_size_um=pixel_size_um,
     )
     if sdata is not None:
         sdata.write(output)
