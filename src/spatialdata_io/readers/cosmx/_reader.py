@@ -19,10 +19,11 @@ CosMxDatasetReader
 from __future__ import annotations
 
 import math
+import re
 import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, cast, overload
+from typing import TYPE_CHECKING, Any, Literal, cast, overload
 
 import dask.array as da
 import dask.dataframe as dd
@@ -45,10 +46,12 @@ from spatialdata.transformations import Scale, Sequence, Translation, get_transf
 
 from spatialdata_io._constants._constants import CosmxKeys
 from spatialdata_io._docs import inject_docs
+from spatialdata_io.readers._utils._features import COSMX_NAME_RULES, feature_types_by_name, split_by_feature_type
 from spatialdata_io.readers._utils._utils import _set_observation_unit, _set_reader_metadata
 
 from ._discovery import (
     _infer_dataset_id,
+    _modality_from_ancestors,
     _set_up_cosmx_dataset_for_conversion,
 )
 from ._io import (
@@ -89,6 +92,10 @@ if TYPE_CHECKING:
     from anndata import AnnData
 
 __all__ = ["cosmx"]
+
+PROTEIN = "Protein Expression"
+# protein exprMat columns no vendor source types (seen in sddb_jm45slqy3e): the Channel-* stains, Ms IgG1, Rb IgG
+_COSMX_PROTEIN_UNVERIFIED = ((re.compile(r"^Channel-|^(Ms|Rb) IgG"), "unverified"),)
 
 # ---------------------------------------------------------------------------
 # Dataset descriptor
@@ -912,8 +919,15 @@ class CosMxDatasetReader:
 
     # -- Read tables (expression + metadata) --
 
-    def read_tables(self, regions: list[str], *, modality: str | None = None) -> dict[str, AnnData]:
-        """Read expression matrix and metadata into an AnnData table."""
+    def read_tables(
+        self, regions: list[str], *, modality: str | None = None, controls: Literal["keep", "drop"] = "keep"
+    ) -> dict[str, AnnData]:
+        """Read expression matrix and metadata into an AnnData table, typed by ``var["feature_types"]``.
+
+        RNA features are typed by name (:data:`COSMX_NAME_RULES`); ``controls="drop"`` removes the controls. The
+        Protein modality's targets are ``Protein Expression``, its ``Channel-*`` and IgG columns ``unverified``
+        (no vendor source types them); `controls` does not apply to it.
+        """
         if self.dataset.exprMat_file is None:
             return {}
 
@@ -977,6 +991,13 @@ class CosMxDatasetReader:
                 bg_df[adata.var_names].to_numpy().T, index=adata.var_names, columns=[f"fov_{f}" for f in bg_df.index]
             )
 
+        if (modality or _modality_from_ancestors(self.dataset.exprMat_file, self.dataset.path)) == "Protein":
+            adata.var["feature_types"] = feature_types_by_name(adata.var_names, _COSMX_PROTEIN_UNVERIFIED, PROTEIN)
+        else:
+            adata.var["feature_types"] = feature_types_by_name(adata.var_names, COSMX_NAME_RULES)
+            # by name there are only genes and controls, so the split returns one table; varm follows the subset
+            adata = split_by_feature_type(adata, controls=controls)["table"]
+
         # Zarr-safe, case-insensitively unique obs/var keys (spatialdata core),
         # then categoricals → string (zarr cannot serialize categoricals).
         sanitize_table(adata)
@@ -1024,6 +1045,7 @@ def _read_images_and_shapes(
 def _cosmx_multi(
     dataset: CosMxDataset,
     *,
+    controls: Literal["keep", "drop"],
     read_images: bool,
     read_labels: bool,
     read_proteins: bool,
@@ -1149,7 +1171,7 @@ def _cosmx_multi(
     if read_gexp:
         for mod_name, mod_ds in modalities.items():
             logger.debug("[4/5] Reading %s data...", mod_name)
-            mod_tables = _modality_reader(mod_ds).read_tables(region_refs, modality=mod_name)
+            mod_tables = _modality_reader(mod_ds).read_tables(region_refs, modality=mod_name, controls=controls)
             if label_ids:
                 mod_tables = _filter_tables_to_ids(mod_tables, label_ids, source_label="rasterised labels")
             if mod_tables:
@@ -1384,6 +1406,7 @@ def cosmx(
     add_fovs_as_shapes: bool = True,
     skip_empty_fovs: bool = True,
     preview_fovs: bool = False,
+    controls: Literal["keep", "drop"] = "keep",
 ) -> SpatialData | None:
     """Read *CosMx Nanostring* data into a :class:`spatialdata.SpatialData` object.
 
@@ -1458,6 +1481,12 @@ def cosmx(
         to keep every listed FOV.
     preview_fovs
         Show a preview plot of FOV positions and return ``None``.
+    controls
+        ``"keep"`` keeps the RNA control features in the table, ``"drop"`` removes them. CosMx names no feature
+        type, so the features are typed by name in ``var["feature_types"]``: ``NegPrb*`` and ``Negative*`` (also
+        ``NegativeAdd``) are ``Negative Control Probe``, ``SystemControl*`` and ``FalseCode*`` ``System Control``,
+        the rest ``Gene Expression``. A Protein modality's table is never affected; its targets are
+        ``Protein Expression`` and its ``Channel-*`` and IgG isotype columns ``unverified``.
 
     Returns
     -------
@@ -1489,6 +1518,7 @@ def cosmx(
     if dataset.modalities:
         return _cosmx_multi(
             dataset=dataset,
+            controls=controls,
             read_images=read_images,
             read_labels=read_labels,
             read_proteins=read_proteins,
@@ -1576,7 +1606,7 @@ def cosmx(
     labels, label_ids = reader.read_labels() if read_labels else ({}, set())
 
     region_refs = list(labels.keys()) or list(shapes.keys()) or ["cells"]
-    tables = reader.read_tables(region_refs) if read_gexp else {}
+    tables = reader.read_tables(region_refs, controls=controls) if read_gexp else {}
     if label_ids:
         tables = _filter_tables_to_ids(tables, label_ids, source_label="rasterised labels")
 

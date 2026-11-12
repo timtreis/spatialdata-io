@@ -1998,3 +1998,84 @@ def test_dataset_id_selects_only_its_own_flat_files(tmp_path: Path) -> None:
     assert found["exprMat_file"] == tmp_path / "Run5452_S2_exprMat_file.csv"
     (tmp_path / "Run5452_S2_tx_file.csv").unlink()
     assert _scan_for_files_to_read(tmp_path, ["tx_file"], dataset_id="Run5452_S2")["tx_file"] is None
+
+
+class TestFeatureTypes:
+    """Controls stay in the table, typed by name in ``var["feature_types"]``; ``controls="drop"`` removes them."""
+
+    CONTROLS = {
+        "NegPrb1": "Negative Control Probe",
+        "Negative2": "Negative Control Probe",
+        "NegativeAdd": "Negative Control Probe",
+        "SystemControl3": "System Control",
+        "FalseCode4": "System Control",
+    }
+
+    @classmethod
+    def _with_controls(cls, src: Path, dest: Path, name: str, columns: list[str]) -> pd.DataFrame:
+        """Copy ``src`` to ``dest`` and add ``columns`` and one background row (cell_ID 0) per FOV to ``name``."""
+        import shutil
+
+        shutil.copytree(src, dest)
+        expr = pd.read_csv(dest / name)
+        rng = np.random.default_rng(0)
+        for c in columns:
+            expr[c] = rng.integers(0, 3, len(expr))
+        bg = expr.drop_duplicates("fov").assign(cell_ID=0)
+        bg.iloc[:, 2:] = rng.integers(0, 5, bg.iloc[:, 2:].shape)
+        expr = pd.concat([bg, expr], ignore_index=True)
+        _write_csv(dest / name, expr, compress=name.endswith(".gz"))
+        return expr
+
+    @staticmethod
+    def _cells(expr: pd.DataFrame, obs_names: pd.Index) -> pd.DataFrame:
+        cells = expr[expr["cell_ID"] != 0]
+        return cells.set_index(cells["fov"].astype(str) + "_" + cells["cell_ID"].astype(str)).loc[obs_names]
+
+    def test_controls_kept_and_typed(self, sdio, fixture_a, tmp_path):
+        expr = self._with_controls(fixture_a, tmp_path / "d", "S0_exprMat_file.csv.gz", list(self.CONTROLS))
+        table = _read(sdio, tmp_path / "d", read_images=False)["cell_data"]
+
+        features = expr.columns[2:].tolist()  # all but fov and cell_ID
+        assert table.var_names.tolist() == features
+        assert table.var["feature_types"].to_dict() == {
+            **{c: "Gene Expression" for c in features if c.startswith("Gene_")},
+            **self.CONTROLS,
+        }
+        np.testing.assert_array_equal(table.X.toarray(), self._cells(expr, table.obs_names)[features].to_numpy())
+        bg = expr[expr["cell_ID"] == 0].set_index("fov")
+        np.testing.assert_array_equal(table.varm["fov_bg_signal"].to_numpy(), bg[features].to_numpy().T)
+
+    def test_drop_controls(self, sdio, fixture_a, tmp_path):
+        expr = self._with_controls(fixture_a, tmp_path / "d", "S0_exprMat_file.csv.gz", list(self.CONTROLS))
+        table = _read(sdio, tmp_path / "d", read_images=False, controls="drop")["cell_data"]
+
+        genes = [c for c in expr.columns if c.startswith("Gene_")]
+        assert table.var_names.tolist() == genes
+        assert set(table.var["feature_types"]) == {"Gene Expression"}
+        np.testing.assert_array_equal(table.X.toarray(), self._cells(expr, table.obs_names)[genes].to_numpy())
+        assert table.varm["fov_bg_signal"].index.tolist() == genes
+
+    def test_round_trip(self, sdio, fixture_a, tmp_path):
+        import spatialdata as sd
+
+        self._with_controls(fixture_a, tmp_path / "d", "S0_exprMat_file.csv.gz", list(self.CONTROLS))
+        sdata = _read(sdio, tmp_path / "d", read_images=False)
+        sdata.write(tmp_path / "x.zarr")
+        back = sd.read_zarr(tmp_path / "x.zarr")["cell_data"]
+        pd.testing.assert_frame_equal(back.var, sdata["cell_data"].var)
+        assert (back.X != sdata["cell_data"].X).nnz == 0
+
+    @pytest.mark.parametrize("controls", ["keep", "drop"])
+    def test_multimodal_protein_is_typed_and_never_dropped(self, sdio, fixture_multimodal, tmp_path, controls):
+        unverified = ["Channel-DNA", "Ms IgG1", "Rb IgG"]
+        self._with_controls(fixture_multimodal, tmp_path / "mm", "S0RNA_exprMat_file.csv", list(self.CONTROLS))
+        self._with_controls(tmp_path / "mm", tmp_path / "p", "S0Protein_exprMat_file.csv", unverified)
+        sdata = sdio.cosmx(tmp_path / "p", n_workers=1, read_transcripts=False, read_images=False, controls=controls)
+
+        rna, protein = sdata["RNA"], sdata["Protein"]
+        assert rna.n_vars == N_GENES + (len(self.CONTROLS) if controls == "keep" else 0)
+        assert protein.var["feature_types"].to_dict() == {
+            **{f"Gene_{i}": "Protein Expression" for i in range(N_GENES)},
+            **dict.fromkeys(unverified, "unverified"),
+        }
