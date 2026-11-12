@@ -467,6 +467,23 @@ def test_xenium_csv_only_hex_labels() -> None:
     assert len(_label_ids(sdata["nucleus_labels"])) >= 12  # >= cells (multinucleate)
 
 
+def test_xenium_parquet_only_hex_labels(tmp_path: Path) -> None:
+    # XOA 3.1 exports without cells.zarr.zip ship boundaries as parquet only (sddb_2dzyboj2vd); the
+    # label_id mapping must come from the parquet and give the same labels as the CSV bundle
+    import shutil
+
+    for f in XENIUM_CSV_HEX.iterdir():
+        if f.name.endswith(".csv.gz"):
+            pd.read_csv(f).to_parquet(tmp_path / f.name.replace(".csv.gz", ".parquet"), index=False)
+        else:
+            shutil.copy(f, tmp_path / f.name)
+    kwargs = {"morphology_mip": False, "morphology_focus": False, "aligned_images": False, "transcripts": False}
+    sdata, ref = xenium(tmp_path, **kwargs), xenium(XENIUM_CSV_HEX, **kwargs)
+    for name in ("cell_labels", "nucleus_labels"):
+        assert _label_ids(sdata[name]) == _label_ids(ref[name])
+    assert set(sdata["table"].obs["cell_labels"]) == set(ref["table"].obs["cell_labels"])
+
+
 def test_xenium_degenerate_boundary_dropped(tmp_path: Path) -> None:
     # XOA occasionally emits boundaries with < 4 coordinates, which shapely cannot turn into a ring
     import shutil

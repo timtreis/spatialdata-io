@@ -427,28 +427,25 @@ def xenium(
     # CSV-only bundles (pre-1.3.0 / stripped GEO deposits) ship no cells.zarr.zip, so we read
     # everything from the .csv.gz files instead and leave the context unset; the raster labels are
     # then reconstructed from the boundary polygons (see _get_labels_from_boundaries).
-    # NOTE: a store with no zarr but with parquet-and-no-csv would fall through to the CSV readers and
-    # fail. Such a mix is not produced by XOA or GEO, and it already failed before this PR, so we read
-    # the CSVs directly rather than branch on every file combination.
     if (path / XeniumKeys.CELLS_ZARR).is_file():
         cells_zarr_ctx: _XeniumCells | None = _XeniumCells.open(path, version)
     else:
         cells_zarr_ctx = None
 
-    # cell_id <-> label_index mappings. The zarr provides them; for CSV bundles the same information
-    # lives in the boundary CSVs' ``label_id`` column (v2/v3). Pre-1.3.0 CSVs have no ``label_id``,
+    # cell_id <-> label_index mappings. The zarr provides them; without it the same information lives
+    # in the boundary parquet's or CSV's ``label_id`` column (v2/v3). Pre-1.3.0 CSVs have no ``label_id``,
     # so the mappings stay None and labels are keyed directly by the integer cell_id.
     if cells_zarr_ctx is not None:
         cell_im = cells_zarr_ctx.cell_indices_mapping
         nucleus_im = cells_zarr_ctx.nucleus_indices_mapping
     else:
         cell_im = (
-            _csv_indices_mapping(path, XeniumKeys.CELL_BOUNDARIES_FILE_CSV)
+            _boundary_indices_mapping(path, XeniumKeys.CELL_BOUNDARIES_FILE, XeniumKeys.CELL_BOUNDARIES_FILE_CSV)
             if (cells_boundaries or cells_labels)
             else None
         )
         nucleus_im = (
-            _csv_indices_mapping(path, XeniumKeys.NUCLEUS_BOUNDARIES_FILE_CSV)
+            _boundary_indices_mapping(path, XeniumKeys.NUCLEUS_BOUNDARIES_FILE, XeniumKeys.NUCLEUS_BOUNDARIES_FILE_CSV)
             if (nucleus_boundaries or nucleus_labels)
             else None
         )
@@ -942,17 +939,25 @@ def _has_label_id(csv: Path) -> bool:
     return "label_id" in pd.read_csv(csv, nrows=0).columns
 
 
-def _csv_indices_mapping(path: Path, gz_name: str) -> pd.DataFrame | None:
-    """Build the cell_id <-> label_index mapping from a boundary CSV's ``label_id`` column.
+def _boundary_indices_mapping(path: Path, parquet_name: str, gz_name: str) -> pd.DataFrame | None:
+    """Build the cell_id <-> label_index mapping from a boundary file's ``label_id`` column.
 
-    v2/v3 boundary CSVs carry a ``label_id`` column (the same integer the zarr stores as
-    ``label_index``); pre-1.3.0 CSVs do not, in which case there is nothing to map and ``None`` is
-    returned so labels fall back to the integer ``cell_id``.
+    Reads the parquet when present (bundles without cells.zarr.zip, e.g. XOA 3.1 exports with parquet
+    only), else the CSV. v2/v3 boundary files carry a ``label_id`` column (the same integer the zarr
+    stores as ``label_index``); pre-1.3.0 files do not, in which case there is nothing to map and
+    ``None`` is returned so labels fall back to the integer ``cell_id``.
     """
-    csv = _resolve_csv(path, gz_name)
-    if not _has_label_id(csv):
-        return None
-    df = pd.read_csv(csv, usecols=[str(XeniumKeys.CELL_ID), "label_id"]).drop_duplicates("label_id")
+    columns = [str(XeniumKeys.CELL_ID), "label_id"]
+    if (path / parquet_name).is_file():
+        if "label_id" not in pq.read_schema(path / parquet_name).names:
+            return None
+        df = pq.read_table(path / parquet_name, columns=columns).to_pandas()
+    else:
+        csv = _resolve_csv(path, gz_name)
+        if not _has_label_id(csv):
+            return None
+        df = pd.read_csv(csv, usecols=columns)
+    df = df.drop_duplicates("label_id")
     return pd.DataFrame(
         {"cell_id": _decode_cell_id_column(df[XeniumKeys.CELL_ID]).to_numpy(), "label_index": df["label_id"].to_numpy()}
     )
