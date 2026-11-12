@@ -85,8 +85,9 @@ def _snap_fov_grid(
     Forcing every FOV to the same extent prevents a single
     cropped / malformed FOV from shrinking the canvas.
 
-    A warning is emitted when an image size deviates from *fov_size*
-    by more than *tol* pixels.
+    A smaller image is placed at *fov_size* with a warning; an image larger
+    than *fov_size* by more than *tol* pixels raises ``ValueError``, because
+    placing it would crop the tile.
 
     Parameters
     ----------
@@ -136,6 +137,11 @@ def _snap_fov_grid(
                 _, ah, aw = arr.shape
             else:
                 ah, aw = arr.shape
+            if aw > wanted_w + tol or ah > wanted_h + tol:
+                raise ValueError(
+                    f"FOV {f} has image {aw}x{ah}, larger than the run's FOV {wanted_w}x{wanted_h}; placing it would "
+                    "crop the tile."
+                )
             if abs(aw - wanted_w) > tol or abs(ah - wanted_h) > tol:
                 logger.warning(
                     "FOV %s has image %sx%s but the run's FOV is %sx%s. Placing it at the run's size.",
@@ -654,6 +660,8 @@ def _canvas_from_fov_locs_for_polygons(
         ymaxs = (locs["ymax"].astype(float) - origin_y).to_numpy()
     else:
         raise ValueError("_canvas_from_fov_locs_for_polygons: no fov_size and no xmax / ymax columns.")
+    if not (np.isfinite(xmaxs).all() and np.isfinite(ymaxs).all()):
+        raise ValueError("_canvas_from_fov_locs_for_polygons: the FOV extents are unknown (no exact FOV size).")
 
     min_x = float(xmins.min())
     min_y = float(ymins.min())

@@ -292,6 +292,9 @@ class CosMxDatasetReader:
         If ``True``, keep vector polygons even when rasterizing to labels.
     fov_size
         The run's FOV ``(width, height)`` in px (:func:`_fov_size_px`); every FOV is placed with it.
+    fov_size_exact
+        ``False`` when *fov_size* is only a lower bound (``"local_px_lower_bound"``): then it sizes the FOV boxes
+        only, never a canvas or a y-flip height.
     """
 
     def __init__(
@@ -307,9 +310,11 @@ class CosMxDatasetReader:
         keep_polygons_after_rasterize: bool = False,
         image_normalization_percentile: float | None = None,
         fov_size: tuple[float, float] | None = None,
+        fov_size_exact: bool = True,
     ) -> None:
         self.dataset = dataset
         self.fov_size = fov_size
+        self.fov_size_exact = fov_size_exact
         self.fovs = fovs
         self.n_workers = n_workers or 1
         self.flip_image = bool(flip_image) if flip_image is not None else False
@@ -336,7 +341,7 @@ class CosMxDatasetReader:
             self.fov_locs = _read_fov_locs(
                 dataset.fov_positions_file,
                 fovs=sorted(fovs) if fovs else None,
-                fov_size=fov_size,
+                fov_size=self._placement_size,
             )
         else:
             raise ValueError("FOV positions file is required to read CosMx data.")
@@ -394,8 +399,13 @@ class CosMxDatasetReader:
         return self._poly_df
 
     @property
+    def _placement_size(self) -> tuple[float, float] | None:
+        """The FOV size for canvases and y flips: ``None`` when only a lower bound is known."""
+        return self.fov_size if self.fov_size_exact else None
+
+    @property
     def _fov_height(self) -> float | None:
-        return float(self.fov_size[1]) if self.fov_size is not None else None
+        return float(self._placement_size[1]) if self._placement_size is not None else None
 
     def _ensure_origin(self) -> tuple[float, float]:
         """Return the coordinate origin, loading polygons if needed."""
@@ -523,7 +533,7 @@ class CosMxDatasetReader:
             selected_channels=channels,
             n_workers=self.n_workers,
             tighten_to_seen=tighten,
-            fov_size=self.fov_size,
+            fov_size=self._placement_size,
             **imread_kwargs,
         )
         if stitched is None:
@@ -779,7 +789,7 @@ class CosMxDatasetReader:
             origin_x=ox,
             origin_y=oy,
             fovs=self.fovs,
-            fov_size=self.fov_size,
+            fov_size=self._placement_size,
         )
 
         raster = _polygons_to_label_raster(
@@ -821,7 +831,7 @@ class CosMxDatasetReader:
             flip_image=self.flip_image,
             n_workers=self.n_workers,
             fov_local_to_global=fov_local_to_global,
-            fov_size=self.fov_size,
+            fov_size=self._placement_size,
         )
 
         if stitched is None:
@@ -851,7 +861,7 @@ class CosMxDatasetReader:
             flip_image=self.flip_image,
             n_workers=self.n_workers,
             fovs=self.fovs if self.fovs else None,
-            fov_size=self.fov_size,
+            fov_size=self._placement_size,
         )
         present_ids = {int(x) for x in df["global_cell_id"].to_numpy() if x != 0}
         lbl = _parse_labels(stitched, ox, oy)
@@ -1096,6 +1106,7 @@ def _cosmx_multi(
     skip_empty_fovs: bool,
     preview_fovs: bool,
     pixel_size_um: float | None,
+    fov_size_px: tuple[int, int] | None = None,
 ) -> SpatialData | None:
     """Read a multimodal CosMx dataset (e.g. RNA + Protein)."""
     modalities = dataset.modalities
@@ -1115,10 +1126,26 @@ def _cosmx_multi(
 
     fov_size_info: dict[str, Any] = {"fov_size_px": None, "fov_size_source": None}
     fov_size: tuple[float, float] | None = None
+    fov_size_exact = True
     if read_images or read_labels or read_polygons or read_transcripts or add_fovs_as_shapes or preview_fovs:
-        fov_size_info = _fov_size_px(dataset)
+        fov_size_info = _fov_size_px(dataset, fov_size_px)
         fov_size = cast("tuple[float, float]", tuple(fov_size_info["fov_size_px"]))
-    fov_locs = _read_fov_locs(label_ds.fov_positions_file, fovs=sorted(fov_set) if fov_set else None, fov_size=fov_size)
+        fov_size_exact = fov_size_info["fov_size_source"] != FOV_SIZE_LOWER_BOUND
+    fov_locs = _read_fov_locs(
+        label_ds.fov_positions_file,
+        fovs=sorted(fov_set) if fov_set else None,
+        fov_size=fov_size if fov_size_exact else None,
+    )
+    if fov_size is not None:
+        _check_fov_size_use(
+            fov_size_info,
+            [dataset, *modalities.values()],
+            fov_locs,
+            read_labels=read_labels,
+            read_polygons=read_polygons,
+            read_transcripts=read_transcripts,
+            polygons_as_labels=polygons_as_labels,
+        )
 
     if skip_empty_fovs and (read_images or read_labels):
         fov_locs = _prune_empty_fovs(dataset, fov_locs, fov_set)
@@ -1150,6 +1177,7 @@ def _cosmx_multi(
         keep_polygons_after_rasterize=keep_polygons_after_rasterize,
         image_normalization_percentile=image_normalization_percentile,
         fov_size=fov_size,
+        fov_size_exact=fov_size_exact,
     )
 
     # Pre-load polygons to freeze max_cell_id
@@ -1171,6 +1199,7 @@ def _cosmx_multi(
             fov_locs=fov_locs,
             align_rasters_to_polygons=align_rasters_to_polygons,
             fov_size=fov_size,
+            fov_size_exact=fov_size_exact,
         )
         if base_max_cell_id is not None:
             r.max_cell_id = base_max_cell_id
@@ -1228,61 +1257,94 @@ def _cosmx_multi(
 _CURRENT_CAMERA_LOCAL_EXTENT_PX = (4000.0, COSMX_FOV_SIZE_PX)
 
 
+def _header_hw(path: Path) -> tuple[int, int]:
+    """(height, width) of an image from its header only.
+
+    A TIFF page's ``imagelength`` / ``imagewidth`` are the ImageLength / ImageWidth tags (tifffile 2026.11.8,
+    ``tifffile.py:6290-6294``), so a planar ``(S, H, W)`` page still gives ``(H, W)``; other formats are read by PIL
+    (a scikit-image dependency), which also reads only the header.
+    """
+    if path.suffix.lower() in {".tif", ".tiff"}:
+        with tifffile.TiffFile(path) as tif:
+            page = cast("tifffile.TiffPage", tif.pages[0])
+            return int(page.imagelength), int(page.imagewidth)
+    from PIL import Image
+
+    with Image.open(path) as im:
+        return int(im.size[1]), int(im.size[0])
+
+
+_IMAGE_SUFFIXES = {".tif", ".tiff", ".jpg", ".jpeg", ".png"}
+
+
+def _fov_image_files(dataset: CosMxDataset) -> tuple[str, list[Path]] | None:
+    """The first FOV image directory with files, and its image files, sorted.
+
+    Looked for in ``Morphology2D``, ``RawMorphologyImages``, ``CellLabels`` and ``CellComposite``, in that order.
+    """
+    for name, directory in (
+        ("Morphology2D", dataset.morphology_2d_dir),
+        ("RawMorphologyImages", dataset.raw_morphology_dir),
+        ("CellLabels", dataset.cell_labels_dir),
+        ("CellComposite", dataset.cell_composite_dir),
+    ):
+        if directory is None:
+            continue
+        if name == "CellLabels":
+            files = sorted(find_cell_label_tifs(directory).values())
+        else:
+            suffixes = _IMAGE_SUFFIXES if name == "CellComposite" else {".tif", ".tiff"}
+            files = sorted(p for p in directory.rglob("*") if p.suffix.lower() in suffixes)
+        if files:
+            return name, files
+    return None
+
+
 def _fov_tiff_header(dataset: CosMxDataset) -> tuple[float | None, tuple[int, int] | None, str | None]:
     """``ImPixelSize_nm``, (height, width) and name of the first FOV TIFF, read from its header only.
 
     A morphology TIFF (``Morphology2D``, else ``RawMorphologyImages``) gives all three; without one, a
     ``CellLabels`` TIFF gives the FOV shape.
     """
-    for directory in (dataset.morphology_2d_dir, dataset.raw_morphology_dir, dataset.cell_labels_dir):
-        if directory is None:
-            continue
-        if directory == dataset.cell_labels_dir:
-            tifs = sorted(find_cell_label_tifs(directory).values())
-        else:
-            tifs = sorted(p for p in directory.rglob("*") if p.suffix.lower() in {".tif", ".tiff"})
-        if not tifs:
-            continue
-        with tifffile.TiffFile(tifs[0]) as tif:
-            page = cast("tifffile.TiffPage", tif.pages[0])
-            shape = (int(page.shape[0]), int(page.shape[1]))
-            nm = None
-            if directory != dataset.cell_labels_dir:
-                try:
-                    nm = json.loads(page.description).get("ImPixelSize_nm")
-                except (json.JSONDecodeError, AttributeError):
-                    nm = None
-        return (float(nm) if isinstance(nm, int | float) else None), shape, tifs[0].name
-    return None, None, None
+    found = _fov_image_files(dataset)
+    if found is None or found[0] == "CellComposite":
+        return None, None, None
+    name, files = found
+    nm = None
+    if name != "CellLabels":
+        with tifffile.TiffFile(files[0]) as tif:
+            try:
+                nm = json.loads(cast("tifffile.TiffPage", tif.pages[0]).description).get("ImPixelSize_nm")
+            except (json.JSONDecodeError, AttributeError):
+                nm = None
+    return (float(nm) if isinstance(nm, int | float) else None), _header_hw(files[0]), files[0].name
 
 
 def _fov_image_shape(datasets: list[CosMxDataset]) -> tuple[tuple[int, int], str] | None:
-    """``(width, height)`` and name of the first FOV image, from its header only.
+    """``(width, height)`` of the run's FOV images and where they were read, from every FOV header.
 
-    Looked for in ``Morphology2D``, ``RawMorphologyImages``, ``CellLabels`` and ``CellComposite``, in that order.
+    Takes the first directory with images in the order of :func:`_fov_image_files` and reads the header of every
+    file in it. FOVs of different shapes raise ``ValueError``: every FOV is placed at one size, so a larger tile
+    would be cropped.
     """
     for ds in datasets:
-        _, shape, name = _fov_tiff_header(ds)
-        if shape is not None:
-            return (shape[1], shape[0]), cast(str, name)
-    for ds in datasets:
-        if ds.cell_composite_dir is None:
+        if (found := _fov_image_files(ds)) is None:
             continue
-        imgs = sorted(p for p in ds.cell_composite_dir.rglob("*") if p.suffix.lower() in _COMPOSITE_SUFFIXES)
-        if not imgs:
-            continue
-        if imgs[0].suffix.lower() in {".tif", ".tiff"}:
-            with tifffile.TiffFile(imgs[0]) as tif:
-                page = cast("tifffile.TiffPage", tif.pages[0])
-                return (int(page.shape[1]), int(page.shape[0])), imgs[0].name
-        from PIL import Image  # a scikit-image dependency; reads the header only
-
-        with Image.open(imgs[0]) as im:
-            return (int(im.size[0]), int(im.size[1])), imgs[0].name
+        name, files = found
+        shapes: dict[tuple[int, int], list[str]] = {}
+        for f in files:
+            shapes.setdefault(_header_hw(f), []).append(f.name)
+        if len(shapes) > 1:
+            listed = "; ".join(f"{w} x {h} px ({len(n)} file(s), e.g. {n[0]})" for (h, w), n in sorted(shapes.items()))
+            raise ValueError(
+                f"CosMx FOV images in {name} differ in shape: {listed}. Every FOV is placed at one size, so the larger "
+                "tiles would be cropped."
+            )
+        ((h, w),) = shapes
+        return (w, h), f"{name} ({len(files)} file(s), e.g. {files[0].name})"
     return None
 
 
-_COMPOSITE_SUFFIXES = {".tif", ".tiff", ".jpg", ".jpeg", ".png"}
 # local px columns per file kind: polygon vertices, cell centres, transcripts
 _LOCAL_PX_COLUMNS = {
     "polygons_file": ("x_local_px", "y_local_px"),
@@ -1321,33 +1383,93 @@ def _local_px_max(datasets: list[CosMxDataset]) -> tuple[tuple[float, float], li
     return None
 
 
-def _fov_size_px(dataset: CosMxDataset) -> dict[str, Any]:
-    """The run's FOV ``(width, height)`` in px and its source, resolved once per run.
+# a FOV size from the local px maxima: only a lower bound, used for the FOV boxes and nothing else
+FOV_SIZE_LOWER_BOUND = "local_px_lower_bound"
+_TABLES_ONLY = (
+    "read_images=False, read_labels=False, read_polygons=False, read_transcripts=False and add_fovs_as_shapes=False "
+    "read the tables only"
+)
 
-    1. ``"fov_image"``: the header of the first FOV image (see :func:`_fov_image_shape`).
-    2. ``"local_px_max"``: the largest local px per axis in the run's own files, rounded up (polygon vertices and
-       cell centres, else transcripts). This is a lower bound on the FOV size: no cell or vertex lies beyond it.
 
-    The CosMx spec size is never used: it does not hold for every camera (spatialdata-db-schemas 9a37d86
-    ``specs/nanostring_cosmx.yaml:10``, "NOT valid for the older camera"). With neither source, raise ``ValueError``.
-    """
+def _fov_size_error(detail: str) -> ValueError:
+    return ValueError(f"CosMx FOV size unknown: {detail}. Pass fov_size_px=(width, height) to set it; {_TABLES_ONLY}.")
+
+
+def _fov_size_px(dataset: CosMxDataset, fov_size_px: tuple[int, int] | None = None) -> dict[str, Any]:
+    """The run's FOV ``(width, height)`` in px and its source, resolved once per run, in the order of :func:`cosmx`."""
+    if fov_size_px is not None:
+        w, h = (int(v) for v in fov_size_px)
+        if w <= 0 or h <= 0:
+            raise ValueError(f"fov_size_px must be two positive ints (width, height), got {fov_size_px!r}.")
+        return {"fov_size_px": [w, h], "fov_size_source": "argument"}
     datasets = [dataset, *(dataset.modalities.values() if dataset.modalities else [])]
     if (image := _fov_image_shape(datasets)) is not None:
-        (w, h), name = image
-        logger.info("CosMx FOV size %d x %d px from the FOV image header %s.", w, h, name)
+        (w, h), where = image
+        logger.info("CosMx FOV size %d x %d px from the FOV image headers in %s.", w, h, where)
         return {"fov_size_px": [int(w), int(h)], "fov_size_source": "fov_image"}
     if (extent := _local_px_max(datasets)) is not None:
         (x, y), used = extent
+        lo, hi = _CURRENT_CAMERA_LOCAL_EXTENT_PX
+        if lo <= x <= hi and lo <= y <= hi:
+            # spatialdata-db-schemas 9a37d86 specs/nanostring_cosmx.yaml:12-15 (fov_px_current, 4256 x 4256), applied
+            # by the Lead's T141 rule "NEW 4000-4256" (spatialdata-io-sddb tasks/todo.md:586, "T141 part 1")
+            size = int(COSMX_FOV_SIZE_PX)
+            logger.info(
+                "CosMx FOV size %d x %d px: largest local px %g x %g (%s) is in the current-camera range.",
+                size,
+                size,
+                x,
+                y,
+                "; ".join(used),
+            )
+            return {"fov_size_px": [size, size], "fov_size_source": "spec_current_camera_extent"}
         w, h = math.ceil(x), math.ceil(y)
-        logger.info("CosMx FOV size %d x %d px from the largest local px in %s.", w, h, "; ".join(used))
-        return {"fov_size_px": [int(w), int(h)], "fov_size_source": "local_px_max"}
-    raise ValueError(
-        "CosMx FOV size unknown: no FOV image (Morphology2D, RawMorphologyImages, CellLabels_F*.tif or CellComposite) "
-        "and no local px columns (x_local_px / y_local_px in the polygons or transcripts file, CenterX_local_px / "
-        "CenterY_local_px in the metadata file). Without it FOVs cannot be placed; pass read_images=False, "
-        "read_labels=False, read_polygons=False, read_transcripts=False and add_fovs_as_shapes=False to read the "
-        "tables only."
+        logger.warning(
+            "CosMx FOV size only bounded below: largest local px %g x %g (%s), outside the current-camera range "
+            "%g-%g. It sizes the FOV boxes only; pass fov_size_px=(width, height) for anything else.",
+            x,
+            y,
+            "; ".join(used),
+            lo,
+            hi,
+        )
+        return {"fov_size_px": [int(w), int(h)], "fov_size_source": FOV_SIZE_LOWER_BOUND}
+    raise _fov_size_error(
+        "no FOV image (Morphology2D, RawMorphologyImages, CellLabels_F*.tif or CellComposite) and no local px columns "
+        "(x_local_px / y_local_px in the polygons or transcripts file, CenterX_local_px / CenterY_local_px in the "
+        "metadata file)"
     )
+
+
+def _check_fov_size_use(
+    fov_size_info: dict[str, Any],
+    datasets: list[CosMxDataset],
+    fov_locs: pd.DataFrame | None,
+    *,
+    read_labels: bool,
+    read_polygons: bool,
+    read_transcripts: bool,
+    polygons_as_labels: bool,
+) -> None:
+    """Raise when a read needs an exact FOV size (a canvas or a y-flip height) and only a lower bound is known."""
+    if fov_size_info["fov_size_source"] != FOV_SIZE_LOWER_BOUND:
+        return
+    has_poly = any(ds.polygons_file is not None for ds in datasets)
+    has_tx = any(ds.tx_file is not None for ds in datasets)
+    non_flipped = fov_locs is not None and "flip_y" in fov_locs and bool((~fov_locs["flip_y"].astype(bool)).any())
+    needs = []
+    if read_labels and polygons_as_labels and has_poly:
+        needs.append("the polygon label canvas")
+    if non_flipped and has_poly and (read_polygons or (read_labels and polygons_as_labels)):
+        needs.append("the polygon y flip of px+mm FOVs")
+    if non_flipped and has_tx and read_transcripts:
+        needs.append("the transcript y flip of px+mm FOVs")
+    if needs:
+        w, h = fov_size_info["fov_size_px"]
+        raise _fov_size_error(
+            f"no FOV image, and the largest local px ({w} x {h}) is only a lower bound, which {' and '.join(needs)} "
+            "cannot use"
+        )
 
 
 def _local_px_extent(tables: dict[str, Any]) -> tuple[float, float] | None:
@@ -1613,6 +1735,7 @@ def cosmx(
     preview_fovs: bool = False,
     controls: Literal["keep", "drop"] = "keep",
     pixel_size_um: float | None = None,
+    fov_size_px: tuple[int, int] | None = None,
 ) -> SpatialData | None:
     """Read *CosMx Nanostring* data into a :class:`spatialdata.SpatialData` object.
 
@@ -1696,6 +1819,9 @@ def cosmx(
     pixel_size_um
         µm per pixel stated by the caller, e.g. from the deposit's description. Overrides every other source; see the
         pixel size order below.
+    fov_size_px
+        The FOV ``(width, height)`` in px stated by the caller. Overrides every other source; see the FOV size order
+        below.
 
     Returns
     -------
@@ -1718,6 +1844,21 @@ def cosmx(
        largest ``CenterX_local_px`` and ``CenterY_local_px`` are both within 4000-4256.
     5. ``"unknown"``: otherwise ``pixel_size_um`` is ``None``, a warning names the geometry found, and there is no
        ``"microns"`` coordinate system.
+
+    Every FOV is placed at the run's FOV size, recorded as ``fov_size_px`` ``[width, height]`` with
+    ``fov_size_source`` in ``sdata.attrs["cosmx"]`` (both ``None`` when nothing is placed), resolved in this order:
+
+    1. ``"argument"``: ``fov_size_px``, when given.
+    2. ``"fov_image"``: the headers of every FOV image in the first of ``Morphology2D``, ``RawMorphologyImages``,
+       ``CellLabels`` and ``CellComposite`` that has any; FOVs of different shapes raise ``ValueError``.
+    3. ``"spec_current_camera_extent"``: 4256 x 4256 px, when there is no FOV image and the largest local px
+       (polygon vertices and cell centres, else transcripts) are within 4000-4256 on both axes.
+    4. ``"local_px_lower_bound"``: otherwise those maxima, rounded up. They are only a lower bound and size the FOV
+       boxes only; a read that needs a canvas (polygon labels) or a y-flip height (px+mm FOVs) raises
+       ``ValueError``.
+
+    With none of these, any read that places FOVs raises ``ValueError``. A table cell missing from the labels is
+    kept and logged, never dropped.
     """
     n_workers = n_workers or 1
     path = Path(path).resolve()
@@ -1760,6 +1901,7 @@ def cosmx(
             skip_empty_fovs=skip_empty_fovs,
             preview_fovs=preview_fovs,
             pixel_size_um=pixel_size_um,
+            fov_size_px=fov_size_px,
         )
 
     # --- Single-modality path ---
@@ -1774,6 +1916,7 @@ def cosmx(
     image_models_kwargs, imread_kwargs = _default_image_kwargs(image_models_kwargs, imread_kwargs)
     fov_size_info: dict[str, Any] = {"fov_size_px": None, "fov_size_source": None}
     fov_size: tuple[float, float] | None = None
+    fov_size_exact = True
 
     try:
         fov_locs = _read_fov_locs(dataset.fov_positions_file) if dataset.fov_positions_file else None
@@ -1785,9 +1928,20 @@ def cosmx(
     else:
         places_fovs = read_images or read_labels or read_polygons or read_transcripts or add_fovs_as_shapes
         if fov_locs is not None and (places_fovs or preview_fovs):
-            fov_size_info = _fov_size_px(dataset)
+            fov_size_info = _fov_size_px(dataset, fov_size_px)
             fov_size = cast("tuple[float, float]", tuple(fov_size_info["fov_size_px"]))
-            _set_fov_extent(fov_locs, fov_size)
+            fov_size_exact = fov_size_info["fov_size_source"] != FOV_SIZE_LOWER_BOUND
+            if fov_size_exact:
+                _set_fov_extent(fov_locs, fov_size)
+            _check_fov_size_use(
+                fov_size_info,
+                [dataset],
+                fov_locs,
+                read_labels=read_labels,
+                read_polygons=read_polygons,
+                read_transcripts=read_transcripts,
+                polygons_as_labels=polygons_as_labels,
+            )
 
     if skip_empty_fovs and (read_images or read_labels):
         fov_locs = _prune_empty_fovs(dataset, fov_locs, fov_set)
@@ -1812,6 +1966,7 @@ def cosmx(
         keep_polygons_after_rasterize=keep_polygons_after_rasterize,
         image_normalization_percentile=image_normalization_percentile,
         fov_size=fov_size,
+        fov_size_exact=fov_size_exact,
     )
 
     # Pre-scan cell_ID max across all available files to avoid

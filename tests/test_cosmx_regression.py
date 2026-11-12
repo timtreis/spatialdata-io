@@ -534,8 +534,12 @@ class TestMicrons:
         assert "FOV image 256 x 256 px" in caplog.text
 
         sdata = _read(sdio, fixture_b, pixel_size_um=0.18)
-        assert sdata.attrs["cosmx"]["pixel_size_um"] == 0.18
-        assert sdata.attrs["cosmx"]["pixel_size_source"] == "argument"
+        assert sdata.attrs["cosmx"] == {
+            "pixel_size_um": 0.18,
+            "pixel_size_source": "argument",
+            "fov_size_px": [256, 256],
+            "fov_size_source": "fov_image",
+        }
         for _, name, element in sdata.gen_spatial_elements():
             to_px = get_transformation(element, "global").to_affine_matrix(("x", "y"), ("x", "y"))
             to_um = get_transformation(element, "microns").to_affine_matrix(("x", "y"), ("x", "y"))
@@ -1240,7 +1244,16 @@ class TestLabelAnchoring:
         _write_csv(root / "S0_exprMat_file.csv.gz", _make_expr_mat([1], n_cells=5), compress=True)
         _write_csv(root / "S0_metadata_file.csv.gz", _make_metadata([1], n_cells=5), compress=True)
 
-        sd = sdio.cosmx(root, fovs=[1], read_images=False, read_transcripts=False, read_proteins=False, n_workers=1)
+        # no FOV image and local px outside the current-camera range: the polygon label canvas needs a stated size
+        sd = sdio.cosmx(
+            root,
+            fovs=[1],
+            read_images=False,
+            read_transcripts=False,
+            read_proteins=False,
+            n_workers=1,
+            fov_size_px=(FOV_SIZE, FOV_SIZE),
+        )
         lab = next(iter(sd.labels.values()))
         arr = lab.data if hasattr(lab, "data") else lab["scale0"]["image"].data
         n_label = int((np.asarray(da.unique(arr).compute()) != 0).sum())
@@ -1249,20 +1262,23 @@ class TestLabelAnchoring:
         assert n_table == 5, f"table must hold only the 5 quantified cells, got {n_table}"
 
 
-def _camera_run(root: Path, w: int, h: int, cells: list[tuple[int, int]], *, labels: bool = True) -> Path:
+def _camera_run(
+    root: Path, w: int, h: int, cells: list[tuple[int, int]], *, labels: bool = True, pxmm: bool = False
+) -> Path:
     """A px-only run (like zenodo 11108209 Run5469_S2) of two side-by-side ``w x h`` px FOVs.
 
     Each FOV has a cell at every local ``(x, y)`` in *cells*: a hexagon in the polygons file and, with *labels*, a
-    60 px square in a ``CellLabels_F*.tif`` of shape ``(h, w)``.
+    60 px square in a ``CellLabels_F*.tif`` of shape ``(h, w)``. With *pxmm* the positions also list mm, so the FOVs
+    are not flipped: local y is mirrored about the FOV height (``flip_y`` False).
     """
     import tifffile
 
     root.mkdir(parents=True, exist_ok=True)
     fovs, n = [1, 2], len(cells)
-    _write_csv(
-        root / "R_fov_positions_file.csv",
-        pd.DataFrame({"fov": fovs, "x_global_px": [0.0, float(w)], "y_global_px": [0.0, 0.0]}),
-    )
+    pos = pd.DataFrame({"fov": fovs, "x_global_px": [0.0, float(w)], "y_global_px": [0.0, 0.0]})
+    if pxmm:
+        pos = pos.assign(x_global_mm=pos["x_global_px"] / MM_TO_PX, y_global_mm=pos["y_global_px"] / MM_TO_PX)
+    _write_csv(root / "R_fov_positions_file.csv", pos)
     rows = [
         pt for f in fovs for cid, (cx, cy) in enumerate(cells, 1) for pt in _make_polygon_rows(f, cid, cx, cy, r=25.0)
     ]
@@ -1318,14 +1334,106 @@ class TestFovSize:
         assert self._boxes(sdata) == [(5472, 3648)] * 2
         assert "Forcing spec size" not in caplog.text and "not in the rasterised labels" not in caplog.text
 
-    def test_old_camera_size_from_local_px_without_images(self, sdio, tmp_path):
+    def test_old_camera_without_images_is_a_lower_bound(self, sdio, tmp_path):
         root = _camera_run(tmp_path / "old", 5472, 3648, _OLD_CAMERA_CELLS, labels=False)
-        sdata = sdio.cosmx(root, **self._KW)
-        # polygon vertices reach 5300 + 25 and 3500 + 25 * sin(60°) local px
-        assert sdata.attrs["cosmx"]["fov_size_source"] == "local_px_max"
+        # the polygon label canvas needs an exact FOV size, which the local px maxima are not
+        with pytest.raises(
+            ValueError, match=r"only a lower bound.*polygon label canvas.*fov_size_px=\(width, height\)"
+        ):
+            sdio.cosmx(root, **self._KW)
+        # FOV boxes alone may use the lower bound: polygon vertices reach 5300 + 25 and 3500 + 25 * sin(60°) local px
+        sdata = sdio.cosmx(root, polygons_as_labels=False, **self._KW)
+        assert sdata.attrs["cosmx"]["fov_size_source"] == "local_px_lower_bound"
         assert sdata.attrs["cosmx"]["fov_size_px"] == [5325, 3522]
+        assert self._boxes(sdata) == [(5325, 3522)] * 2
         assert sdata["cell_data"].n_obs == 2 * len(_OLD_CAMERA_CELLS)
-        assert self._label_ids(sdata)[1] >= set(sdata["cell_data"].obs["global_cell_id"].astype(int))
+        # a stated size overrides everything
+        sdata = sdio.cosmx(root, fov_size_px=(5472, 3648), **self._KW)
+        assert sdata.attrs["cosmx"]["fov_size_px"] == [5472, 3648]
+        assert sdata.attrs["cosmx"]["fov_size_source"] == "argument"
+        assert self._label_ids(sdata)[1] == set(sdata["cell_data"].obs["global_cell_id"].astype(int))
+
+    def test_lower_bound_px_mm_polygons_raise(self, sdio, tmp_path):
+        root = _camera_run(tmp_path / "old", 5472, 3648, _OLD_CAMERA_CELLS, labels=False, pxmm=True)
+        with pytest.raises(ValueError, match="polygon y flip of px\\+mm FOVs"):
+            sdio.cosmx(root, polygons_as_labels=False, **self._KW)
+
+    @staticmethod
+    def _gid(sdata, fov: int, cell: int) -> int:
+        obs = sdata["cell_data"].obs
+        sel = (obs["fov"].astype(int) == fov) & (obs["cell_ID"].astype(int) == cell)
+        return int(obs.loc[sel, "global_cell_id"].iloc[0])
+
+    @staticmethod
+    def _label_centre(sdata, gid: int) -> tuple[float, float]:
+        """Global (x, y) of a cell's label pixels."""
+        from spatialdata.transformations import get_transformation
+
+        lab = next(iter(sdata.labels.values()))
+        arr = np.asarray((lab.data if hasattr(lab, "data") else lab["scale0"]["image"].data).compute())
+        rows, cols = np.nonzero(arr == gid)
+        m = get_transformation(lab, "global").to_affine_matrix(("x", "y"), ("x", "y"))
+        x, y, _ = m @ [cols.mean() + 0.5, rows.mean() + 0.5, 1.0]
+        return float(x), float(y)
+
+    @staticmethod
+    def _polygon_centre(sdata, gid: int) -> tuple[float, float]:
+        """Global (x, y) of a cell polygon's centroid."""
+        from spatialdata.transformations import get_transformation
+
+        shp = next(v for k, v in sdata.shapes.items() if "fov_box" not in k)
+        g = shp.loc[gid].geometry.centroid
+        m = get_transformation(shp, "global").to_affine_matrix(("x", "y"), ("x", "y"))
+        x, y, _ = m @ [g.x, g.y, 1.0]
+        return float(x), float(y)
+
+    @pytest.mark.parametrize("pxmm", [True, False])
+    def test_old_camera_cell_lands_at_its_local_px(self, sdio, tmp_path, pxmm):
+        # cell 3 sits at local (4500, 1000) of FOV 2 (x0 = 5472): a px+mm FOV mirrors y about the height 3648, so a
+        # width / height swap would put it at 5472 - 1000. Polygons and CellLabels must both land there.
+        root = _camera_run(tmp_path / "old", 5472, 3648, _OLD_CAMERA_CELLS, pxmm=pxmm)
+        sdata = sdio.cosmx(root, polygons_as_labels=False, **self._KW)
+        assert sdata.attrs["cosmx"]["fov_size_px"] == [5472, 3648]
+        gid = self._gid(sdata, 2, 3)
+        want = (5472 + 4500, 3648 - 1000 if pxmm else 1000)
+        for x, y in (self._label_centre(sdata, gid), self._polygon_centre(sdata, gid)):
+            assert abs(x - want[0]) <= 1.5 and abs(y - want[1]) <= 1.5, (x, y, want)
+        assert sdata["cell_data"].n_obs == 2 * len(_OLD_CAMERA_CELLS)
+
+    @pytest.mark.parametrize("pxmm", [True, False])
+    def test_current_camera_without_images_uses_4256(self, sdio, tmp_path, pxmm):
+        # no FOV image, local px maxima in the T141 current-camera range 4000-4256: 4256 x 4256 px, as 7ea45a5 placed it
+        cells = [(200, 200), (2000, 1800), (4100, 1000), (3000, 4050)]
+        root = _camera_run(tmp_path / "cur", 4256, 4256, cells, labels=False, pxmm=pxmm)
+        sdata = sdio.cosmx(root, polygons_as_labels=False, **self._KW)
+        assert sdata.attrs["cosmx"]["fov_size_px"] == [4256, 4256]
+        assert sdata.attrs["cosmx"]["fov_size_source"] == "spec_current_camera_extent"
+        assert self._boxes(sdata) == [(4256, 4256)] * 2
+        x, y = self._polygon_centre(sdata, self._gid(sdata, 1, 3))
+        assert abs(x - 4100) <= 1.5
+        assert abs(y - (4256 - 1000 if pxmm else 1000)) <= 1.5, y
+
+    def test_fov_images_of_different_shapes_raise(self, sdio, tmp_path):
+        import tifffile
+
+        root = _camera_run(tmp_path / "mixed", 5472, 3648, _OLD_CAMERA_CELLS)
+        tifffile.imwrite(root / "CellLabels" / "CellLabels_F002.tif", np.zeros((3000, 5000), dtype=np.uint16))
+        with pytest.raises(ValueError, match=r"CellLabels differ in shape: 5000 x 3000 px .*; 5472 x 3648 px"):
+            sdio.cosmx(root, **self._KW)
+
+    def test_tile_larger_than_the_stated_size_raises(self, sdio, tmp_path):
+        root = _camera_run(tmp_path / "old", 5472, 3648, _OLD_CAMERA_CELLS)
+        with pytest.raises(ValueError, match="larger than the run's FOV 4256x4256; placing it would crop the tile"):
+            sdio.cosmx(root, fov_size_px=(4256, 4256), polygons_as_labels=False, **self._KW)
+
+    def test_planar_tiff_header_gives_height_and_width(self, tmp_path):
+        import tifffile
+
+        from spatialdata_io.readers.cosmx._reader import _header_hw
+
+        p = tmp_path / "planar.tif"
+        tifffile.imwrite(p, np.zeros((3, 40, 70), dtype=np.uint8), planarconfig="separate", photometric="rgb")
+        assert _header_hw(p) == (40, 70)
 
     @pytest.mark.parametrize("polygons_as_labels", [True, False])
     def test_current_camera_run_unchanged(self, sdio, tmp_path, polygons_as_labels):
@@ -1347,7 +1455,7 @@ class TestFovSize:
         )
         _write_csv(root / "R_exprMat_file.csv", _make_expr_mat([1]))
         _write_csv(root / "R_metadata_file.csv", _make_metadata([1]))
-        with pytest.raises(ValueError, match="CosMx FOV size unknown: no FOV image"):
+        with pytest.raises(ValueError, match=r"CosMx FOV size unknown: no FOV image.*fov_size_px=\(width, height\)"):
             sdio.cosmx(root, n_workers=1)
         # the tables alone need no FOV size
         kw = dict.fromkeys(
@@ -1367,7 +1475,7 @@ class TestFovSize:
         _write_csv(root / "S0_exprMat_file.csv", _make_expr_mat([1], n_cells=6))
         _write_csv(root / "S0_metadata_file.csv", _make_metadata([1], n_cells=6))
         with caplog.at_level("WARNING"):
-            sdata = sdio.cosmx(root, **self._KW)
+            sdata = sdio.cosmx(root, fov_size_px=(FOV_SIZE, FOV_SIZE), **self._KW)
         assert sdata["cell_data"].n_obs == 6
         assert "1 of 6 cell(s) are not in the rasterised labels; they are kept" in caplog.text
 
@@ -1381,7 +1489,7 @@ class TestFovSize:
         _write_csv(root / "S0_exprMat_file.csv", _make_expr_mat([1], n_cells=5))
         _write_csv(root / "S0_metadata_file.csv", _make_metadata([1], n_cells=4))
         with caplog.at_level("WARNING"):
-            sdata = sdio.cosmx(root, **self._KW)
+            sdata = sdio.cosmx(root, fov_size_px=(FOV_SIZE, FOV_SIZE), **self._KW)
         obs = sdata["cell_data"].obs
         assert len(obs) == 5
         assert obs["cell_ID"].astype(int).tolist() == [1, 2, 3, 4, 5]
@@ -1817,7 +1925,7 @@ class TestSkipEmptyFovs:
         )
         keys = [k for k in sd.shapes if "fov_box" in k]
         assert keys and len(sd.shapes[keys[0]]) == 2
-        assert sd.attrs["cosmx"]["fov_size_source"] == "local_px_max"
+        assert sd.attrs["cosmx"]["fov_size_source"] == "local_px_lower_bound"
 
 
 class TestDetectFovsWithData:

@@ -214,6 +214,12 @@ def codex_wrapper(
     default=None,
     help="Stated µm per pixel; overrides the positions file, the TIFF header and the spec. [default: None]",
 )
+@click.option(
+    "--fov-size-px",
+    type=(int, int),
+    default=None,
+    help="Stated FOV width and height in px; overrides the FOV image headers and the local px. [default: None]",
+)
 def cosmx_wrapper(
     input: str,
     output: str,
@@ -239,6 +245,7 @@ def cosmx_wrapper(
     preview_fovs: bool = False,
     controls: Literal["keep", "drop"] = "keep",
     pixel_size_um: float | None = None,
+    fov_size_px: tuple[int, int] | None = None,
 ) -> None:
     """CosMx conversion to SpatialData."""
     from spatialdata_io.readers.cosmx import cosmx
@@ -267,6 +274,7 @@ def cosmx_wrapper(
         preview_fovs=preview_fovs,
         controls=controls,
         pixel_size_um=pixel_size_um,
+        fov_size_px=fov_size_px,
     )
     if sdata is not None:
         sdata.write(output)
