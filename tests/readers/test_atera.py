@@ -347,7 +347,7 @@ _TABLE_ONLY = {
 }
 
 
-@pytest.mark.parametrize("var_columns", [None, [str(AteraKeys.FEATURE_NAME)]])
+@pytest.mark.parametrize("var_columns", [None, [str(AteraKeys.FEATURE_NAME)], [str(AteraKeys.VAR_GENOME)]])
 def test_atera_keeps_controls(atera_qc_path: Path, var_columns: list[str] | None) -> None:
     from spatialdata_io.readers.atera import atera
 
@@ -355,7 +355,9 @@ def test_atera_keeps_controls(atera_qc_path: Path, var_columns: list[str] | None
     sdata = atera(atera_qc_path, **_TABLE_ONLY, **({} if var_columns is None else {"var_columns": var_columns}))
     table, protein = sdata["table"], sdata["table_protein"]
     assert set(sdata.tables) == {"table", "table_protein"}
-    assert table.var_names.tolist() == ["GENE_A", "NegControlProbe_1", "GENE_B", "UnassignedCodeword_7"]
+    # without feature_name the index stays the bundle's feature_id
+    names = str(AteraKeys.FEATURE_ID) if var_columns == [str(AteraKeys.VAR_GENOME)] else str(AteraKeys.FEATURE_NAME)
+    assert table.var_names.tolist() == QC_VAR.reset_index()[names].tolist()[:4]
     assert table.var["feature_types"].tolist() == QC_VAR[str(AteraKeys.VAR_FEATURE_TYPE)].tolist()[:4]
     assert table.n_vars + protein.n_vars == len(QC_VAR)
     np.testing.assert_array_equal(np.asarray(table.X.compute().toarray()), QC_X[:, :4])
@@ -387,8 +389,9 @@ def test_atera_controls_round_trip(atera_qc_path: Path, tmp_path_factory: pytest
         np.testing.assert_array_equal(back[key].X.toarray(), np.asarray(sdata[key].X.compute().toarray()))
 
 
-def test_read_table_for_cells_keeps_every_feature(atera_qc_path: Path) -> None:
-    table = read_table_for_cells(atera_qc_path, cell_ids=[CELL_IDS[2], CELL_IDS[0]], var_columns=["feature_name"])
+@pytest.mark.parametrize("var_columns", [[str(AteraKeys.FEATURE_NAME)], [str(AteraKeys.VAR_GENOME)]])
+def test_read_table_for_cells_keeps_every_feature(atera_qc_path: Path, var_columns: list[str]) -> None:
+    table = read_table_for_cells(atera_qc_path, cell_ids=[CELL_IDS[2], CELL_IDS[0]], var_columns=var_columns)
     assert table.var["feature_types"].tolist() == QC_VAR[str(AteraKeys.VAR_FEATURE_TYPE)].tolist()
     np.testing.assert_array_equal(table.X.toarray(), QC_X[[2, 0]])
 

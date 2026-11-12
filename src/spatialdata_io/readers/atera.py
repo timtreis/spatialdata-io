@@ -336,16 +336,16 @@ def _xenium_var(var: pd.DataFrame) -> pd.DataFrame:
     from anndata.utils import make_index_unique
 
     name, ftype = str(AteraKeys.FEATURE_NAME), str(AteraKeys.VAR_FEATURE_TYPE)
+    var = var.rename(columns={ftype: "feature_types"})  # also without names: split_by_feature_type needs it
     if name not in var.columns:
         return var
-    var = var.copy()
     fid = str(AteraKeys.FEATURE_ID)
     var["gene_ids"] = (var[fid] if fid in var.columns else var.index.to_series()).astype(str).to_numpy()
     var.index = pd.Index(var[name].astype(str).to_numpy())  # from a Series, pd.Index would keep its name
     if not var.index.is_unique:
         logging.warning(f"{int(var.index.duplicated().sum())} duplicate feature names; made unique with a suffix.")
         var.index = make_index_unique(var.index)
-    return var.rename(columns={ftype: "feature_types"})
+    return var
 
 
 def _select_var_columns(var: pd.DataFrame, var_columns: list[str] | Literal["all"]) -> pd.DataFrame:
