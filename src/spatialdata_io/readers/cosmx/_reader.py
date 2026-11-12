@@ -24,15 +24,17 @@ import re
 import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Literal, cast, overload
+from typing import Any, Literal, cast, overload
 
 import dask.array as da
 import dask.dataframe as dd
 import geopandas as gpd
 import numpy as np
 import pandas as pd
+import scipy.sparse
 import shapely.geometry as sgeom
 import tifffile
+from anndata import AnnData
 from shapely.affinity import translate as _translate
 from spatialdata import SpatialData, sanitize_table
 from spatialdata._logging import logger
@@ -90,9 +92,6 @@ from ._utils import (
     detect_fovs_with_data,
     find_cell_label_tifs,
 )
-
-if TYPE_CHECKING:
-    from anndata import AnnData
 
 __all__ = ["cosmx"]
 
@@ -1022,6 +1021,8 @@ class CosMxDatasetReader:
 
         adata.obs["region_key"] = pd.Series(region, index=adata.obs.index, dtype="category")
 
+        is_protein = (modality or _modality_from_ancestors(self.dataset.exprMat_file, self.dataset.path)) == "Protein"
+        tables = {"cell_data": adata}
         if bg_df is not None:
             # var-aligned (genes x FOVs): as an uns DataFrame its gene columns become zarr keys, and probe names
             # like "Gstp1/2" are not valid keys. Set before sanitize_table so varm follows any var renaming.
@@ -1029,23 +1030,63 @@ class CosMxDatasetReader:
             if len(missing):
                 raise ValueError(f"Background rows lack {len(missing)} gene(s) of the table, e.g. {list(missing[:3])}")
             adata.varm["fov_bg_signal"] = pd.DataFrame(
-                bg_df[adata.var_names].to_numpy().T, index=adata.var_names, columns=[f"fov_{f}" for f in bg_df.index]
+                bg_df[adata.var_names].to_numpy().T, index=adata.var_names, columns=[f"fov_{f}" for f in bg_df["fov"]]
             )
+            tables[UNASSIGNED_TABLE] = _unassigned_table(bg_df, adata.var.copy(), is_protein=is_protein)
 
-        if (modality or _modality_from_ancestors(self.dataset.exprMat_file, self.dataset.path)) == "Protein":
-            adata.var["feature_types"] = feature_types_by_name(adata.var_names, _COSMX_PROTEIN_UNVERIFIED, PROTEIN)
-        else:
-            adata.var["feature_types"] = feature_types_by_name(adata.var_names, COSMX_NAME_RULES)
-            # by name there are only genes and controls, so the split returns one table; varm follows the subset
-            adata = split_by_feature_type(adata, controls=controls)["table"]
+        for name, t in tables.items():
+            if is_protein:
+                t.var["feature_types"] = feature_types_by_name(t.var_names, _COSMX_PROTEIN_UNVERIFIED, PROTEIN)
+            else:
+                t.var["feature_types"] = feature_types_by_name(t.var_names, COSMX_NAME_RULES)
+                # by name there are only genes and controls, so the split returns one table; varm follows the subset
+                t = split_by_feature_type(t, controls=controls)["table"]
+            # Zarr-safe, case-insensitively unique obs/var keys (spatialdata core),
+            # then categoricals → string (zarr cannot serialize categoricals).
+            sanitize_table(t)
+            _pandas_categoricals_to_string(cast(pd.DataFrame, t.obs))
+            tables[name] = t
 
-        # Zarr-safe, case-insensitively unique obs/var keys (spatialdata core),
-        # then categoricals → string (zarr cannot serialize categoricals).
-        sanitize_table(adata)
-        _pandas_categoricals_to_string(cast(pd.DataFrame, adata.obs))
+        tables["cell_data"] = _parse_cell_table(tables["cell_data"], region=region)
+        return tables
 
-        table = _parse_cell_table(adata, region=region)
-        return {"cell_data": table}
+
+UNASSIGNED_TABLE = "unassigned_per_fov"
+# vendor wording verbatim ("show" sic), from the table "expression matrix file format for AtoMx SIP v1.3.2", cell_ID row
+_RNA_CELL_ID_ZERO = "All transcripts not assigned to a cell are show with a cell_ID value of 0."
+_RNA_CELL_ID_ZERO_SOURCE = (
+    "https://nanostring.com/wp-content/uploads/2024/11/MK6578_CosMx_Human_Lymph_Node_FFPE_Dataset_webpage.html"
+)
+
+
+def _unassigned_table(bg: pd.DataFrame, var: pd.DataFrame, *, is_protein: bool) -> AnnData:
+    """The exprMat's ``cell_ID == 0`` rows as a table of their own: one row per exprMat row, the cell table's features.
+
+    ``obs`` holds ``fov`` (and the slide column, when the exprMat has one), indexed by the FOV id, ``<slide>_<fov>``
+    where FOV ids repeat across slides. It annotates no element.
+    """
+    keys = [c for c in bg.columns if c not in var.index]
+    obs = bg[keys].reset_index(drop=True)
+    index = obs["fov"].astype(str)
+    if index.duplicated().any() and len(keys) > 1:
+        index = obs[keys[1]].astype(str) + "_" + index
+    if index.duplicated().any():
+        raise ValueError(f"cell_ID == 0 rows repeat a FOV id, e.g. {index[index.duplicated()].head(3).tolist()}")
+    obs.index = pd.Index(index.to_numpy(), dtype=str)
+    table = AnnData(X=scipy.sparse.csr_matrix(bg[var.index].to_numpy()), obs=obs, var=var)
+    info: dict[str, Any] = {
+        "source": "exprMat rows with cell_ID == 0",
+        "n_rows": int(table.n_obs),
+        "n_fovs": int(obs[keys].drop_duplicates().shape[0]),
+    }
+    if is_protein:
+        info["note"] = "cell_ID 0 rows of the exprMat (vendor definition: pending)"
+    else:
+        info["note"] = "cell_ID 0 rows of the exprMat (vendor definition: see vendor_definition)"
+        info["vendor_definition"] = _RNA_CELL_ID_ZERO
+        info["vendor_source"] = _RNA_CELL_ID_ZERO_SOURCE
+    table.uns["cosmx_unassigned"] = info
+    return table
 
 
 # ---------------------------------------------------------------------------
@@ -1242,7 +1283,9 @@ def _cosmx_multi(
             if label_ids:
                 _count_cells_outside_labels(mod_tables, label_ids, source_label="rasterised labels")
             if mod_tables:
-                tables[mod_name] = next(iter(mod_tables.values()))
+                tables[mod_name] = mod_tables["cell_data"]
+            if UNASSIGNED_TABLE in mod_tables:
+                tables[f"{UNASSIGNED_TABLE}_{mod_name}"] = mod_tables[UNASSIGNED_TABLE]
 
     logger.debug("[5/5] Assembling SpatialData object...")
     return _assemble_sdata(images, points, labels, shapes, tables, label_ds, pixel_size_um, fov_size_info)
@@ -1584,7 +1627,8 @@ def _assemble_sdata(
             sdata.set_table_annotates_spatialelement(table_name, region=main_label)
 
     for table in sdata.tables.values():
-        _set_observation_unit(table, "cell", None)
+        if "cosmx_unassigned" not in table.uns:  # its rows are exprMat cell_ID == 0 rows, not cells
+            _set_observation_unit(table, "cell", None)
     return _set_reader_metadata(sdata, "cosmx")
 
 
@@ -1829,7 +1873,10 @@ def cosmx(
     :class:`spatialdata.SpatialData` or ``None`` (if ``preview_fovs=True``).
 
     Tables: a single-modality run gives one table, ``cell_data``; a multimodal run gives one table per
-    modality, ``RNA`` and ``Protein``, annotating the same labels.
+    modality, ``RNA`` and ``Protein``, annotating the same labels. The exprMat rows with ``cell_ID == 0`` are not
+    cells: they are kept as read in ``unassigned_per_fov`` (multimodal: ``unassigned_per_fov_<modality>``), with the
+    cell table's features, ``obs`` ``fov`` (and the slide column) and ``uns["cosmx_unassigned"]``; it annotates no
+    element.
 
     Every element is in pixels in ``"global"``, and in µm in ``"microns"`` (the same transformation followed by a
     scale) when the pixel size is known. ``sdata.attrs["cosmx"]`` records it as ``pixel_size_um`` with

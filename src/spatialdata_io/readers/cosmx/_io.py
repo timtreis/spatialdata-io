@@ -291,13 +291,13 @@ def _read_expr_mat_polars(
     n_rows: int | None = None,
     fovs: set[int] | None = None,
 ) -> tuple[AnnData, pd.DataFrame | None]:
-    """Read expression matrix, filtering out background (cell_ID=0).
+    """Read the expression matrix; its ``cell_ID == 0`` rows are returned apart, not as cells.
 
     Returns
     -------
     tuple of (AnnData, bg_df or None)
-        The cell expression table and, if any cell_ID=0 rows were present,
-        a DataFrame of per-FOV background signal indexed by ``fov``.
+        The cell expression table and, if any ``cell_ID == 0`` rows were present, those rows as read: ``fov``, the
+        slide column when there is one, and every feature column, one row per exprMat row.
     """
     schema = pl.read_csv(expr_path, n_rows=100).schema
     # Some GEO exports key cells only by the AtoMx string id (`cell_id` = c_<slide>_<fov>_<cell>, no fov column).
@@ -319,6 +319,7 @@ def _read_expr_mat_polars(
     if parse_ids:
         meta_cols = ["cell", *meta_cols, *(["slide"] if "slide" not in schema else [])]
     obs_cols = ["fov", "cell_ID", "fov_cellID", *meta_cols]
+    bg_cols = ["fov", *[c for c in _SLIDE_COLS if c in meta_cols][:1], *expr_cols]
 
     def prep(df: pl.DataFrame) -> pl.DataFrame:
         lf = _parse_atomx_cell_ids(df.lazy(), id_col, expr_path.name) if parse_ids else df.lazy()
@@ -344,7 +345,7 @@ def _read_expr_mat_polars(
             batch = prep(pl.DataFrame(pa.Table.from_batches([block])))
             is_bg = batch["cell_ID"] == 0
             if is_bg.any():
-                bg_parts.append(batch.filter(is_bg).select(["fov", *expr_cols]))
+                bg_parts.append(batch.filter(is_bg).select(bg_cols))
                 batch = batch.filter(~is_bg)
             obs_parts.append(batch.select(obs_cols))
             x_parts.append(scipy.sparse.csr_matrix(batch.select(expr_cols).to_numpy()))
@@ -353,12 +354,12 @@ def _read_expr_mat_polars(
 
     bg_df: pd.DataFrame | None = None
     if bg_parts:
-        bg_df = pl.concat(bg_parts).to_pandas().set_index("fov")
-        bg_df.index = bg_df.index.astype(int)
+        bg_df = pl.concat(bg_parts).to_pandas()
+        bg_df["fov"] = bg_df["fov"].astype(int)
         logger.info(
-            "Filtered %d background row(s) (cell_ID=0) from expression matrix across %d FOV(s).",
+            "Kept %d cell_ID == 0 row(s) of the expression matrix (%d FOV(s)) apart from the cells.",
             len(bg_df),
-            bg_df.index.nunique(),
+            bg_df["fov"].nunique(),
         )
 
     obs = _index_by_cell(pl.concat(obs_parts).to_pandas(), expr_path.name)

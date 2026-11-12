@@ -2174,7 +2174,7 @@ class TestExprMatMetadataColumns:
         assert list(adata.var_names) == ["GENE1"]
         assert adata.obs["cell"].tolist() == ["c_1_1_1"]
         assert adata.X.toarray().tolist() == [[4]]
-        assert bg.columns.tolist() == ["GENE1"]
+        assert bg.columns.tolist() == ["fov", "GENE1"]
 
     def test_batched_read_matches_single_batch(self, tmp_path, monkeypatch):
         from spatialdata_io.readers.cosmx import _io
@@ -2189,7 +2189,7 @@ class TestExprMatMetadataColumns:
         adata, bg = _io._read_expr_mat_polars(p)
         assert adata.obs_names.tolist() == full.obs_names.tolist() == ["1_1", "1_2", "2_1"]
         assert adata.X.toarray().tolist() == full.X.toarray().tolist() == [[0, 5], [3, 0], [1, 2]]
-        assert bg.equals(full_bg) and bg.loc[2].tolist() == [8, 6]
+        assert bg.equals(full_bg) and bg.values.tolist() == [[1, 9, 7], [2, 8, 6]]
 
     def test_r_exported_rownames_and_metadata(self, tmp_path):
         from spatialdata_io.readers.cosmx._io import _read_expr_mat_polars
@@ -2469,3 +2469,85 @@ class TestFeatureTypes:
             **{f"Gene_{i}": "Protein Expression" for i in range(N_GENES)},
             **dict.fromkeys(unverified, "unverified"),
         }
+
+
+class TestUnassignedPerFov:
+    """The exprMat's cell_ID == 0 rows are kept as read in their own table, never as cells."""
+
+    _with_bg = TestFeatureTypes._with_controls
+
+    def test_counts_land_exactly_and_cells_unchanged(self, sdio, fixture_a, tmp_path):
+        expr = self._with_bg(fixture_a, tmp_path / "d", "S0_exprMat_file.csv.gz", list(TestFeatureTypes.CONTROLS))
+        sdata = _read(sdio, tmp_path / "d", read_images=False)
+        plain = _read(sdio, fixture_a, read_images=False)["cell_data"]
+        cells, un = sdata["cell_data"], sdata["unassigned_per_fov"]
+
+        bg = expr[expr["cell_ID"] == 0]
+        features = expr.columns[2:].tolist()
+        assert un.obs_names.tolist() == bg["fov"].astype(str).tolist()
+        assert un.obs["fov"].tolist() == bg["fov"].tolist()
+        np.testing.assert_array_equal(un.X.toarray(), bg[features].to_numpy())
+        pd.testing.assert_frame_equal(un.var, cells.var)
+        assert un.uns["cosmx_unassigned"] == {
+            "source": "exprMat rows with cell_ID == 0",
+            "n_rows": len(bg),
+            "n_fovs": bg["fov"].nunique(),
+            "note": "cell_ID 0 rows of the exprMat (vendor definition: see vendor_definition)",
+            "vendor_definition": "All transcripts not assigned to a cell are show with a cell_ID value of 0.",
+            "vendor_source": "https://nanostring.com/wp-content/uploads/2024/11/MK6578_CosMx_Human_Lymph_Node_FFPE_Dataset_webpage.html",
+        }
+        assert "spatialdata_attrs" not in un.uns  # annotates no element
+        assert un.uns.get("spatialdata_io", {}).get("observation_unit") is None
+        # the cell table is the one read without the cell_ID == 0 rows
+        assert cells.obs_names.tolist() == plain.obs_names.tolist()
+        np.testing.assert_array_equal(cells[:, plain.var_names].X.toarray(), plain.X.toarray())
+
+    def test_drop_controls_filters_like_the_cell_table(self, sdio, fixture_a, tmp_path):
+        expr = self._with_bg(fixture_a, tmp_path / "d", "S0_exprMat_file.csv.gz", list(TestFeatureTypes.CONTROLS))
+        sdata = _read(sdio, tmp_path / "d", read_images=False, controls="drop")
+        un = sdata["unassigned_per_fov"]
+        genes = [c for c in expr.columns if c.startswith("Gene_")]
+        pd.testing.assert_frame_equal(un.var, sdata["cell_data"].var)
+        assert un.var_names.tolist() == genes
+        np.testing.assert_array_equal(un.X.toarray(), expr.loc[expr["cell_ID"] == 0, genes].to_numpy())
+
+    def test_round_trip(self, sdio, fixture_a, tmp_path):
+        import spatialdata as sd
+
+        self._with_bg(fixture_a, tmp_path / "d", "S0_exprMat_file.csv.gz", list(TestFeatureTypes.CONTROLS))
+        sdata = _read(sdio, tmp_path / "d", read_images=False)
+        sdata.write(tmp_path / "x.zarr")
+        back = sd.read_zarr(tmp_path / "x.zarr")
+        for name in ("cell_data", "unassigned_per_fov"):
+            assert (back[name].X != sdata[name].X).nnz == 0
+            pd.testing.assert_frame_equal(back[name].var, sdata[name].var)
+        pd.testing.assert_frame_equal(back["unassigned_per_fov"].obs, sdata["unassigned_per_fov"].obs)
+        assert back["unassigned_per_fov"].uns["cosmx_unassigned"] == sdata["unassigned_per_fov"].uns["cosmx_unassigned"]
+
+    def test_no_table_without_cell_id_zero_rows(self, sdio, fixture_a):
+        assert "unassigned_per_fov" not in _read(sdio, fixture_a, read_images=False).tables
+
+    def test_multimodal_one_table_per_modality(self, sdio, fixture_multimodal, tmp_path):
+        rna = self._with_bg(fixture_multimodal, tmp_path / "mm", "S0RNA_exprMat_file.csv", [])
+        prot = self._with_bg(tmp_path / "mm", tmp_path / "p", "S0Protein_exprMat_file.csv", [])
+        sdata = sdio.cosmx(tmp_path / "p", n_workers=1, read_transcripts=False, read_images=False)
+
+        for mod, expr in (("RNA", rna), ("Protein", prot)):
+            un = sdata[f"unassigned_per_fov_{mod}"]
+            bg = expr[expr["cell_ID"] == 0]
+            np.testing.assert_array_equal(un.X.toarray(), bg[un.var_names].to_numpy())
+            pd.testing.assert_frame_equal(un.var, sdata[mod].var)
+        assert sdata["unassigned_per_fov_Protein"].uns["cosmx_unassigned"]["note"] == (
+            "cell_ID 0 rows of the exprMat (vendor definition: pending)"
+        )
+        assert "vendor_definition" not in sdata["unassigned_per_fov_Protein"].uns["cosmx_unassigned"]
+        assert "vendor_definition" in sdata["unassigned_per_fov_RNA"].uns["cosmx_unassigned"]
+
+    def test_fov_ids_repeating_across_slides_are_keyed_by_slide(self):
+        from spatialdata_io.readers.cosmx._reader import _unassigned_table
+
+        bg = pd.DataFrame({"fov": [1, 1], "slide": ["A", "B"], "G1": [3, 4]})
+        un = _unassigned_table(bg, pd.DataFrame(index=pd.Index(["G1"])), is_protein=False)
+        assert un.obs_names.tolist() == ["A_1", "B_1"]
+        assert un.obs["slide"].tolist() == ["A", "B"]
+        assert un.uns["cosmx_unassigned"]["n_fovs"] == 2
