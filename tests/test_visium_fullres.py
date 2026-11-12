@@ -30,7 +30,10 @@ def _space_ranger(
     genes = ["G1", "G2"]
     rows = [",".join(["", *genes])] + [f"{b},{i},{i + 1}" for i, b in enumerate(spots)]
     (root / "counts.csv").write_text("\n".join(rows) + "\n")
-    positions = [f"{b},{t},{i // 2},{i % 2},{y},{x}" for i, (b, (t, (x, y))) in enumerate(spots.items())]
+    # Visium array (10x): a spot's array_col has the parity of its array_row
+    positions = [
+        f"{b},{t},{i // 2},{2 * (i % 2) + (i // 2) % 2},{y},{x}" for i, (b, (t, (x, y))) in enumerate(spots.items())
+    ]
     (root / "spatial" / "tissue_positions_list.csv").write_text("\n".join(positions) + "\n")
     scalefactors = {"spot_diameter_fullres": 90.0, "tissue_hires_scalef": 0.1, "tissue_lowres_scalef": 0.03}
     (root / "spatial" / "scalefactors_json.json").write_text(json.dumps(scalefactors))
@@ -101,3 +104,25 @@ def test_fullres_image_not_matching_the_hires_downscale_is_skipped(
         sdata = _read(_space_ranger(tmp_path, image_shape, hires_shape=hires_shape))
     assert "S1_full_image" not in sdata.images
     assert "tissue_hires_scalef" in caplog.text
+
+
+def test_px_per_um_from_the_visium_array() -> None:
+    from spatialdata_io.readers.visium import _px_per_um
+
+    rows, cols = np.meshgrid(np.arange(6), np.arange(0, 12, 2), indexing="ij")
+    cols = cols + rows % 2  # 10x: even columns on even rows, odd on odd rows
+    # neighbours in a row are 100 µm apart (one column = 50 µm); the row step (here 1.74 columns, as on Space Ranger
+    # output) must not matter
+    um = np.stack([cols.ravel() * 50.0, rows.ravel() * 1.74 * 50.0], axis=1)
+    theta, scale = np.deg2rad(37.0), 2.47  # px per µm, under any rotation and a flip
+    rot = scale * np.array([[np.cos(theta), -np.sin(theta)], [np.sin(theta), np.cos(theta)]]) @ np.diag([1, -1])
+    xy = um @ rot.T + [1234.5, 678.9]
+    assert _px_per_um(np.stack([cols.ravel(), rows.ravel()], axis=1), xy) == pytest.approx(scale)
+
+
+def test_px_per_um_refuses_a_non_visium_array() -> None:
+    from spatialdata_io.readers.visium import _px_per_um
+
+    rows, cols = np.meshgrid(np.arange(4), np.arange(4), indexing="ij")  # a square grid, e.g. sddb_24dexki6yf
+    with pytest.raises(ValueError, match="not on a Visium v1/v2 array"):
+        _px_per_um(np.stack([cols.ravel(), rows.ravel()], axis=1).astype(float), np.random.rand(16, 2))

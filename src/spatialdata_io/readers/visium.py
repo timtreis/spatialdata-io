@@ -13,7 +13,6 @@ import scipy.sparse as sp
 from anndata import AnnData, read_h5ad
 from dask_image.imread import imread
 from imageio import imread as imread2
-from scipy.spatial import cKDTree
 from spatialdata import SpatialData
 from spatialdata._logging import logger
 from spatialdata.models import Image2DModel, ShapesModel, TableModel
@@ -64,6 +63,11 @@ def visium(
     The gene expression is the table ``"table"``. A Gene and Protein (CytAssist) counts file also holds Antibody
     Capture features, which become a second table ``"table_protein"`` annotating the same spots; antibody counts in
     a separate file are read with ``protein_file``.
+
+    The spot circles have the physical size of the capture spots: 10x states Visium spots are 55 µm in diameter, spaced
+    100 µm apart. The pixels per µm follow from the spots' array positions and that 100 µm spacing. Space Ranger's
+    ``spot_diameter_fullres`` is not used for the circles: 10x describes it as a visualization estimate of 60-70 µm, not
+    the spot size.
 
     .. seealso::
 
@@ -221,14 +225,11 @@ def visium(
         )
         scalefactors = json.loads(scalefactors_file.read_bytes())
     else:
-        # e.g. GSE263617: Visium spots are 55 µm wide at 100 µm centre-to-centre (instrument spec), so the diameter
-        # follows from the spot spacing; the hires/lowres images cannot be placed without their scale factors
-        pitch = float(np.median(cKDTree(spot_coords).query(spot_coords, k=2)[0][:, 1]))
-        scalefactors = {"spot_diameter_fullres": 0.55 * pitch}
-        logger.warning(
-            f"No scale factors file in {path}: spot diameter {0.55 * pitch:.1f} px from the spot spacing (55 µm spots "
-            "at 100 µm); the hires/lowres images are skipped."
-        )
+        # e.g. GSE263617: the hires/lowres images cannot be placed without their scale factors
+        scalefactors = {}
+        logger.warning(f"No scale factors file in {path}: the hires/lowres images are skipped.")
+    # the circles are the physical spots, placed by the array (spots 100 µm apart), never by spot_diameter_fullres
+    px_per_um = _px_per_um(adata.obs[["array_col", "array_row"]].to_numpy(float), spot_coords)
 
     transform_original = Identity()
     transforms = {
@@ -240,7 +241,7 @@ def visium(
     circles = ShapesModel.parse(
         spot_coords,
         geometry=0,
-        radius=scalefactors["spot_diameter_fullres"] / 2.0,
+        radius=_SPOT_DIAMETER_UM / 2.0 * px_per_um,
         index=adata.obs["spot_id"].copy(),
         transformations={dataset_id: transform_original}
         | {f"{dataset_id}_downscaled_{res}": t for res, t in transforms.items()},
@@ -374,6 +375,35 @@ def _read_image(image_file: Path, imread_kwargs: dict[str, Any]) -> Any:
 
 # a full-resolution image must contain (almost) all in-tissue spots; deposited crops and CytAssist images do not
 _MIN_SPOTS_INSIDE_FULLRES = 0.99
+# Visium array (10x Space Ranger outputs docs, "Tissue positions"): array_col "uses even numbers ... for even rows, and
+# odd numbers ... for odd rows", so spots next to each other in a row are 2 columns apart, and the 10x glossary states the
+# spots are "spaced 100 µm apart": one array_col step is 50 µm. The row spacing is not used (on Space Ranger output
+# the row step is 1.74 column steps, not the sqrt(3) of an ideal hexagon).
+_ARRAY_COL_UM = 50.0
+# physical diameter of a Visium v1/v2 capture spot (10x glossary: "55 µm in diameter, spaced 100 µm apart")
+_SPOT_DIAMETER_UM = 55.0
+
+
+def _px_per_um(array_col_row: np.ndarray, spot_xy: np.ndarray) -> float:
+    """Full-resolution pixels per µm, from the spots' array positions and pixel positions.
+
+    A least-squares affine fit of the pixel positions on ``(array_col, array_row)`` gives the pixel step of one array
+    column, which is 50 µm. Raises if the array is not Visium's, where a spot's column and row have the same parity.
+    """
+    col, row = array_col_row[:, 0].astype(int), array_col_row[:, 1].astype(int)
+    if np.any((col - row) % 2):
+        raise ValueError(
+            "The spots are not on a Visium v1/v2 array (array_col and array_row of a spot must be both even or both "
+            "odd), so the pixel size cannot be derived from it."
+        )
+    design = np.column_stack([array_col_row, np.ones(len(array_col_row))])
+    coef, *_ = np.linalg.lstsq(design, spot_xy, rcond=None)
+    px_per_col = float(np.linalg.norm(coef[0]))
+    if px_per_col == 0:
+        raise ValueError("Cannot derive the pixel size from spots that all share one array column.")
+    return px_per_col / _ARRAY_COL_UM
+
+
 # Space Ranger makes the hires image by scaling the full-resolution image by tissue_hires_scalef (then rounding)
 _MAX_HIRES_SIZE_ERROR = 0.01
 

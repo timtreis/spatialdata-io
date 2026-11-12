@@ -126,9 +126,17 @@ def test_visium_circles_are_the_spot_coordinates(sdata: SpatialData, dataset_pat
     assert circles.index.tolist() == table.obs["spot_id"].tolist()
     assert all(isinstance(geometry, Point) for geometry in circles.geometry)
 
+    # the circles are the physical 55 µm spots; 10x: spots are 100 µm apart, so the nearest-neighbour distance in
+    # pixels gives the pixels per µm independently of the reader's fit to the array positions
+    xy = positions[[VisiumKeys.SPOTS_X, VisiumKeys.SPOTS_Y]].to_numpy(float)
+    nearest = np.sort(np.linalg.norm(xy[:, None] - xy[None], axis=-1), axis=1)[:, 1]
+    px_per_um = np.median(nearest) / 100.0
+    radius = circles[ShapesModel.RADIUS_KEY].to_numpy()
+    assert np.ptp(radius) == 0
+    assert radius[0] == pytest.approx(55.0 / 2 * px_per_um, rel=0.01)
+    # 10x's spot_diameter_fullres is a visualization estimate of 60-70 µm, so it is not the circle size
     scalefactors = json.loads((dataset_path / "spatial" / VisiumKeys.SCALEFACTORS_FILE).read_bytes())
-    expected_radius = scalefactors["spot_diameter_fullres"] / 2.0
-    assert np.array_equal(circles[ShapesModel.RADIUS_KEY], np.full(len(table), expected_radius))
+    assert 60 <= scalefactors["spot_diameter_fullres"] / px_per_um <= 70
 
 
 def test_visium_dataset_id_is_inferred_from_the_counts_file(dataset_path: Path, sdata: SpatialData) -> None:

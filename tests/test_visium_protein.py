@@ -35,7 +35,9 @@ def _space_ranger(root: Path) -> Path:
         g["genome"] = np.array([b"GRCh38"] * len(_FEATURES))
         g["_all_tag_keys"] = np.array([b"genome"])
     positions = ["barcode,in_tissue,array_row,array_col,pxl_row_in_fullres,pxl_col_in_fullres"]
-    positions += [f"{b},1,0,{i},100,{100 + 50 * i}" for i, b in enumerate(_BARCODES)]
+    positions += [
+        f"{b},1,0,{2 * i},100,{100 + 50 * i}" for i, b in enumerate(_BARCODES)
+    ]  # row neighbours, 100 µm apart
     (root / "spatial" / "tissue_positions.csv").write_text("\n".join(positions) + "\n")
     scalefactors = {"spot_diameter_fullres": 40.0, "tissue_hires_scalef": 0.1, "tissue_lowres_scalef": 0.03}
     (root / "spatial" / "scalefactors_json.json").write_text(json.dumps(scalefactors))
@@ -68,7 +70,7 @@ def test_spot_diameter_from_spacing_without_scale_factors(tmp_path: Path) -> Non
     root = _space_ranger(tmp_path / "S1")
     (root / "spatial" / "scalefactors_json.json").unlink()  # GSE263617 deposits none
     sdata = visium(root)
-    assert sdata.shapes["S1"]["radius"].iloc[0] == 0.55 * 50 / 2  # spots 50 px apart
+    assert sdata.shapes["S1"]["radius"].iloc[0] == pytest.approx(55 / 2 * 0.5)  # 50 px per 100 µm: 0.5 px/µm
     assert not sdata.images and set(sdata.coordinate_systems) == {"S1"}
 
 
