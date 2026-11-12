@@ -80,6 +80,11 @@ def test_genes_only_is_returned_as_is() -> None:
     assert split_by_feature_type(adata, controls="drop")["table"] is adata
 
 
+def test_no_main_table_without_its_features() -> None:
+    tables = split_by_feature_type(_adata(["Antibody Capture"] * 2))
+    assert set(tables) == {"table_protein"}
+
+
 def test_bad_controls_value() -> None:
     with pytest.raises(ValueError, match="'keep' or 'drop'"):
         split_by_feature_type(_adata(TYPES), controls="none")  # type: ignore[arg-type]

@@ -98,7 +98,8 @@ def split_by_feature_type(
 
     Returns
     -------
-    The tables by name; `adata` itself is the main table when it has nothing to move or drop.
+    The tables by name; `adata` itself is the main table when it has nothing to move or drop. Without any feature
+    for the main table, there is no main table unless it would be the only one.
     """
     if controls not in ("keep", "drop"):
         raise ValueError(f"`controls` must be 'keep' or 'drop', got {controls!r}.")
@@ -110,7 +111,7 @@ def split_by_feature_type(
         if n := int((main & ~is_gene).sum()):
             logger.info(f"Dropped {n} control feature(s) from {name!r} (controls='drop').")
         main &= is_gene
-    tables = {name: adata if main.all() else _subset(adata, main)}
-    for key in dict.fromkeys(keys[keys != name]):
-        tables[str(key)] = _subset(adata, keys == key)
-    return tables
+    others = {str(key): _subset(adata, keys == key) for key in dict.fromkeys(keys[keys != name])}
+    if not main.any() and others:  # e.g. a counts file of antibodies only
+        return others
+    return {name: adata if main.all() else _subset(adata, main), **others}

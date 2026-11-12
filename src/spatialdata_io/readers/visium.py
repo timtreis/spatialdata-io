@@ -5,7 +5,7 @@ import os
 import re
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import numpy as np
 import pandas as pd
@@ -21,6 +21,7 @@ from xarray import DataArray
 
 from spatialdata_io._constants._constants import VisiumKeys
 from spatialdata_io._docs import inject_docs
+from spatialdata_io.readers._utils._features import GENE_EXPRESSION, split_by_feature_type
 from spatialdata_io.readers._utils._utils import (
     _add_gene_id_and_genome,
     _read_counts,
@@ -44,6 +45,7 @@ def visium(
     scalefactors_file: str | Path | None = None,
     var_names_make_unique: bool = True,
     protein_file: str | Path | None = None,
+    controls: Literal["keep", "drop"] = "keep",
     imread_kwargs: Mapping[str, Any] = MappingProxyType({}),
     image_models_kwargs: Mapping[str, Any] = MappingProxyType({}),
     **kwargs: Any,
@@ -62,7 +64,7 @@ def visium(
 
     The gene expression is the table ``"table"``. A Gene and Protein (CytAssist) counts file also holds Antibody
     Capture features, which become a second table ``"table_protein"`` annotating the same spots; antibody counts in
-    a separate file are read with ``protein_file``.
+    a separate file are read with ``protein_file``. Any other feature type becomes ``"table_<type>"``.
 
     The spot circles have the physical size of the capture spots: 10x states Visium spots are 55 µm in diameter, spaced
     100 µm apart. The pixels per µm follow from the spots' array positions and that 100 µm spacing. Space Ranger's
@@ -100,6 +102,10 @@ def visium(
         ``*_Protein.h5ad``): a delimited table of antibodies x barcodes (either orientation) or an ``.h5ad`` with
         the barcodes as ``obs_names``. It becomes ``"table_protein"`` on the spots it shares with the counts file;
         its values are taken as deposited.
+    controls
+        ``"keep"`` keeps any control features in ``"table"``, ``"drop"`` removes them. Every feature is typed by
+        ``var["feature_types"]``, the 10x ``feature_type`` (``Gene Expression`` where the counts file has none);
+        Antibody Capture goes to ``"table_protein"`` and any other type to ``"table_<type>"``.
     imread_kwargs
         Keyword arguments passed to :func:`dask_image.imread.imread`.
     image_models_kwargs
@@ -248,15 +254,12 @@ def visium(
     )
     shapes[dataset_id] = circles
     adata.obs["region"] = dataset_id
-    tables = {}
-    feature_types = adata.var.get("feature_types")
-    for key, kind in (("table", "Gene Expression"), ("table_protein", "Antibody Capture")):
-        if feature_types is None:
-            if key == "table":
-                tables[key] = adata
-        elif (keep := (feature_types == kind).to_numpy()).any():
-            tables[key] = adata[:, keep].copy()
-            tables[key].var_names = var_names[keep].tolist()
+    if "feature_types" not in adata.var:
+        adata.var["feature_types"] = GENE_EXPRESSION
+    adata.var["_name"] = var_names.astype(str).to_numpy()
+    tables = split_by_feature_type(adata, controls=controls)
+    for t in tables.values():
+        t.var_names = t.var.pop("_name").tolist()
     if protein_file is not None:
         if "table_protein" in tables:
             raise ValueError(f"{counts_file} already holds Antibody Capture features; drop `protein_file`.")

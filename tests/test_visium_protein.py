@@ -19,10 +19,10 @@ _BARCODES = ["AAAC-1", "AAAG-1", "AAAT-1"]
 _FEATURES = [("CD3", "Gene Expression"), ("G2", "Gene Expression"), ("CD3", "Antibody Capture")]
 
 
-def _space_ranger(root: Path) -> Path:
+def _space_ranger(root: Path, features: list[tuple[str, str]] = _FEATURES) -> Path:
     (root / "spatial").mkdir(parents=True)
     # features x barcodes, as in a 10x HDF5 matrix
-    counts = sp.csc_matrix(np.array([[1, 0, 2], [0, 3, 0], [7, 8, 9]]))
+    counts = sp.csc_matrix(np.array([[1, 0, 2], [0, 3, 0], [7, 8, 9], [4, 0, 1], [0, 0, 5]])[: len(features)])
     with h5py.File(root / "S1_filtered_feature_bc_matrix.h5", "w") as f:
         f.attrs["library_ids"] = np.array([b"S1"])
         m = f.create_group("matrix")
@@ -30,9 +30,9 @@ def _space_ranger(root: Path) -> Path:
         m["data"], m["indices"], m["indptr"] = counts.data, counts.indices, counts.indptr
         m["shape"] = np.array(counts.shape)
         g = m.create_group("features")
-        g["id"] = g["name"] = np.array([n for n, _ in _FEATURES], dtype="S")
-        g["feature_type"] = np.array([t for _, t in _FEATURES], dtype="S")
-        g["genome"] = np.array([b"GRCh38"] * len(_FEATURES))
+        g["id"] = g["name"] = np.array([n for n, _ in features], dtype="S")
+        g["feature_type"] = np.array([t for _, t in features], dtype="S")
+        g["genome"] = np.array([b"GRCh38"] * len(features))
         g["_all_tag_keys"] = np.array([b"genome"])
     positions = ["barcode,in_tissue,array_row,array_col,pxl_row_in_fullres,pxl_col_in_fullres"]
     positions += [
@@ -84,3 +84,27 @@ def test_protein_file_in_either_orientation(tmp_path: Path) -> None:
     np.testing.assert_array_equal(protein.X.toarray(), [[5], [3]])
     with pytest.raises(ValueError, match="already holds Antibody Capture"):
         visium(root, protein_file="adt.csv.gz")
+
+
+_OTHER = [*_FEATURES, ("NEG1", "Negative Control Probe"), ("sg1", "CRISPR Guide Capture")]
+
+
+@pytest.mark.parametrize("controls", ["keep", "drop"])
+def test_other_feature_types_get_their_own_table(tmp_path: Path, controls: str) -> None:
+    sdata = visium(_space_ranger(tmp_path / "S1", _OTHER), controls=controls)
+    assert set(sdata.tables) == {"table", "table_protein", "table_crispr_guide_capture"}
+    rna = sdata["table"]
+    if controls == "keep":
+        assert list(rna.var_names) == ["CD3", "G2", "NEG1"]
+        assert list(rna.var["feature_types"]) == ["Gene Expression", "Gene Expression", "Negative Control Probe"]
+        np.testing.assert_array_equal(rna.X.toarray(), [[1, 0, 4], [0, 3, 0], [2, 0, 1]])
+        assert sum(t.n_vars for t in sdata.tables.values()) == len(_OTHER)
+    else:
+        assert list(rna.var_names) == ["CD3", "G2"]
+    np.testing.assert_array_equal(sdata["table_crispr_guide_capture"].X.toarray(), [[0], [0], [5]])
+    np.testing.assert_array_equal(sdata["table_protein"].X.toarray(), [[7], [8], [9]])
+    sdata.write(tmp_path / "x.zarr")
+    back = read_zarr(tmp_path / "x.zarr")
+    for key, t in sdata.tables.items():
+        assert back[key].var_names.equals(t.var_names)
+        assert back[key].var["feature_types"].tolist() == t.var["feature_types"].tolist()
