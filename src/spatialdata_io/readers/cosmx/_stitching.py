@@ -27,10 +27,7 @@ from skimage.draw import polygon
 from spatialdata._logging import logger
 from tqdm.auto import tqdm
 
-from ._io import (
-    COSMX_FOV_SIZE_PX,
-    _read_fov_image,
-)
+from ._io import _read_fov_image
 from ._utils import FOV_DIR_RE, MORPH_FOV_RE, compute_with_limit
 
 # ---------------------------------------------------------------------------
@@ -77,18 +74,18 @@ def _snap_fov_grid(
     fov_locs: pd.DataFrame,
     fov_arrays: dict[int, da.Array] | dict[int, np.ndarray] | None = None,
     *,
-    fov_size: float = COSMX_FOV_SIZE_PX,
+    fov_size: tuple[float, float] | None = None,
     tol: int = 8,
 ) -> pd.DataFrame:
-    """Normalize FOV boxes to a 0-based canvas using the CosMx spec size.
+    """Normalize FOV boxes to a 0-based canvas using the run's FOV size.
 
-    CosMx local coordinates span 0 .. *fov_size* (default 4256) for both
-    axes.  Polygon CSVs are written in that frame and the rasterizer uses
+    CosMx local coordinates span 0 .. width and 0 .. height of the run's
+    FOV.  Polygon CSVs are written in that frame and the rasterizer uses
     ``fov_locs["xmax"]`` / ``fov_locs["ymax"]`` to build the canvas.
     Forcing every FOV to the same extent prevents a single
     cropped / malformed FOV from shrinking the canvas.
 
-    A warning is emitted when the actual image size deviates from the spec
+    A warning is emitted when an image size deviates from *fov_size*
     by more than *tol* pixels.
 
     Parameters
@@ -99,7 +96,8 @@ def _snap_fov_grid(
         Optional mapping of FOV id to the image array for that FOV
         (used only for sanity-checking dimensions).
     fov_size
-        Expected tile width **and** height in pixels.
+        The run's FOV ``(width, height)`` in pixels.  ``None`` takes it from the
+        first FOV's array in *fov_arrays* (sorted by FOV id).
     tol
         Tolerance in pixels before a size-mismatch warning is raised.
 
@@ -117,8 +115,13 @@ def _snap_fov_grid(
     x_min = float(fov_locs["xmin"].min())
     y_min = float(fov_locs["ymin"].min())
 
-    wanted_w = int(round(fov_size))
-    wanted_h = int(round(fov_size))
+    if fov_size is None:
+        if not fov_arrays:
+            raise ValueError("_snap_fov_grid: no fov_size and no FOV arrays to take it from.")
+        first = fov_arrays[min(fov_arrays)]
+        fov_size = (float(first.shape[-1]), float(first.shape[-2]))
+    wanted_w = int(round(fov_size[0]))
+    wanted_h = int(round(fov_size[1]))
 
     for f in fov_locs.index:
         x0 = int(round(float(fov_locs["xmin"].loc[f]) - x_min))
@@ -135,7 +138,7 @@ def _snap_fov_grid(
                 ah, aw = arr.shape
             if abs(aw - wanted_w) > tol or abs(ah - wanted_h) > tol:
                 logger.warning(
-                    "FOV %s has image %sx%s but CosMx expects %sx%s. Forcing spec size.",
+                    "FOV %s has image %sx%s but the run's FOV is %sx%s. Placing it at the run's size.",
                     f,
                     aw,
                     ah,
@@ -187,6 +190,7 @@ def _read_stitched_image(
     selected_channels: list[str] | None = None,
     n_workers: int | None = None,
     tighten_to_seen: bool = False,
+    fov_size: tuple[float, float] | None = None,
     **imread_kwargs: Any,
 ) -> tuple[da.Array, list[str], float, float] | tuple[None, list[str], float, float]:
     """Stitch per-FOV morphology (and optional protein) TIFFs into one image.
@@ -217,6 +221,8 @@ def _read_stitched_image(
     tighten_to_seen
         Snap the canvas over only image-bearing FOVs, so phantom / image-less
         FOVs neither anchor the origin nor inflate it (issue #37).
+    fov_size
+        The run's FOV ``(width, height)`` in px, see :func:`_snap_fov_grid`.
     **imread_kwargs
         Forwarded to :func:`dask_image.imread.imread`.
 
@@ -268,7 +274,7 @@ def _read_stitched_image(
 
     # Snap only image-bearing FOVs when tightening (issue #37).
     snap_locs = fov_locs.loc[sorted(seen_fovs)].copy() if tighten_to_seen else fov_locs
-    fov_locs = _snap_fov_grid(snap_locs, fov_images)
+    fov_locs = _snap_fov_grid(snap_locs, fov_images, fov_size=fov_size)
 
     used_ox = float(fov_locs.loc[seen_fovs, "xmin"].min())
     used_oy = float(fov_locs.loc[seen_fovs, "ymin"].min())
@@ -338,6 +344,7 @@ def _read_stitched_cell_labels_from_dir(
     flip_image: bool = False,
     n_workers: int | None = None,
     fov_local_to_global: dict[int, np.ndarray] | None = None,
+    fov_size: tuple[float, float] | None = None,
 ) -> tuple[da.Array | None, set[int], pd.DataFrame]:
     """Read flat ``CellLabels_Fxxx.tif`` images and stitch them.
 
@@ -359,6 +366,8 @@ def _read_stitched_cell_labels_from_dir(
         Parallelism cap for :func:`compute_with_limit`.
     fov_local_to_global
         Per-FOV look-up table mapping local cell ids to global ids.
+    fov_size
+        The run's FOV ``(width, height)`` in px, see :func:`_snap_fov_grid`.
 
     Returns
     -------
@@ -408,7 +417,7 @@ def _read_stitched_cell_labels_from_dir(
         return None, set(), fov_locs
 
     stitched_fov_locs = fov_locs.loc[sorted(seen_fovs)].copy()
-    stitched_fov_locs = _snap_fov_grid(stitched_fov_locs, fov_tiles)
+    stitched_fov_locs = _snap_fov_grid(stitched_fov_locs, fov_tiles, fov_size=fov_size)
 
     total_y = int(stitched_fov_locs["y1"].max())
     total_x = int(stitched_fov_locs["x1"].max())
@@ -608,7 +617,7 @@ def _canvas_from_fov_locs_for_polygons(
     origin_x: float,
     origin_y: float,
     fovs: set[int] | None = None,
-    fov_size: float = COSMX_FOV_SIZE_PX,
+    fov_size: tuple[float, float] | None = None,
 ) -> tuple[float, float, int, int]:
     """Compute canvas dimensions from FOV positions in polygon space.
 
@@ -624,7 +633,7 @@ def _canvas_from_fov_locs_for_polygons(
     fovs
         Optional FOV id subset.
     fov_size
-        Expected tile extent in pixels.
+        The run's FOV ``(width, height)`` in px; ``None`` uses ``xmax`` / ``ymax``.
 
     Returns
     -------
@@ -638,15 +647,13 @@ def _canvas_from_fov_locs_for_polygons(
     xmins = (locs["xmin"].astype(float) - origin_x).to_numpy()
     ymins = (locs["ymin"].astype(float) - origin_y).to_numpy()
 
-    if "xmax" in locs.columns:
+    if fov_size is not None:
+        xmaxs, ymaxs = xmins + fov_size[0], ymins + fov_size[1]
+    elif {"xmax", "ymax"}.issubset(locs.columns):
         xmaxs = (locs["xmax"].astype(float) - origin_x).to_numpy()
-    else:
-        xmaxs = xmins + fov_size
-
-    if "ymax" in locs.columns:
         ymaxs = (locs["ymax"].astype(float) - origin_y).to_numpy()
     else:
-        ymaxs = ymins + fov_size
+        raise ValueError("_canvas_from_fov_locs_for_polygons: no fov_size and no xmax / ymax columns.")
 
     min_x = float(xmins.min())
     min_y = float(ymins.min())
@@ -688,6 +695,7 @@ def stitch_segmentation_label_image(
     flip_image: bool = False,
     n_workers: int | None = None,
     fovs: set[int] | None = None,
+    fov_size: tuple[float, float] | None = None,
 ) -> tuple[da.Array, pd.DataFrame]:
     """Stitch per-FOV label TIFFs from a CellStatsDir layout.
 
@@ -715,6 +723,8 @@ def stitch_segmentation_label_image(
         Parallelism cap for :func:`compute_with_limit`.
     fovs
         Optional set of FOV IDs to include. If ``None``, all FOVs are used.
+    fov_size
+        The run's FOV ``(width, height)`` in px, see :func:`_snap_fov_grid`.
 
     Returns
     -------
@@ -727,7 +737,7 @@ def stitch_segmentation_label_image(
 
     path = Path(path)
     dataset_id = _infer_dataset_id(path, dataset_id)
-    fov_locs = _read_fov_locs(Path(fov_position_file))
+    fov_locs = _read_fov_locs(Path(fov_position_file), fov_size=fov_size)
 
     df = pd.read_csv(cell_info_file)
     if fovs is not None:
@@ -785,7 +795,7 @@ def stitch_segmentation_label_image(
 
         fov_tiles[fov] = tile
 
-    fov_locs = _snap_fov_grid(fov_locs, fov_tiles)
+    fov_locs = _snap_fov_grid(fov_locs, fov_tiles, fov_size=fov_size)
 
     total_y = int(fov_locs["y1"].max())
     total_x = int(fov_locs["x1"].max())
@@ -830,12 +840,11 @@ def _plot_fov_preview(
     fov_locs: pd.DataFrame,
     selected_fovs: set[int] | None = None,
     *,
-    fov_size: float = COSMX_FOV_SIZE_PX,
+    fov_size: tuple[float, float],
 ) -> None:
     """Render a preview of the FOV layout using matplotlib.
 
-    Each FOV is drawn as a square with the real CosMx tile size (default
-    4256 x 4256 px) and labelled with its FOV id.  The Y axis is inverted
+    Each FOV is drawn as a box of the run's FOV size and labelled with its FOV id.  The Y axis is inverted
     to match the CosMx top-left origin convention.
 
     Parameters
@@ -845,7 +854,7 @@ def _plot_fov_preview(
     selected_fovs
         If given, only these FOV ids are drawn.
     fov_size
-        Tile size in pixels.
+        The run's FOV ``(width, height)`` in px.
 
     Raises
     ------
@@ -873,9 +882,10 @@ def _plot_fov_preview(
     fov_ids = df["fov"].astype(int).to_numpy()
 
     x_min = float(x0s.min())
-    x_max = float((x0s + fov_size).max())
+    fov_w, fov_h = fov_size
+    x_max = float((x0s + fov_w).max())
     y_min = float(y0s.min())
-    y_max = float((y0s + fov_size).max())
+    y_max = float((y0s + fov_h).max())
     n = len(fov_ids)
 
     if n <= 40:
@@ -892,8 +902,8 @@ def _plot_fov_preview(
     for x, y, _f in zip(x0s.tolist(), y0s.tolist(), fov_ids, strict=False):
         rect = Rectangle(
             (x, y),
-            fov_size,
-            fov_size,
+            fov_w,
+            fov_h,
             fill=False,
             edgecolor="black",
             linewidth=0.8,
@@ -907,12 +917,12 @@ def _plot_fov_preview(
         "fontsize": fontsize,
     }
     for x, y, f in zip(x0s.tolist(), y0s.tolist(), fov_ids, strict=False):
-        cx = x + fov_size / 2.0
-        cy = y + fov_size / 2.0
+        cx = x + fov_w / 2.0
+        cy = y + fov_h / 2.0
         ax.text(cx, cy, str(f), **text_kwargs)
 
-    ax.set_xlim(x_min - fov_size * 0.05, x_max + fov_size * 0.05)
-    ax.set_ylim(y_max + fov_size * 0.05, y_min - fov_size * 0.05)
+    ax.set_xlim(x_min - fov_w * 0.05, x_max + fov_w * 0.05)
+    ax.set_ylim(y_max + fov_h * 0.05, y_min - fov_h * 0.05)
     ax.set_aspect("equal")
 
     ax.set_xlabel("Global X (px)")

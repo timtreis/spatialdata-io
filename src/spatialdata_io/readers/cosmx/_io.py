@@ -42,6 +42,9 @@ if TYPE_CHECKING:
 
 COSMX_PIXEL_SIZE = 0.120280945
 MM_TO_PX = 1000.0 / COSMX_PIXEL_SIZE
+# The current-camera FOV (spatialdata-db-schemas 9a37d86 specs/nanostring_cosmx.yaml:12-15, fov_px_current:
+# "All FOVs are the same dimension, 4256 x 4256 pixels."). Only the spec pixel size check compares against it; the
+# reader places every FOV with the run's own size (``_fov_size_px``).
 COSMX_FOV_SIZE_PX = 4256.0
 
 
@@ -74,10 +77,19 @@ class NoFovCoordinatesError(ValueError):
     """The FOV positions file lists FOVs but no pixel or mm coordinates (some GEO re-exports)."""
 
 
+def _set_fov_extent(fov_locs: pd.DataFrame, fov_size: tuple[float, float] | None) -> pd.DataFrame:
+    """Set ``xmax`` / ``ymax`` from the run's FOV size ``(width, height)`` in px; NaN when it is not known."""
+    w, h = fov_size if fov_size is not None else (math.nan, math.nan)
+    fov_locs["xmax"] = fov_locs["xmin"].astype(float) + float(w)
+    fov_locs["ymax"] = fov_locs["ymin"].astype(float) + float(h)
+    return fov_locs
+
+
 def _read_fov_locs(
     csv_path: Path,
     *,
     fovs: list[int] | None = None,
+    fov_size: tuple[float, float] | None = None,
 ) -> pd.DataFrame:
     df = pd.read_csv(csv_path)
 
@@ -150,9 +162,8 @@ def _read_fov_locs(
         }
     )
 
-    # 6) add width/height and the per-FOV flip flag
-    df["xmax"] = df["xmin"].astype(float) + COSMX_FOV_SIZE_PX
-    df["ymax"] = df["ymin"].astype(float) + COSMX_FOV_SIZE_PX
+    # 6) add width/height (the run's FOV size, see ``_fov_size_px``) and the per-FOV flip flag
+    _set_fov_extent(df, fov_size)
     df["flip_y"] = bool(needs_extra_flip)
 
     # 7) index + optional subset
@@ -434,6 +445,7 @@ def place_local_in_fov_grid(
     y_local_col: str = "y_local_px",
     out_x: str = "x_global_px",
     out_y: str = "y_global_px",
+    fov_height: float | None = None,
 ) -> Any:
     """Overwrite *out_x* / *out_y* with stitched-grid coordinates.
 
@@ -441,16 +453,16 @@ def place_local_in_fov_grid(
 
         x_global = x0 + x_local
         y_global = y0 + y_local                  if the FOV is flipped
-                 = y0 + (FOV_SIZE - y_local)      otherwise
+                 = y0 + (FOV_HEIGHT - y_local)    otherwise
 
     where ``x0``/``y0`` are the FOV's ``xmin``/``ymin``.  This mirrors the
     placement :func:`_read_polygons_csv` applies to polygon vertices, so
     transcripts co-register with polygons by construction (both share the
     same per-FOV local coordinate system).
 
-    The flip height is the fixed CosMx FOV size, not ``fov_locs['ymax']`` —
-    image stitching may overwrite ``ymax`` with the actual raster height,
-    which must not perturb coordinate placement.
+    The flip height is *fov_height*, the run's FOV height (the reader passes it, so a
+    stitched tile that overwrote ``ymax`` does not perturb placement); without it, each
+    FOV's ``ymax - ymin``.  A non-flipped FOV with neither raises ``ValueError``.
 
     Looked up per row via ``Series.map`` (no join/shuffle), so it works for
     both pandas and Dask DataFrames.  *df* must contain *fov_col*,
@@ -465,7 +477,15 @@ def place_local_in_fov_grid(
     # dtype there, which ``where`` rejects):
     #   flip:   y = y0 + y_local            -> offset = y0,        sign = +1
     #   noflip: y = y0 + (FOV - y_local)    -> offset = y0 + FOV,  sign = -1
-    y_off = (y0 + (~flip) * COSMX_FOV_SIZE_PX).to_dict()
+    if fov_height is not None:
+        height = pd.Series(float(fov_height), index=fov_locs.index)
+    elif "ymax" in fov_locs.columns:
+        height = fov_locs["ymax"].astype(float) - y0
+    else:
+        height = pd.Series(math.nan, index=fov_locs.index)
+    if (~flip & ~(height > 0)).any():
+        raise ValueError("place_local_in_fov_grid: no FOV height to flip y (pass fov_height or set ymax).")
+    y_off = (y0 + height.where(~flip, 0.0)).to_dict()
     y_sgn = flip.map({True: 1.0, False: -1.0}).to_dict()
 
     # ``.astype(float)`` is required: on Dask, ``Series.map(dict)`` yields object
@@ -494,7 +514,9 @@ def _read_polygons_csv(
     use_polars: bool = True,
     n_workers: int | None = None,
     fov_set: set[int] | None = None,
+    fov_height: float | None = None,
 ) -> pd.DataFrame:
+    """Polygons in global px; a non-flipped FOV's y is flipped about *fov_height* (else its ``ymax - ymin``)."""
     if fov_locs is None:
         raise ValueError("fov_locs is required to globalize polygon coordinates.")
 
@@ -551,12 +573,6 @@ def _read_polygons_csv(
     y_max = fov_locs["ymax"].astype(float).to_dict() if "ymax" in fov_locs.columns else None
     flip_map = fov_locs["flip_y"].astype(bool).to_dict() if "flip_y" in fov_locs.columns else None
 
-    local_max_y: dict[int, float] = {}
-    for fov, vy_local in zip(pdf["fov"], pdf["vy_local"], strict=False):
-        m = max(float(v) for v in vy_local)
-        if fov not in local_max_y or m > local_max_y[fov]:
-            local_max_y[fov] = m
-
     geoms: list[sgeom.Polygon | None] = []
     bad = 0
 
@@ -567,12 +583,16 @@ def _read_polygons_csv(
         x0 = x_off[fov]
         y0 = y_off[fov]
 
-        if y_max is not None and not math.isnan(y_max[fov]) and y_max[fov] > y0:
-            h = y_max[fov] - y0
-        else:
-            h = max(COSMX_FOV_SIZE_PX, local_max_y.get(fov, 0.0))
-
         extra_flip = bool(flip_map.get(fov, False)) if flip_map is not None else False
+        h = math.nan  # a flipped FOV places y = y0 + y_local and needs no height
+        if not extra_flip and fov_height is not None:
+            h = float(fov_height)
+        elif not extra_flip and y_max is not None and not math.isnan(y_max[fov]) and y_max[fov] > y0:
+            h = y_max[fov] - y0
+        elif not extra_flip:
+            raise ValueError(
+                f"{csv_path.name}: FOV {fov} has no FOV height to flip polygon y (no ymax, no fov_height)."
+            )
 
         pts: list[tuple[float, float]] = []
         for xl_, yl_ in zip(vx_local, vy_local, strict=False):

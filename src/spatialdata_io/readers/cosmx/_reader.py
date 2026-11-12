@@ -71,6 +71,7 @@ from ._io import (
     _read_metadata_polars,
     _read_polygons_csv,
     _read_transcripts_csv,
+    _set_fov_extent,
     place_local_in_fov_grid,
 )
 from ._stitching import (
@@ -230,34 +231,34 @@ def _parse_labels(arr: Any, ox: float, oy: float) -> Labels2DModel:
     return Labels2DModel.parse(arr, dims=("y", "x"), transformations={"global": _translation_transform(ox, oy)})
 
 
-def _filter_tables_to_ids(
+def _count_cells_outside_labels(
     tables: dict[str, AnnData],
     valid_ids: set[int],
     *,
     source_label: str = "label IDs",
-) -> dict[str, AnnData]:
-    """Keep only table rows whose global_cell_id is in *valid_ids*."""
+) -> dict[str, int]:
+    """Count, per table, the rows whose ``global_cell_id`` is not in *valid_ids*, and warn about them.
+
+    Every row is kept: a cell of the expression matrix is never dropped because it is missing from the labels.
+    """
+    counts: dict[str, int] = {}
     if not valid_ids:
-        return tables
-    filtered: dict[str, AnnData] = {}
+        return counts
     for name, table in tables.items():
         col = _global_id_series(table)
         if col is None:
-            filtered[name] = table
             continue
-        mask = col.isin(valid_ids)
-        if not mask.any():
-            logger.warning("Table %s: all rows removed after matching to %s.", name, source_label)
-            continue
-        if mask.all():
-            filtered[name] = table
-            continue
-        logger.info("Table %s: dropping %d row(s) not in %s.", name, int((~mask).sum()), source_label)
-        adata = table.table if hasattr(table, "table") else table
-        ad2 = adata[mask].copy()
-        region_val = ad2.obs["region_key"].iloc[0] if "region_key" in ad2.obs else None
-        filtered[name] = _parse_cell_table(ad2, region=region_val, region_key="region_key" if region_val else None)
-    return filtered
+        n = int((~col.isin(valid_ids)).sum())
+        counts[name] = n
+        if n:
+            logger.warning(
+                "Table %s: %d of %d cell(s) are not in the %s; they are kept in the table.",
+                name,
+                n,
+                len(col),
+                source_label,
+            )
+    return counts
 
 
 # ---------------------------------------------------------------------------
@@ -289,6 +290,8 @@ class CosMxDatasetReader:
         If ``True``, anchor images/labels to the polygon coordinate origin.
     keep_polygons_after_rasterize
         If ``True``, keep vector polygons even when rasterizing to labels.
+    fov_size
+        The run's FOV ``(width, height)`` in px (:func:`_fov_size_px`); every FOV is placed with it.
     """
 
     def __init__(
@@ -303,8 +306,10 @@ class CosMxDatasetReader:
         align_rasters_to_polygons: bool | None = None,
         keep_polygons_after_rasterize: bool = False,
         image_normalization_percentile: float | None = None,
+        fov_size: tuple[float, float] | None = None,
     ) -> None:
         self.dataset = dataset
+        self.fov_size = fov_size
         self.fovs = fovs
         self.n_workers = n_workers or 1
         self.flip_image = bool(flip_image) if flip_image is not None else False
@@ -331,6 +336,7 @@ class CosMxDatasetReader:
             self.fov_locs = _read_fov_locs(
                 dataset.fov_positions_file,
                 fovs=sorted(fovs) if fovs else None,
+                fov_size=fov_size,
             )
         else:
             raise ValueError("FOV positions file is required to read CosMx data.")
@@ -365,6 +371,7 @@ class CosMxDatasetReader:
             n_workers=self.n_workers,
             fov_set=self.fovs,
             use_polars=True,
+            fov_height=self._fov_height,
         )
         poly_df["global_cell_id"] = self.global_cell_id(poly_df)
 
@@ -385,6 +392,10 @@ class CosMxDatasetReader:
         self._origin_y = oy
         self._poly_df = poly_df
         return self._poly_df
+
+    @property
+    def _fov_height(self) -> float | None:
+        return float(self.fov_size[1]) if self.fov_size is not None else None
 
     def _ensure_origin(self) -> tuple[float, float]:
         """Return the coordinate origin, loading polygons if needed."""
@@ -512,6 +523,7 @@ class CosMxDatasetReader:
             selected_channels=channels,
             n_workers=self.n_workers,
             tighten_to_seen=tighten,
+            fov_size=self.fov_size,
             **imread_kwargs,
         )
         if stitched is None:
@@ -581,7 +593,7 @@ class CosMxDatasetReader:
         the per-FOV local columns are not available.
         """
         if {"x_local_px", "y_local_px", "fov"}.issubset(df.columns):
-            return place_local_in_fov_grid(df, self.fov_locs)
+            return place_local_in_fov_grid(df, self.fov_locs, fov_height=self._fov_height)
         logger.warning(
             "[transcripts] No local px columns found — using raw global "
             "coordinates, which may not align with images/polygons."
@@ -693,9 +705,12 @@ class CosMxDatasetReader:
     # -- Build FOV box shapes --
 
     def build_fov_shapes(self) -> dict[str, ShapesModel]:
-        """Build one square per FOV as shape elements."""
+        """Build one box of the run's FOV size per FOV as shape elements."""
         if self.fov_locs is None or self.fov_locs.empty:
             return {}
+        if self.fov_size is None:
+            raise ValueError("FOV boxes need the run's FOV size (fov_size).")
+        fov_w, fov_h = self.fov_size
         ox, oy = self._ensure_origin()
 
         locs = self.fov_locs.loc[sorted(self.fovs)].copy() if self.fovs else self.fov_locs.copy()
@@ -708,7 +723,7 @@ class CosMxDatasetReader:
                 skipped.append(int(cast("int", fov)))
                 continue
             x0, y0 = xmin - ox, ymin - oy
-            geoms.append(sgeom.box(x0, y0, x0 + COSMX_FOV_SIZE_PX, y0 + COSMX_FOV_SIZE_PX))
+            geoms.append(sgeom.box(x0, y0, x0 + fov_w, y0 + fov_h))
             fov_vals.append(int(cast("int", fov)))
 
         if skipped:
@@ -764,6 +779,7 @@ class CosMxDatasetReader:
             origin_x=ox,
             origin_y=oy,
             fovs=self.fovs,
+            fov_size=self.fov_size,
         )
 
         raster = _polygons_to_label_raster(
@@ -805,6 +821,7 @@ class CosMxDatasetReader:
             flip_image=self.flip_image,
             n_workers=self.n_workers,
             fov_local_to_global=fov_local_to_global,
+            fov_size=self.fov_size,
         )
 
         if stitched is None:
@@ -834,6 +851,7 @@ class CosMxDatasetReader:
             flip_image=self.flip_image,
             n_workers=self.n_workers,
             fovs=self.fovs if self.fovs else None,
+            fov_size=self.fov_size,
         )
         present_ids = {int(x) for x in df["global_cell_id"].to_numpy() if x != 0}
         lbl = _parse_labels(stitched, ox, oy)
@@ -946,11 +964,22 @@ class CosMxDatasetReader:
 
         if self.dataset.metadata_file is not None:
             meta = _read_metadata_polars(self.dataset.metadata_file, n_rows=None)
-            common = adata.obs.index.intersection(meta.index)
-            adata = adata[common].copy()
             expr_obs = cast(pd.DataFrame, adata.obs)
             extra = expr_obs.columns.difference(meta.columns)  # exprMat-only metadata (e.g. AtoMx `cell`)
-            adata.obs = meta.loc[common].join(expr_obs[extra])
+            no_meta = ~expr_obs.index.isin(meta.index)
+            obs = meta.reindex(expr_obs.index)
+            if no_meta.any():
+                # a cell of the expression matrix is never dropped: keep it, with its exprMat fov / cell_ID
+                logger.warning(
+                    "%s: %d of %d exprMat cell(s) have no row in %s; they are kept with empty metadata.",
+                    self.dataset.exprMat_file.name,
+                    int(no_meta.sum()),
+                    len(expr_obs),
+                    self.dataset.metadata_file.name,
+                )
+                for c in expr_obs.columns.intersection(meta.columns):
+                    obs[c] = obs[c].where(~no_meta, expr_obs[c]).astype(expr_obs[c].dtype)
+            adata.obs = obs.join(expr_obs[extra])
 
         # Compute global cell IDs
         obs = cast(pd.DataFrame, adata.obs)
@@ -1084,13 +1113,18 @@ def _cosmx_multi(
     if label_ds.fov_positions_file is None:
         raise ValueError("FOV positions file required for multimodal runs.")
 
-    fov_locs = _read_fov_locs(label_ds.fov_positions_file, fovs=sorted(fov_set) if fov_set else None)
+    fov_size_info: dict[str, Any] = {"fov_size_px": None, "fov_size_source": None}
+    fov_size: tuple[float, float] | None = None
+    if read_images or read_labels or read_polygons or read_transcripts or add_fovs_as_shapes or preview_fovs:
+        fov_size_info = _fov_size_px(dataset)
+        fov_size = cast("tuple[float, float]", tuple(fov_size_info["fov_size_px"]))
+    fov_locs = _read_fov_locs(label_ds.fov_positions_file, fovs=sorted(fov_set) if fov_set else None, fov_size=fov_size)
 
     if skip_empty_fovs and (read_images or read_labels):
         fov_locs = _prune_empty_fovs(dataset, fov_locs, fov_set)
 
     if preview_fovs:
-        _plot_fov_preview(fov_locs, fov_set)
+        _plot_fov_preview(fov_locs, fov_set, fov_size=cast("tuple[float, float]", fov_size))
         return None
 
     n_fovs = len(fov_set) if fov_set else len(fov_locs)
@@ -1115,6 +1149,7 @@ def _cosmx_multi(
         align_rasters_to_polygons=align_rasters_to_polygons,
         keep_polygons_after_rasterize=keep_polygons_after_rasterize,
         image_normalization_percentile=image_normalization_percentile,
+        fov_size=fov_size,
     )
 
     # Pre-load polygons to freeze max_cell_id
@@ -1135,6 +1170,7 @@ def _cosmx_multi(
             polygons_as_labels=False,
             fov_locs=fov_locs,
             align_rasters_to_polygons=align_rasters_to_polygons,
+            fov_size=fov_size,
         )
         if base_max_cell_id is not None:
             r.max_cell_id = base_max_cell_id
@@ -1165,9 +1201,8 @@ def _cosmx_multi(
             points = {"transcripts": next(iter(tx_points.values()))}
 
     # Label-anchored co-registration (same as cosmx()): the protein-derived
-    # segmentation read above is the ground truth; filter each modality's table to
-    # the rasterised label IDs. (Modalities quantify different cell subsets, so the
-    # labels cannot be anchored on any single modality's table.)
+    # segmentation read above is shared by every modality. Each modality's cells not
+    # in the rasterised labels are counted and kept, never dropped.
     tables: dict[str, AnnData] = {}
     region_refs = list(labels.keys()) or list(shapes.keys()) or ["cells"]
     if read_gexp:
@@ -1175,12 +1210,12 @@ def _cosmx_multi(
             logger.debug("[4/5] Reading %s data...", mod_name)
             mod_tables = _modality_reader(mod_ds).read_tables(region_refs, modality=mod_name, controls=controls)
             if label_ids:
-                mod_tables = _filter_tables_to_ids(mod_tables, label_ids, source_label="rasterised labels")
+                _count_cells_outside_labels(mod_tables, label_ids, source_label="rasterised labels")
             if mod_tables:
                 tables[mod_name] = next(iter(mod_tables.values()))
 
     logger.debug("[5/5] Assembling SpatialData object...")
-    return _assemble_sdata(images, points, labels, shapes, tables, label_ds, pixel_size_um)
+    return _assemble_sdata(images, points, labels, shapes, tables, label_ds, pixel_size_um, fov_size_info)
 
 
 # ---------------------------------------------------------------------------
@@ -1219,6 +1254,100 @@ def _fov_tiff_header(dataset: CosMxDataset) -> tuple[float | None, tuple[int, in
                     nm = None
         return (float(nm) if isinstance(nm, int | float) else None), shape, tifs[0].name
     return None, None, None
+
+
+def _fov_image_shape(datasets: list[CosMxDataset]) -> tuple[tuple[int, int], str] | None:
+    """``(width, height)`` and name of the first FOV image, from its header only.
+
+    Looked for in ``Morphology2D``, ``RawMorphologyImages``, ``CellLabels`` and ``CellComposite``, in that order.
+    """
+    for ds in datasets:
+        _, shape, name = _fov_tiff_header(ds)
+        if shape is not None:
+            return (shape[1], shape[0]), cast(str, name)
+    for ds in datasets:
+        if ds.cell_composite_dir is None:
+            continue
+        imgs = sorted(p for p in ds.cell_composite_dir.rglob("*") if p.suffix.lower() in _COMPOSITE_SUFFIXES)
+        if not imgs:
+            continue
+        if imgs[0].suffix.lower() in {".tif", ".tiff"}:
+            with tifffile.TiffFile(imgs[0]) as tif:
+                page = cast("tifffile.TiffPage", tif.pages[0])
+                return (int(page.shape[1]), int(page.shape[0])), imgs[0].name
+        from PIL import Image  # a scikit-image dependency; reads the header only
+
+        with Image.open(imgs[0]) as im:
+            return (int(im.size[0]), int(im.size[1])), imgs[0].name
+    return None
+
+
+_COMPOSITE_SUFFIXES = {".tif", ".tiff", ".jpg", ".jpeg", ".png"}
+# local px columns per file kind: polygon vertices, cell centres, transcripts
+_LOCAL_PX_COLUMNS = {
+    "polygons_file": ("x_local_px", "y_local_px"),
+    "metadata_file": ("CenterX_local_px", "CenterY_local_px"),
+    "tx_file": ("x_local_px", "y_local_px"),
+}
+
+
+def _local_px_max(datasets: list[CosMxDataset]) -> tuple[tuple[float, float], list[str]] | None:
+    """Largest local px per axis over the run's polygon vertices and cell centres, else its transcripts.
+
+    Transcripts are scanned only when no polygon or metadata file has local px columns (they are the largest file).
+    """
+    import polars as pl
+
+    for kinds in (("polygons_file", "metadata_file"), ("tx_file",)):
+        xs, ys, used = [], [], []
+        for ds in datasets:
+            for kind in kinds:
+                path = getattr(ds, kind)
+                if path is None or not path.exists():
+                    continue
+                lf = pl.scan_csv(path, infer_schema_length=10_000)
+                cols = {c.lower(): c for c in lf.collect_schema().names()}
+                xc, yc = (cols.get(c.lower()) for c in _LOCAL_PX_COLUMNS[kind])
+                if xc is None or yc is None:
+                    continue
+                x, y = lf.select(pl.col(xc).cast(pl.Float64).max(), pl.col(yc).cast(pl.Float64).max()).collect().row(0)
+                if x is None or y is None:
+                    continue
+                xs.append(x)
+                ys.append(y)
+                used.append(f"{path.name} {xc}/{yc}")
+        if xs:
+            return (max(xs), max(ys)), used
+    return None
+
+
+def _fov_size_px(dataset: CosMxDataset) -> dict[str, Any]:
+    """The run's FOV ``(width, height)`` in px and its source, resolved once per run.
+
+    1. ``"fov_image"``: the header of the first FOV image (see :func:`_fov_image_shape`).
+    2. ``"local_px_max"``: the largest local px per axis in the run's own files, rounded up (polygon vertices and
+       cell centres, else transcripts). This is a lower bound on the FOV size: no cell or vertex lies beyond it.
+
+    The CosMx spec size is never used: it does not hold for every camera (spatialdata-db-schemas 9a37d86
+    ``specs/nanostring_cosmx.yaml:10``, "NOT valid for the older camera"). With neither source, raise ``ValueError``.
+    """
+    datasets = [dataset, *(dataset.modalities.values() if dataset.modalities else [])]
+    if (image := _fov_image_shape(datasets)) is not None:
+        (w, h), name = image
+        logger.info("CosMx FOV size %d x %d px from the FOV image header %s.", w, h, name)
+        return {"fov_size_px": [int(w), int(h)], "fov_size_source": "fov_image"}
+    if (extent := _local_px_max(datasets)) is not None:
+        (x, y), used = extent
+        w, h = math.ceil(x), math.ceil(y)
+        logger.info("CosMx FOV size %d x %d px from the largest local px in %s.", w, h, "; ".join(used))
+        return {"fov_size_px": [int(w), int(h)], "fov_size_source": "local_px_max"}
+    raise ValueError(
+        "CosMx FOV size unknown: no FOV image (Morphology2D, RawMorphologyImages, CellLabels_F*.tif or CellComposite) "
+        "and no local px columns (x_local_px / y_local_px in the polygons or transcripts file, CenterX_local_px / "
+        "CenterY_local_px in the metadata file). Without it FOVs cannot be placed; pass read_images=False, "
+        "read_labels=False, read_polygons=False, read_transcripts=False and add_fovs_as_shapes=False to read the "
+        "tables only."
+    )
 
 
 def _local_px_extent(tables: dict[str, Any]) -> tuple[float, float] | None:
@@ -1285,6 +1414,7 @@ def _assemble_sdata(
     tables: dict[str, Any],
     dataset: CosMxDataset,
     pixel_size_um: float | None = None,
+    fov_size_info: dict[str, Any] | None = None,
 ) -> SpatialData:
     """Build and annotate the final SpatialData object."""
     # Move each image's per-channel normalization divisors from the (non-persisted) element
@@ -1307,7 +1437,10 @@ def _assemble_sdata(
         tables=tables,
         attrs=attrs,
     )
-    sdata.attrs["cosmx"] = _pixel_size_um(dataset, tables, pixel_size_um)
+    sdata.attrs["cosmx"] = {
+        **_pixel_size_um(dataset, tables, pixel_size_um),
+        **(fov_size_info or {"fov_size_px": None, "fov_size_source": None}),
+    }
     if sdata.attrs["cosmx"]["pixel_size_um"] is not None:
         _add_microns(sdata, sdata.attrs["cosmx"]["pixel_size_um"])
 
@@ -1639,6 +1772,8 @@ def cosmx(
 
     fov_set = _normalize_fovs(fovs)
     image_models_kwargs, imread_kwargs = _default_image_kwargs(image_models_kwargs, imread_kwargs)
+    fov_size_info: dict[str, Any] = {"fov_size_px": None, "fov_size_source": None}
+    fov_size: tuple[float, float] | None = None
 
     try:
         fov_locs = _read_fov_locs(dataset.fov_positions_file) if dataset.fov_positions_file else None
@@ -1647,14 +1782,20 @@ def cosmx(
         logger.warning("%s Reading the cell tables only; cell positions stay in the metadata columns.", e)
         fov_locs = pd.DataFrame({"xmin": [np.nan], "ymin": [np.nan]})
         read_images = read_labels = read_polygons = read_transcripts = add_fovs_as_shapes = False
+    else:
+        places_fovs = read_images or read_labels or read_polygons or read_transcripts or add_fovs_as_shapes
+        if fov_locs is not None and (places_fovs or preview_fovs):
+            fov_size_info = _fov_size_px(dataset)
+            fov_size = cast("tuple[float, float]", tuple(fov_size_info["fov_size_px"]))
+            _set_fov_extent(fov_locs, fov_size)
 
     if skip_empty_fovs and (read_images or read_labels):
         fov_locs = _prune_empty_fovs(dataset, fov_locs, fov_set)
 
     if preview_fovs:
-        if fov_locs is None:
+        if fov_locs is None or fov_size is None:
             raise ValueError("preview_fovs=True but no FOV positions file found.")
-        _plot_fov_preview(fov_locs, fov_set)
+        _plot_fov_preview(fov_locs, fov_set, fov_size=fov_size)
         return None
 
     if align_rasters_to_polygons is None:
@@ -1670,6 +1811,7 @@ def cosmx(
         align_rasters_to_polygons=align_rasters_to_polygons,
         keep_polygons_after_rasterize=keep_polygons_after_rasterize,
         image_normalization_percentile=image_normalization_percentile,
+        fov_size=fov_size,
     )
 
     # Pre-scan cell_ID max across all available files to avoid
@@ -1688,18 +1830,17 @@ def cosmx(
     )
     points = reader.read_transcripts() if read_transcripts and dataset.tx_file is not None else {}
 
-    # Label-anchored co-registration: the segmentation is the ground truth (in
-    # multimodal runs it is the protein-derived segmentation, shared across
-    # modalities), so rasterise every cell and filter the table to the cells that
-    # actually rasterised. _cosmx_multi runs the same cascade per modality.
+    # Label-anchored co-registration: the table annotates the segmentation. Table
+    # cells not in the rasterised labels are counted and kept, never dropped.
+    # _cosmx_multi runs the same check per modality.
     labels, label_ids = reader.read_labels() if read_labels else ({}, set())
 
     region_refs = list(labels.keys()) or list(shapes.keys()) or ["cells"]
     tables = reader.read_tables(region_refs, controls=controls) if read_gexp else {}
     if label_ids:
-        tables = _filter_tables_to_ids(tables, label_ids, source_label="rasterised labels")
+        _count_cells_outside_labels(tables, label_ids, source_label="rasterised labels")
 
     if add_fovs_as_shapes:
         shapes = {**shapes, **reader.build_fov_shapes()}
 
-    return _assemble_sdata(images, points, labels, shapes, tables, dataset, pixel_size_um)
+    return _assemble_sdata(images, points, labels, shapes, tables, dataset, pixel_size_um, fov_size_info)

@@ -38,13 +38,11 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 COSMX_PIXEL_SIZE = 0.120280945
 MM_TO_PX = 1000.0 / COSMX_PIXEL_SIZE
-# The reader forces FOV_SIZE_PX=4256 in _snap_fov_grid.
-# Our polygon local coords and FOV positions must be consistent with this.
-# Real CosmX = 4256. We use a small size for fast test TIFFs.
-# _snap_fov_grid will warn but still force 4256 for coordinates.
+# The reader places FOVs with the run's own FOV size (the first FOV image header, else the largest local px), so a
+# fixture's TIFFs, FOV positions and local px share one FOV size. Real current-camera FOVs are 4256 x 4256 px; the
+# fixtures use 256 px for fast TIFFs. TestFovSize reads 4256 x 4256 and 5472 x 3648 px runs.
 TIFF_FOV_SIZE = 256
-# The reader's internal spec size (used for polygon coords, FOV positions, grid snapping)
-SPEC_FOV_SIZE = 4256
+FOV_SIZE = TIFF_FOV_SIZE
 N_CHANNELS = 3
 N_CELLS_PER_FOV = 5
 N_GENES = 10
@@ -71,7 +69,7 @@ def _tiff_description() -> str:
     )
 
 
-def _write_morphology_tiff(path: Path, n_channels: int = N_CHANNELS, fov_size: int = SPEC_FOV_SIZE):
+def _write_morphology_tiff(path: Path, n_channels: int = N_CHANNELS, fov_size: int = FOV_SIZE):
     """Write a multi-page TIFF that dask_image.imread reads as (C, Y, X)."""
     import tifffile
 
@@ -113,7 +111,7 @@ def _write_csv(path: Path, df: pd.DataFrame, compress: bool = False):
     df.to_csv(path, index=False, compression="gzip" if compress else None)
 
 
-def _make_polygon_rows(fov: int, cell_id: int, cx: float, cy: float, r: float = 50.0, n_pts: int = 6):
+def _make_polygon_rows(fov: int, cell_id: int, cx: float, cy: float, r: float = FOV_SIZE / 85, n_pts: int = 6):
     """Hexagon vertices for one cell in LOCAL coordinates."""
     rows = []
     for i in range(n_pts):
@@ -135,7 +133,7 @@ def _make_polygon_df(fov_positions: dict[int, tuple[float, float]], n_cells: int
     fov_positions: {fov_id: (x_global_px, y_global_px)}
     """
     rows = []
-    spacing = SPEC_FOV_SIZE / (n_cells + 1)
+    spacing = FOV_SIZE / (n_cells + 1)
     for fov, (x_off, y_off) in fov_positions.items():
         for cid in range(1, n_cells + 1):
             cx_local = spacing * cid
@@ -186,7 +184,7 @@ def fixture_a(tmp_path_factory) -> Path:
     fovs = [1, 2]
 
     # Adjacent: FOV 2 is directly right of FOV 1
-    fov_pos = {1: (0.0, 0.0), 2: (float(SPEC_FOV_SIZE), 0.0)}
+    fov_pos = {1: (0.0, 0.0), 2: (float(FOV_SIZE), 0.0)}
     x_mm = {f: x / MM_TO_PX for f, (x, _) in fov_pos.items()}
     y_mm = {f: y / MM_TO_PX for f, (_, y) in fov_pos.items()}
 
@@ -222,7 +220,7 @@ def fixture_b(tmp_path_factory) -> Path:
     fovs = [1, 5]
 
     # Non-adjacent: FOV 5 is 3 FOV-widths away
-    fov_pos = {1: (0.0, 0.0), 5: (3.0 * SPEC_FOV_SIZE, 2.0 * SPEC_FOV_SIZE)}
+    fov_pos = {1: (0.0, 0.0), 5: (3.0 * FOV_SIZE, 2.0 * FOV_SIZE)}
 
     fov_df = pd.DataFrame(
         {
@@ -377,7 +375,8 @@ class TestFovPositions:
             fixture_c / "Pancreas_fov_positions_file.csv",
         ]
         for p in paths:
-            fl = _read_fov_locs(p)
+            assert _read_fov_locs(p)[["xmax", "ymax"]].isna().all().all()  # no FOV size given
+            fl = _read_fov_locs(p, fov_size=(FOV_SIZE, FOV_SIZE))
             for col in ("xmin", "ymin", "xmax", "ymax", "flip_y"):
                 assert col in fl.columns, f"{p.name} missing {col}"
             assert (fl["xmax"] > fl["xmin"]).all()
@@ -525,12 +524,18 @@ class TestMicrons:
         # fixture_b: px-only positions and 256 x 256 px morphology TIFFs without ImPixelSize_nm
         with caplog.at_level("WARNING"):
             sdata = _read(sdio, fixture_b)
-        assert sdata.attrs["cosmx"] == {"pixel_size_um": None, "pixel_size_source": "unknown"}
+        assert sdata.attrs["cosmx"] == {
+            "pixel_size_um": None,
+            "pixel_size_source": "unknown",
+            "fov_size_px": [256, 256],
+            "fov_size_source": "fov_image",
+        }
         assert "microns" not in sdata.coordinate_systems
         assert "FOV image 256 x 256 px" in caplog.text
 
         sdata = _read(sdio, fixture_b, pixel_size_um=0.18)
-        assert sdata.attrs["cosmx"] == {"pixel_size_um": 0.18, "pixel_size_source": "argument"}
+        assert sdata.attrs["cosmx"]["pixel_size_um"] == 0.18
+        assert sdata.attrs["cosmx"]["pixel_size_source"] == "argument"
         for _, name, element in sdata.gen_spatial_elements():
             to_px = get_transformation(element, "global").to_affine_matrix(("x", "y"), ("x", "y"))
             to_um = get_transformation(element, "microns").to_affine_matrix(("x", "y"), ("x", "y"))
@@ -538,7 +543,12 @@ class TestMicrons:
 
     def test_multimodal_argument(self, fixture_multimodal, sdio):
         sdata = _read(sdio, fixture_multimodal, pixel_size_um=0.18)
-        assert sdata.attrs["cosmx"] == {"pixel_size_um": 0.18, "pixel_size_source": "argument"}
+        assert sdata.attrs["cosmx"] == {
+            "pixel_size_um": 0.18,
+            "pixel_size_source": "argument",
+            "fov_size_px": [TIFF_FOV_SIZE, TIFF_FOV_SIZE],
+            "fov_size_source": "fov_image",
+        }
         assert "microns" in sdata.coordinate_systems
 
 
@@ -762,7 +772,7 @@ def _lookup_centres(raster, fov_locs, fov, n_cells, ox, oy):
     """
     from spatialdata_io.readers.cosmx._io import place_local_in_fov_grid
 
-    block = SPEC_FOV_SIZE // (n_cells + 2)
+    block = FOV_SIZE // (n_cells + 2)
     centres = [c * block + block // 2 for c in range(1, n_cells + 1)]
     placed = place_local_in_fov_grid(
         pd.DataFrame({"fov": [fov] * n_cells, "x_local_px": centres, "y_local_px": centres}),
@@ -800,9 +810,8 @@ class TestLabelTranscriptCoRegistration:
 
         from spatialdata_io.readers.cosmx._stitching import _read_stitched_cell_labels_from_dir
 
-        # Use the real FOV size so the flip arithmetic in placement (which uses
-        # COSMX_FOV_SIZE_PX) matches the label tile height.
-        fov_size = SPEC_FOV_SIZE
+        # The label tile height and the fov_locs ymax that placement flips about are the same FOV size.
+        fov_size = FOV_SIZE
         n_cells = 5
         labels_dir = tmp_path / "CellLabels"
         _write_cell_label_tiff(labels_dir / "CellLabels_F001.tif", n_cells=n_cells, fov_size=fov_size)
@@ -907,9 +916,7 @@ class TestLabelTileFlip:
                 }
             ),
         )
-        _write_cell_label_tiff(
-            cs / f"FOV{fov:03d}" / f"CellLabels_F{fov:03d}.tif", n_cells=n_cells, fov_size=SPEC_FOV_SIZE
-        )
+        _write_cell_label_tiff(cs / f"FOV{fov:03d}" / f"CellLabels_F{fov:03d}.tif", n_cells=n_cells, fov_size=FOV_SIZE)
 
         stitched, df = stitch_segmentation_label_image(
             path=tmp_path,
@@ -943,11 +950,11 @@ class TestTranscriptAlignmentE2E:
     @staticmethod
     def _build(root: Path, prefix: str, poly_y_offset: float) -> Path:
         """Dataset where polygon GLOBAL y sits *poly_y_offset* from the FOV
-        position (e.g. -SPEC_FOV_SIZE reproduces the old fov_shift trigger).
+        position (e.g. -FOV_SIZE reproduces the old fov_shift trigger).
         Transcripts are written at each cell's local centroid.
         """
         fovs = [1, 2]
-        fov_pos = {1: (0.0, 0.0), 2: (float(SPEC_FOV_SIZE), 0.0)}
+        fov_pos = {1: (0.0, 0.0), 2: (float(FOV_SIZE), 0.0)}
         x_mm = {f: x / MM_TO_PX for f, (x, _) in fov_pos.items()}
         y_mm = {f: y / MM_TO_PX for f, (_, y) in fov_pos.items()}
         fov_df = pd.DataFrame(
@@ -968,7 +975,7 @@ class TestTranscriptAlignmentE2E:
         _write_csv(root / f"{prefix}-polygons.csv.gz", _make_polygon_df(poly_off), compress=True)
 
         # transcripts: one per cell at the cell's LOCAL centroid
-        spacing = SPEC_FOV_SIZE / (N_CELLS_PER_FOV + 1)
+        spacing = FOV_SIZE / (N_CELLS_PER_FOV + 1)
         rows = []
         for fov in fovs:
             ox, oy = poly_off[fov]
@@ -1009,7 +1016,7 @@ class TestTranscriptAlignmentE2E:
             hi = float(elem.geometry.bounds["maxy"].max())
             return a * lo + b, a * hi + b
 
-    @pytest.mark.parametrize("offset", [0.0, -SPEC_FOV_SIZE, 3.0 * SPEC_FOV_SIZE])
+    @pytest.mark.parametrize("offset", [0.0, -FOV_SIZE, 3.0 * FOV_SIZE])
     def test_transcripts_overlap_polygons(self, sdio, tmp_path, offset):
         root = self._build(tmp_path, "TxAlign", offset)
         # keep cell polygons as shapes (don't rasterise) so we can compare
@@ -1026,7 +1033,7 @@ class TestTranscriptAlignmentE2E:
         s_lo, s_hi = self._gy_extent(shp)
         # transcript y-extent must sit within the polygon y-extent (+margin),
         # i.e. no one-FOV-height drift regardless of the global offset
-        margin = SPEC_FOV_SIZE * 0.25
+        margin = FOV_SIZE * 0.25
         assert p_lo >= s_lo - margin and p_hi <= s_hi + margin, (
             f"offset={offset}: points y[{p_lo:.0f},{p_hi:.0f}] not within polygons y[{s_lo:.0f},{s_hi:.0f}]"
         )
@@ -1041,7 +1048,7 @@ class TestPolygonReading:
     def test_valid_geometries(self, fixture_a):
         from spatialdata_io.readers.cosmx._io import _read_fov_locs, _read_polygons_csv
 
-        fl = _read_fov_locs(fixture_a / "S0_fov_positions_file.csv.gz")
+        fl = _read_fov_locs(fixture_a / "S0_fov_positions_file.csv.gz", fov_size=(FOV_SIZE, FOV_SIZE))
         pdf = _read_polygons_csv(fixture_a / "S0-polygons.csv.gz", fov_locs=fl, fov_set={1}, use_polars=True)
         assert len(pdf) > 0
         assert pdf["geometry"].apply(lambda g: g.is_valid).all()
@@ -1049,7 +1056,7 @@ class TestPolygonReading:
     def test_flip_y_still_valid(self, fixture_b):
         from spatialdata_io.readers.cosmx._io import _read_fov_locs, _read_polygons_csv
 
-        fl = _read_fov_locs(fixture_b / "Run5642_S3_Quarter_fov_positions_file.csv")
+        fl = _read_fov_locs(fixture_b / "Run5642_S3_Quarter_fov_positions_file.csv", fov_size=(FOV_SIZE, FOV_SIZE))
         pdf = _read_polygons_csv(
             fixture_b / "Run5642_S3_Quarter-polygons.csv", fov_locs=fl, fov_set={1}, use_polars=True
         )
@@ -1059,7 +1066,7 @@ class TestPolygonReading:
     def test_coords_finite(self, fixture_a):
         from spatialdata_io.readers.cosmx._io import _read_fov_locs, _read_polygons_csv
 
-        fl = _read_fov_locs(fixture_a / "S0_fov_positions_file.csv.gz")
+        fl = _read_fov_locs(fixture_a / "S0_fov_positions_file.csv.gz", fov_size=(FOV_SIZE, FOV_SIZE))
         pdf = _read_polygons_csv(fixture_a / "S0-polygons.csv.gz", fov_locs=fl, fov_set={1, 2}, use_polars=True)
         for g in pdf["geometry"]:
             assert all(math.isfinite(v) for v in g.bounds)
@@ -1067,7 +1074,7 @@ class TestPolygonReading:
     def test_cell_count_per_fov(self, fixture_a):
         from spatialdata_io.readers.cosmx._io import _read_fov_locs, _read_polygons_csv
 
-        fl = _read_fov_locs(fixture_a / "S0_fov_positions_file.csv.gz")
+        fl = _read_fov_locs(fixture_a / "S0_fov_positions_file.csv.gz", fov_size=(FOV_SIZE, FOV_SIZE))
         pdf = _read_polygons_csv(fixture_a / "S0-polygons.csv.gz", fov_locs=fl, fov_set={1}, use_polars=True)
         assert pdf["cell_ID"].nunique() == N_CELLS_PER_FOV
 
@@ -1078,7 +1085,7 @@ class TestPolygonReading:
         from spatialdata_io.readers.cosmx._io import _read_polygons_csv
 
         # Build a polygon CSV where cell_ID=1 has TWO polygon parts
-        spacing = SPEC_FOV_SIZE / (N_CELLS_PER_FOV + 1)
+        spacing = FOV_SIZE / (N_CELLS_PER_FOV + 1)
         rows = []
         # Part 1 of cell 1
         for pt in _make_polygon_rows(1, 1, spacing, spacing, r=50.0):
@@ -1100,8 +1107,8 @@ class TestPolygonReading:
             {
                 "xmin": [0.0],
                 "ymin": [0.0],
-                "xmax": [float(SPEC_FOV_SIZE)],
-                "ymax": [float(SPEC_FOV_SIZE)],
+                "xmax": [float(FOV_SIZE)],
+                "ymax": [float(FOV_SIZE)],
             },
             index=[1],
         )
@@ -1242,20 +1249,160 @@ class TestLabelAnchoring:
         assert n_table == 5, f"table must hold only the 5 quantified cells, got {n_table}"
 
 
+def _camera_run(root: Path, w: int, h: int, cells: list[tuple[int, int]], *, labels: bool = True) -> Path:
+    """A px-only run (like zenodo 11108209 Run5469_S2) of two side-by-side ``w x h`` px FOVs.
+
+    Each FOV has a cell at every local ``(x, y)`` in *cells*: a hexagon in the polygons file and, with *labels*, a
+    60 px square in a ``CellLabels_F*.tif`` of shape ``(h, w)``.
+    """
+    import tifffile
+
+    root.mkdir(parents=True, exist_ok=True)
+    fovs, n = [1, 2], len(cells)
+    _write_csv(
+        root / "R_fov_positions_file.csv",
+        pd.DataFrame({"fov": fovs, "x_global_px": [0.0, float(w)], "y_global_px": [0.0, 0.0]}),
+    )
+    rows = [
+        pt for f in fovs for cid, (cx, cy) in enumerate(cells, 1) for pt in _make_polygon_rows(f, cid, cx, cy, r=25.0)
+    ]
+    _write_csv(root / "R-polygons.csv", pd.DataFrame(rows))
+    _write_csv(root / "R_exprMat_file.csv", _make_expr_mat(fovs, n_cells=n))
+    centres = {"CenterX_local_px": [c[0] for c in cells] * 2, "CenterY_local_px": [c[1] for c in cells] * 2}
+    _write_csv(root / "R_metadata_file.csv", _make_metadata(fovs, n_cells=n).assign(**centres))
+    if labels:
+        for f in fovs:
+            arr = np.zeros((h, w), dtype=np.uint16)
+            for cid, (cx, cy) in enumerate(cells, 1):
+                arr[cy - 30 : cy + 30, cx - 30 : cx + 30] = cid
+            (root / "CellLabels").mkdir(exist_ok=True)
+            tifffile.imwrite(root / "CellLabels" / f"CellLabels_F{f:03d}.tif", arr)
+    return root
+
+
+# local (x, y) cell centres; the old-camera ones lie beyond x = 4256, where the fixed 4256 px tile cut them off
+_OLD_CAMERA_CELLS = [(200, 200), (2000, 1800), (4500, 1000), (5300, 3500), (3000, 3400)]
+_CURRENT_CAMERA_CELLS = [(200, 200), (2000, 1800), (4100, 1000), (4150, 4100), (3000, 3400)]
+
+
+class TestFovSize:
+    """The run's FOV size: the first FOV image header, else the largest local px; never the 4256 px spec size."""
+
+    _KW = {"n_workers": 1, "read_images": False, "read_transcripts": False}
+
+    @staticmethod
+    def _boxes(sdata):
+        boxes = next(v for k, v in sdata.shapes.items() if "fov_box" in k)
+        return [tuple(round(b) for b in (g.bounds[2] - g.bounds[0], g.bounds[3] - g.bounds[1])) for g in boxes.geometry]
+
+    @staticmethod
+    def _label_ids(sdata):
+        import dask.array as da
+
+        lab = next(iter(sdata.labels.values()))
+        arr = lab.data if hasattr(lab, "data") else lab["scale0"]["image"].data
+        return arr.shape, {int(i) for i in np.asarray(da.unique(arr).compute()) if i != 0}
+
+    @pytest.mark.parametrize("polygons_as_labels", [True, False])
+    def test_old_camera_run_keeps_every_cell(self, sdio, tmp_path, polygons_as_labels, caplog):
+        root = _camera_run(tmp_path / "old", 5472, 3648, _OLD_CAMERA_CELLS)
+        with caplog.at_level("WARNING"):
+            sdata = sdio.cosmx(root, polygons_as_labels=polygons_as_labels, **self._KW)
+        assert sdata.attrs["cosmx"]["fov_size_px"] == [5472, 3648]
+        assert sdata.attrs["cosmx"]["fov_size_source"] == "fov_image"
+        table = sdata["cell_data"]
+        assert table.n_obs == 2 * len(_OLD_CAMERA_CELLS)
+        shape, ids = self._label_ids(sdata)
+        assert set(table.obs["global_cell_id"].astype(int)) <= ids  # every cell, also those beyond x = 4256
+        assert shape == (3648, 2 * 5472)
+        assert self._boxes(sdata) == [(5472, 3648)] * 2
+        assert "Forcing spec size" not in caplog.text and "not in the rasterised labels" not in caplog.text
+
+    def test_old_camera_size_from_local_px_without_images(self, sdio, tmp_path):
+        root = _camera_run(tmp_path / "old", 5472, 3648, _OLD_CAMERA_CELLS, labels=False)
+        sdata = sdio.cosmx(root, **self._KW)
+        # polygon vertices reach 5300 + 25 and 3500 + 25 * sin(60°) local px
+        assert sdata.attrs["cosmx"]["fov_size_source"] == "local_px_max"
+        assert sdata.attrs["cosmx"]["fov_size_px"] == [5325, 3522]
+        assert sdata["cell_data"].n_obs == 2 * len(_OLD_CAMERA_CELLS)
+        assert self._label_ids(sdata)[1] >= set(sdata["cell_data"].obs["global_cell_id"].astype(int))
+
+    @pytest.mark.parametrize("polygons_as_labels", [True, False])
+    def test_current_camera_run_unchanged(self, sdio, tmp_path, polygons_as_labels):
+        # the same n_obs, label shape and FOV boxes as the fixed 4256 px reader (7ea45a5) gave on this run
+        root = _camera_run(tmp_path / "cur", 4256, 4256, _CURRENT_CAMERA_CELLS)
+        sdata = sdio.cosmx(root, polygons_as_labels=polygons_as_labels, **self._KW)
+        assert sdata.attrs["cosmx"]["fov_size_px"] == [4256, 4256]
+        assert sdata["cell_data"].n_obs == 2 * len(_CURRENT_CAMERA_CELLS)
+        shape, ids = self._label_ids(sdata)
+        assert shape == (4256, 2 * 4256)
+        assert ids == set(sdata["cell_data"].obs["global_cell_id"].astype(int))
+        assert self._boxes(sdata) == [(4256, 4256)] * 2
+
+    def test_no_geometry_raises(self, sdio, tmp_path):
+        root = tmp_path / "bare"
+        root.mkdir()
+        _write_csv(
+            root / "R_fov_positions_file.csv", pd.DataFrame({"fov": [1], "x_global_px": [0.0], "y_global_px": [0.0]})
+        )
+        _write_csv(root / "R_exprMat_file.csv", _make_expr_mat([1]))
+        _write_csv(root / "R_metadata_file.csv", _make_metadata([1]))
+        with pytest.raises(ValueError, match="CosMx FOV size unknown: no FOV image"):
+            sdio.cosmx(root, n_workers=1)
+        # the tables alone need no FOV size
+        kw = dict.fromkeys(
+            ("read_images", "read_labels", "read_polygons", "read_transcripts", "add_fovs_as_shapes"), False
+        )
+        sdata = sdio.cosmx(root, n_workers=1, **kw)
+        assert sdata["cell_data"].n_obs == N_CELLS_PER_FOV
+        assert sdata.attrs["cosmx"]["fov_size_px"] is None
+
+    def test_cell_outside_labels_is_kept(self, sdio, tmp_path, caplog):
+        # cell 6 is in the expression matrix but has no polygon: kept in the table, and logged
+        root = tmp_path / "unseg"
+        root.mkdir()
+        fov_df = pd.DataFrame({"fov": [1], "x_global_px": [0.0], "y_global_px": [0.0]})
+        _write_csv(root / "S0_fov_positions_file.csv", fov_df)
+        _write_csv(root / "S0-polygons.csv", _make_polygon_df({1: (0.0, 0.0)}, n_cells=5))
+        _write_csv(root / "S0_exprMat_file.csv", _make_expr_mat([1], n_cells=6))
+        _write_csv(root / "S0_metadata_file.csv", _make_metadata([1], n_cells=6))
+        with caplog.at_level("WARNING"):
+            sdata = sdio.cosmx(root, **self._KW)
+        assert sdata["cell_data"].n_obs == 6
+        assert "1 of 6 cell(s) are not in the rasterised labels; they are kept" in caplog.text
+
+    def test_cell_without_metadata_is_kept(self, sdio, tmp_path, caplog):
+        root = tmp_path / "nometa"
+        root.mkdir()
+        _write_csv(
+            root / "S0_fov_positions_file.csv", pd.DataFrame({"fov": [1], "x_global_px": [0.0], "y_global_px": [0.0]})
+        )
+        _write_csv(root / "S0-polygons.csv", _make_polygon_df({1: (0.0, 0.0)}, n_cells=5))
+        _write_csv(root / "S0_exprMat_file.csv", _make_expr_mat([1], n_cells=5))
+        _write_csv(root / "S0_metadata_file.csv", _make_metadata([1], n_cells=4))
+        with caplog.at_level("WARNING"):
+            sdata = sdio.cosmx(root, **self._KW)
+        obs = sdata["cell_data"].obs
+        assert len(obs) == 5
+        assert obs["cell_ID"].astype(int).tolist() == [1, 2, 3, 4, 5]
+        assert obs["Area"].isna().sum() == 1
+        assert "1 of 5 exprMat cell(s) have no row in S0_metadata_file.csv" in caplog.text
+
+
 class TestFovPlacement:
     """Verify stitching geometry for adjacent, non-adjacent, and single FOV."""
 
     def test_adjacent_stitched_width(self, sdio, fixture_a):
-        """Two side-by-side FOVs → stitched canvas ≈ 2 * SPEC_FOV_SIZE wide."""
+        """Two side-by-side FOVs → stitched canvas ≈ 2 * FOV_SIZE wide."""
         import dask.array as da
 
         sdata = _read(sdio, fixture_a, fovs=[1, 2])
         if not sdata.images:
             pytest.skip("No images")
         c, h, w = _img_shape(sdata)
-        # _snap_fov_grid forces 4256, so canvas = 2*4256
-        assert w > SPEC_FOV_SIZE, f"Expected width > {SPEC_FOV_SIZE}, got {w}"
-        assert w <= 2 * SPEC_FOV_SIZE + 10
+        # _snap_fov_grid places each FOV at the run's FOV size, so canvas = 2 * FOV_SIZE
+        assert w > FOV_SIZE, f"Expected width > {FOV_SIZE}, got {w}"
+        assert w <= 2 * FOV_SIZE + 10
 
         # Verify the image has actual data, not all zeros
         img = next(iter(sdata.images.values()))
@@ -1269,12 +1416,12 @@ class TestFovPlacement:
         assert sample.max() > 0, "Stitched image is all zeros in FOV 1 region"
 
     def test_non_adjacent_has_gap(self, sdio, fixture_b):
-        """Non-adjacent FOVs → canvas larger than 2 * SPEC_FOV_SIZE."""
+        """Non-adjacent FOVs → canvas larger than 2 * FOV_SIZE."""
         sdata = _read(sdio, fixture_b, fovs=[1, 5])
         if not sdata.images:
             pytest.skip("No images")
         c, h, w = _img_shape(sdata)
-        assert w > 2 * SPEC_FOV_SIZE, f"Non-adjacent gap not reflected: w={w}"
+        assert w > 2 * FOV_SIZE, f"Non-adjacent gap not reflected: w={w}"
 
     def test_single_fov_size(self, sdio, fixture_a):
         """Single FOV → image matches the actual TIFF size (no snapping)."""
@@ -1286,7 +1433,7 @@ class TestFovPlacement:
         assert w == TIFF_FOV_SIZE
 
     def test_fov_boxes_geometry(self, sdio, fixture_a):
-        """FOV boxes should be SPEC_FOV_SIZE x SPEC_FOV_SIZE squares."""
+        """FOV boxes should be FOV_SIZE x FOV_SIZE squares."""
         sdata = _read(sdio, fixture_a, fovs=[1, 2])
         fov_keys = [k for k in sdata.shapes if "fov_box" in k]
         assert len(fov_keys) == 1
@@ -1296,8 +1443,8 @@ class TestFovPlacement:
             minx, miny, maxx, maxy = geom.bounds
             w = maxx - minx
             h = maxy - miny
-            assert abs(w - SPEC_FOV_SIZE) < 1
-            assert abs(h - SPEC_FOV_SIZE) < 1
+            assert abs(w - FOV_SIZE) < 1
+            assert abs(h - FOV_SIZE) < 1
 
     def test_non_adjacent_fov_boxes_separated(self, sdio, fixture_b):
         """Non-adjacent FOV boxes should not overlap."""
@@ -1508,7 +1655,7 @@ def fixture_phantom(tmp_path_factory) -> Path:
     prefix = "Run_Ph"
     pos_fovs = [1, 2]
     real = [2]
-    fov_pos = {1: (0.0, 0.0), 2: (float(SPEC_FOV_SIZE), 0.0)}
+    fov_pos = {1: (0.0, 0.0), 2: (float(FOV_SIZE), 0.0)}
 
     fov_df = pd.DataFrame(
         {
@@ -1538,7 +1685,7 @@ def fixture_no_perfov(tmp_path_factory) -> Path:
     root = tmp_path_factory.mktemp("fixture_noperfov")
     prefix = "Run_NP"
     fovs = [1, 2]
-    fov_pos = {1: (0.0, 0.0), 2: (float(SPEC_FOV_SIZE), 0.0)}
+    fov_pos = {1: (0.0, 0.0), 2: (float(FOV_SIZE), 0.0)}
     fov_df = pd.DataFrame(
         {
             "fov": fovs,
@@ -1548,7 +1695,9 @@ def fixture_no_perfov(tmp_path_factory) -> Path:
     )
     _write_csv(root / f"{prefix}_fov_positions_file.csv", fov_df)
     _write_csv(root / f"{prefix}_exprMat_file.csv", _make_expr_mat(fovs))
-    _write_csv(root / f"{prefix}_metadata_file.csv", _make_metadata(fovs))
+    # cell centres give the FOV size (no FOV image to take it from)
+    meta = _make_metadata(fovs).assign(CenterX_local_px=FOV_SIZE - 1.5, CenterY_local_px=FOV_SIZE - 1.5)
+    _write_csv(root / f"{prefix}_metadata_file.csv", meta)
     return root
 
 
@@ -1593,11 +1742,11 @@ class TestSkipEmptyFovs:
         sd = sdio.cosmx(fixture_phantom, skip_empty_fovs=True, **self._COMMON)
         _, ih, iw = _img_shape(sd)
         lh, lw = _label_shape(sd)
-        assert iw <= SPEC_FOV_SIZE + 10, f"image canvas not tightened: {iw}"
+        assert iw <= FOV_SIZE + 10, f"image canvas not tightened: {iw}"
         assert (ih, iw) == (lh, lw), f"image {ih}x{iw} != label {lh}x{lw}"
-        # both rasters land on the real FOV 2 (global x = SPEC_FOV_SIZE)
-        assert abs(_global_x(next(iter(sd.images.values()))) - SPEC_FOV_SIZE) <= 1
-        assert abs(_global_x(next(iter(sd.labels.values()))) - SPEC_FOV_SIZE) <= 1
+        # both rasters land on the real FOV 2 (global x = FOV_SIZE)
+        assert abs(_global_x(next(iter(sd.images.values()))) - FOV_SIZE) <= 1
+        assert abs(_global_x(next(iter(sd.labels.values()))) - FOV_SIZE) <= 1
 
     def test_prune_drops_phantom_fov_box(self, sdio, fixture_phantom):
         sd = sdio.cosmx(fixture_phantom, skip_empty_fovs=True, add_fovs_as_shapes=True, **self._COMMON)
@@ -1610,9 +1759,9 @@ class TestSkipEmptyFovs:
         sd = sdio.cosmx(fixture_phantom, skip_empty_fovs=False, **self._COMMON)
         _, ih, iw = _img_shape(sd)
         lh, lw = _label_shape(sd)
-        assert iw <= SPEC_FOV_SIZE + 10, f"image canvas not tightened w/o skip: {iw}"
+        assert iw <= FOV_SIZE + 10, f"image canvas not tightened w/o skip: {iw}"
         assert (ih, iw) == (lh, lw)
-        assert abs(_global_x(next(iter(sd.images.values()))) - SPEC_FOV_SIZE) <= 1
+        assert abs(_global_x(next(iter(sd.images.values()))) - FOV_SIZE) <= 1
 
     def test_no_skip_keeps_phantom_fov_box(self, sdio, fixture_phantom):
         # Read without labels: the label path independently prunes fov_locs to
@@ -1668,6 +1817,7 @@ class TestSkipEmptyFovs:
         )
         keys = [k for k in sd.shapes if "fov_box" in k]
         assert keys and len(sd.shapes[keys[0]]) == 2
+        assert sd.attrs["cosmx"]["fov_size_source"] == "local_px_max"
 
 
 class TestDetectFovsWithData:
@@ -1726,7 +1876,7 @@ def fixture_lowsig(tmp_path_factory) -> Path:
     root = tmp_path_factory.mktemp("fixture_lowsig")
     prefix = "S0"
     fovs = [1, 2]
-    fov_pos = {1: (0.0, 0.0), 2: (float(SPEC_FOV_SIZE), 0.0)}
+    fov_pos = {1: (0.0, 0.0), 2: (float(FOV_SIZE), 0.0)}
     x_mm = {f: x / MM_TO_PX for f, (x, _) in fov_pos.items()}
     y_mm = {f: y / MM_TO_PX for f, (_, y) in fov_pos.items()}
     fov_df = pd.DataFrame(
