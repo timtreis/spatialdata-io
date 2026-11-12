@@ -202,6 +202,12 @@ def codex_wrapper(
 @click.option("--add-fovs-as-shapes", type=bool, default=True, help="Add FOV bounding boxes as shapes. [default: True]")
 @click.option("--skip-empty-fovs", type=bool, default=True, help="Drop FOVs without data files. [default: True]")
 @click.option("--preview-fovs", type=bool, default=False, help="Plot the FOV layout and exit. [default: False]")
+@click.option(
+    "--controls",
+    type=click.Choice(["keep", "drop"]),
+    default="keep",
+    help="Whether to keep the control features in the table. [default: keep]",
+)
 def cosmx_wrapper(
     input: str,
     output: str,
@@ -225,6 +231,7 @@ def cosmx_wrapper(
     add_fovs_as_shapes: bool = True,
     skip_empty_fovs: bool = True,
     preview_fovs: bool = False,
+    controls: Literal["keep", "drop"] = "keep",
 ) -> None:
     """CosMx conversion to SpatialData."""
     from spatialdata_io.readers.cosmx import cosmx
@@ -251,6 +258,7 @@ def cosmx_wrapper(
         add_fovs_as_shapes=add_fovs_as_shapes,
         skip_empty_fovs=skip_empty_fovs,
         preview_fovs=preview_fovs,
+        controls=controls,
     )
     if sdata is not None:
         sdata.write(output)
@@ -457,6 +465,12 @@ def mcmicro_wrapper(
 @click.option("--cells-table", type=bool, default=True, help="Whether to read cells table.  [default: True]")
 @click.option("--mosaic-images", type=bool, default=True, help="Whether to read the mosaic images.  [default: True]")
 @click.option(
+    "--controls",
+    type=click.Choice(["keep", "drop"]),
+    default="keep",
+    help="Whether to keep the control features in the table. [default: keep]",
+)
+@click.option(
     "--imread-kwargs",
     type=str,
     default="{}",
@@ -480,6 +494,7 @@ def merscope_wrapper(
     cells_boundaries: bool = True,
     cells_table: bool = True,
     mosaic_images: bool = True,
+    controls: Literal["keep", "drop"] = "keep",
     imread_kwargs: str = "{}",
     image_models_kwargs: str = "{}",
 ) -> None:
@@ -497,6 +512,7 @@ def merscope_wrapper(
         cells_boundaries=cells_boundaries,
         cells_table=cells_table,
         mosaic_images=mosaic_images,
+        controls=controls,
         imread_kwargs=_parse_json_param(imread_kwargs, "imread_kwargs"),
         image_models_kwargs=_parse_json_param(image_models_kwargs, "image_models_kwargs"),
     )
@@ -725,6 +741,12 @@ def stereoseq_wrapper(
     help="Antibody counts deposited apart from the counts file, relative to the input folder. [default: None]",
 )
 @click.option(
+    "--controls",
+    type=click.Choice(["keep", "drop"]),
+    default="keep",
+    help="Whether to keep the control features in the table. [default: keep]",
+)
+@click.option(
     "--imread-kwargs",
     type=str,
     default="{}",
@@ -746,6 +768,7 @@ def visium_wrapper(
     scalefactors_file: str | Path | None = None,
     var_names_make_unique: bool = True,
     protein_file: str | None = None,
+    controls: Literal["keep", "drop"] = "keep",
     imread_kwargs: str = "{}",
     image_models_kwargs: str = "{}",
 ) -> None:
@@ -761,6 +784,7 @@ def visium_wrapper(
         scalefactors_file=scalefactors_file,
         var_names_make_unique=var_names_make_unique,
         protein_file=protein_file,
+        controls=controls,
         imread_kwargs=_parse_json_param(imread_kwargs, "imread_kwargs"),
         image_models_kwargs=_parse_json_param(image_models_kwargs, "image_models_kwargs"),
     )
@@ -826,10 +850,16 @@ def visium_wrapper(
     help="Whether to make variable names unique. [default: True]",
 )
 @click.option(
+    "--controls",
+    type=click.Choice(["keep", "drop"]),
+    default="keep",
+    help="Whether to keep the control features in the tables. [default: keep]",
+)
+@click.option(
     "--gex-only",
     type=bool,
-    default=False,
-    help="If `True`, only load gene expression features. [default: False]",
+    default=None,
+    help="Deprecated, use --controls: True drops the controls, False keeps them.",
 )
 @click.option(
     "--imread-kwargs",
@@ -862,7 +892,8 @@ def visium_hd_wrapper(
     load_all_images: bool = False,
     annotate_table_by_labels: bool = False,
     var_names_make_unique: bool = True,
-    gex_only: bool = False,
+    controls: Literal["keep", "drop"] = "keep",
+    gex_only: bool | None = None,
     imread_kwargs: str = "{}",
     image_models_kwargs: str = "{}",
     anndata_kwargs: str = "{}",
@@ -882,6 +913,7 @@ def visium_hd_wrapper(
         load_all_images=load_all_images,
         annotate_table_by_labels=annotate_table_by_labels,
         var_names_make_unique=var_names_make_unique,
+        controls=controls,
         gex_only=gex_only,
         imread_kwargs=_parse_json_param(imread_kwargs, "imread_kwargs"),
         image_models_kwargs=_parse_json_param(image_models_kwargs, "image_models_kwargs"),

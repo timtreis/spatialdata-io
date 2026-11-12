@@ -5,7 +5,7 @@ import re
 import warnings
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 import h5py
 import numpy as np
@@ -31,6 +31,7 @@ from xarray import DataArray
 
 from spatialdata_io._constants._constants import VisiumHDKeys
 from spatialdata_io._docs import inject_docs
+from spatialdata_io.readers._utils._features import split_by_feature_type
 from spatialdata_io.readers._utils._utils import _add_gene_id_and_genome, _set_observation_unit, _set_reader_metadata
 
 if TYPE_CHECKING:
@@ -60,7 +61,8 @@ def visium_hd(
     imread_kwargs: Mapping[str, Any] = MappingProxyType({}),
     image_models_kwargs: Mapping[str, Any] = MappingProxyType({}),
     anndata_kwargs: Mapping[str, Any] = MappingProxyType({}),
-    gex_only: bool = False,
+    gex_only: bool | None = None,
+    controls: Literal["keep", "drop"] = "keep",
 ) -> SpatialData:
     """Read *10x Genomics* Visium HD formatted dataset.
 
@@ -112,12 +114,27 @@ def visium_hd(
     anndata_kwargs
         Keyword arguments for :func:`anndata.io.read_h5ad`.
     gex_only
-        If `True`, only the gene expression (GEX) data will be loaded.
+        .. deprecated::
+            Use `controls`. `True` maps to ``controls="drop"``, `False` to ``controls="keep"``; protein and other
+            feature types are never dropped.
+    controls
+        ``"keep"`` keeps any control features in each table, ``"drop"`` removes them. Every feature is typed by
+        ``var["feature_types"]``, the 10x ``feature_type``. Protein (Antibody Capture, Protein Expression) of a
+        table ``<name>`` goes to ``<name>_protein`` and any other type to ``<name>_<type>``, annotating the same
+        element.
 
     Returns
     -------
     SpatialData object for the Visium HD data.
     """
+    if gex_only is not None:
+        warnings.warn(
+            f"The `gex_only` parameter is deprecated; use `controls`. gex_only={gex_only} maps to "
+            f"controls={'drop' if gex_only else 'keep'!r}, and protein goes to `<table>_protein` either way.",
+            DeprecationWarning,
+            stacklevel=2,
+        )
+        controls = "drop" if gex_only else "keep"
     path = Path(path)
     all_files = [file for file in path.rglob("*") if file.is_file()]
     tables = {}
@@ -262,7 +279,7 @@ def visium_hd(
             counts_file = VisiumHDKeys.FILTERED_COUNTS_FILE if filtered_counts_file else VisiumHDKeys.RAW_COUNTS_FILE
             adata = sc.read_10x_h5(
                 path_bin / counts_file,
-                gex_only=gex_only,
+                gex_only=False,
                 **anndata_kwargs,
             )
 
@@ -356,7 +373,7 @@ def visium_hd(
     # Integrate the segmentation data (skipped if segmentation files are not found)
     if cell_segmentation_files_exist:
         print("Found segmentation data. Incorporating cell_segmentations.")
-        cell_adata_hd = sc.read_10x_h5(COUNT_MATRIX_PATH, gex_only=gex_only)
+        cell_adata_hd = sc.read_10x_h5(COUNT_MATRIX_PATH, gex_only=False)
         cell_adata_hd.var_names_make_unique()
 
         cell_shapes_gdf = _extract_geometries_from_geojson(
@@ -390,7 +407,6 @@ def visium_hd(
             nucleus_adata_hd = _make_filtered_nucleus_adata(
                 filtered_matrix_h5_path=FILTERED_MATRIX_2U_PATH,
                 barcode_mappings_parquet_path=BARCODE_MAPPINGS_PATH,
-                gex_only=gex_only,
             )
             nucleus_shapes_gdf = _extract_geometries_from_geojson(
                 adata=nucleus_adata_hd, geojson_path=NUCLEUS_GEOJSON_PATH
@@ -572,6 +588,9 @@ def visium_hd(
             stacklevel=2,
         )
 
+    # protein and other feature types of each table go to `<name>_protein` / `<name>_<type>`, nothing is dropped
+    split = {name: split_by_feature_type(t, controls=controls, name=name) for name, t in tables.items()}
+    tables = {k: t for parts in split.values() for k, t in parts.items()}
     sdata = SpatialData(tables=tables, images=images, shapes=shapes, labels=labels)
 
     if annotate_table_by_labels:
@@ -589,9 +608,10 @@ def visium_hd(
                 return_region_as_labels=True,
             )
             sdata[labels_name] = labels_element
-            rasterize_bins_link_table_to_labels(
-                sdata=sdata, table_name=bin_size_str, rasterized_labels_name=labels_name
-            )
+            for table_name in split[bin_size_str]:
+                rasterize_bins_link_table_to_labels(
+                    sdata=sdata, table_name=table_name, rasterized_labels_name=labels_name
+                )
 
     return _set_reader_metadata(sdata, "visium_hd")
 

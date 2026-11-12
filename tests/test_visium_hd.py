@@ -213,3 +213,10 @@ def test_cli_visium_hd(runner: CliRunner, dataset: str) -> None:
 
         # A simple check to confirm data was loaded
         assert f"{DATASET_ID}_lowres_image" in sdata.images
+
+
+@pytest.mark.parametrize("gex_only", [True, False])
+def test_gex_only_is_deprecated(tmp_path: Path, gex_only: bool) -> None:
+    # the warning comes before any file is read; the empty folder then fails to read
+    with pytest.warns(DeprecationWarning, match="gex_only"), pytest.raises(Exception):  # noqa: B017
+        visium_hd(tmp_path, gex_only=gex_only)
