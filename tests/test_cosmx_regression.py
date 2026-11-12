@@ -1413,6 +1413,17 @@ class TestFovSize:
         assert abs(x - 4100) <= 1.5
         assert abs(y - (4256 - 1000 if pxmm else 1000)) <= 1.5, y
 
+    @pytest.mark.parametrize("pxmm", [True, False])
+    def test_polygon_labels_land_on_their_polygons(self, sdio, tmp_path, pxmm):
+        # the first polygon starts at local (175, 175), not at the FOV origin: the label canvas starts at the FOV
+        # origin, so its translation must carry that offset as well as the polygon origin
+        root = _camera_run(tmp_path / "cur", 4256, 4256, _CURRENT_CAMERA_CELLS, labels=False, pxmm=pxmm)
+        sdata = sdio.cosmx(root, polygons_as_labels=True, keep_polygons_after_rasterize=True, **self._KW)
+        assert sdata.attrs["cosmx"]["fov_size_px"] == [4256, 4256]
+        for gid in sdata["cell_data"].obs["global_cell_id"].astype(int):
+            (lx, ly), (px, py) = self._label_centre(sdata, gid), self._polygon_centre(sdata, gid)
+            assert abs(lx - px) <= 1 and abs(ly - py) <= 1, (gid, (lx, ly), (px, py))
+
     def test_fov_images_of_different_shapes_raise(self, sdio, tmp_path):
         import tifffile
 

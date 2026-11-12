@@ -805,7 +805,8 @@ class CosMxDatasetReader:
 
         present_ids = {int(x) for x in da.unique(raster.data).compute() if x != 0}
         name = _element_name("polygons_labels", self.fovs)
-        lbl = _parse_labels(raster, ox, oy)
+        # raster column 0 is polygon-frame x = canvas_min_x (the first FOV's origin), not the polygon origin
+        lbl = _parse_labels(raster, ox + canvas_min_x, oy + canvas_min_y)
         return {name: lbl}, present_ids
 
     def _labels_from_cell_labels_dir(self) -> tuple[dict[str, Labels2DModel], set[int]]:
