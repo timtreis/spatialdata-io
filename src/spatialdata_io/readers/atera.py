@@ -29,6 +29,7 @@ from spatialdata_io.readers._atera_common import (
     read_cell_boundaries,
     read_transcripts_for_genes,
 )
+from spatialdata_io.readers._utils._features import split_by_feature_type
 from spatialdata_io.readers._utils._utils import _initialize_raster_models_kwargs, _set_reader_metadata
 from spatialdata_io.readers.xenium import _add_aligned_images
 
@@ -71,6 +72,7 @@ def atera(
     aligned_images: bool = True,
     var_columns: list[str] | Literal["all"] = DEFAULT_VAR_COLUMNS,
     table_row_chunk_size: int = DEFAULT_TABLE_ROW_CHUNK_SIZE,
+    controls: Literal["keep", "drop"] = "keep",
     imread_kwargs: Mapping[str, Any] = MappingProxyType({}),
     image_models_kwargs: Mapping[str, Any] = MappingProxyType({}),
     labels_models_kwargs: Mapping[str, Any] = MappingProxyType({}),
@@ -124,11 +126,17 @@ def atera(
         differential-expression columns). Defaults to a small subset (`{xx.FEATURE_NAME!r}`,
         `{xx.VAR_FILTERED!r}`, `{xx.VAR_HIGHLY_VARIABLE!r}`, `{xx.FEATURE_ID!r}`,
         `{xx.VAR_FEATURE_TYPE!r}`, `{xx.VAR_GENOME!r}`) to avoid holding the full table in memory;
-        pass `"all"` to keep every column, or use `read_var` to load the full table separately.
+        pass `"all"` to keep every column, or use `read_var` to load the full table separately. The feature type
+        is always kept, as ``feature_types``.
     table_row_chunk_size
         Number of `obs` rows read per chunk when lazily loading the table's `X` (see `_get_table`).
         Larger values mean fewer, larger `dask` tasks (faster, but more peak memory per chunk);
         smaller values mean more, smaller ones.
+    controls
+        ``"keep"`` keeps the control features (negative control probes and codewords, genomic controls, unassigned
+        and deprecated codewords) in ``table``, ``"drop"`` removes them. Every feature is typed by
+        ``var["feature_types"]``, the bundle's ``feature_type``; protein goes to ``table_protein`` and any other
+        type to ``table_<type>``.
     imread_kwargs
         Keyword arguments passed to `tifffile.TiffFile` when reading the morphology images (see
         `_tiled_imread`); the images are read tile-by-tile off `tifffile`'s own `zarr` store rather
@@ -160,12 +168,14 @@ def atera(
     # element that isn't actually present in `sdata`.
     default_region = "cell_labels" if cells_labels else "cell_boundaries" if cells_boundaries else "cell_labels"
 
+    tables: dict[str, AnnData] = {}
     table: AnnData | None = None
     feature_names: list[str] | None = None
     if cells_table:
         table, feature_names = _get_table(
             path, var_columns=var_columns, row_chunk_size=table_row_chunk_size, region=default_region
         )
+        tables = split_by_feature_type(table, controls=controls)
 
     shapes: dict[str, Any] = {}
     labels: dict[str, DataArray | DataTree] = {}
@@ -208,7 +218,6 @@ def atera(
     if aligned_images:
         images |= _get_aligned_images(path, image_models_kwargs)
 
-    tables = {"table": table} if table is not None else {}
     sdata = SpatialData(images=images, labels=labels, points=points, tables=tables, shapes=shapes)
     sdata = _set_reader_metadata(sdata, "atera")
     sdata.attrs[str(AteraKeys.PIXEL_SIZE)] = pixel_size
@@ -339,6 +348,14 @@ def _xenium_var(var: pd.DataFrame) -> pd.DataFrame:
     return var.rename(columns={ftype: "feature_types"})
 
 
+def _select_var_columns(var: pd.DataFrame, var_columns: list[str] | Literal["all"]) -> pd.DataFrame:
+    """The `var_columns` of `var`, always with the feature type, which `split_by_feature_type` needs."""
+    if var_columns == "all":
+        return var
+    ftype = str(AteraKeys.VAR_FEATURE_TYPE)
+    return var[list(dict.fromkeys([*var_columns, *([ftype] if ftype in var.columns else [])]))]
+
+
 def _parse_table(adata: AnnData, region: str) -> AnnData:
     """Annotate `region` with `adata`, using whichever `obs` column holds that element's instance ids.
 
@@ -377,8 +394,7 @@ def _get_table(
         with _patched_ragged_vlen_chunk_decode():
             var_df = _read_dataframe(group, AteraKeys.VAR_GROUP)
             feature_names = var_df[str(AteraKeys.FEATURE_NAME)].astype(str).tolist()
-            if var_columns != "all":
-                var_df = var_df[list(var_columns)]
+            var_df = _select_var_columns(var_df, var_columns)
 
             obs_df = _read_dataframe(group, AteraKeys.OBS_GROUP)
             _add_label_id(obs_df)
@@ -473,7 +489,7 @@ def read_table_for_cells(
 
     Returns
     -------
-    An `AnnData` `TableModel` with only the requested cells.
+    An `AnnData` `TableModel` with only the requested cells and every feature, typed by ``var["feature_types"]``.
     """
     if (cell_ids is None) == (bbox is None):
         raise ValueError("Exactly one of `cell_ids`/`bbox` must be given.")
@@ -485,9 +501,7 @@ def read_table_for_cells(
     try:
         group = zarr.open_group(store, mode="r")
         with _patched_ragged_vlen_chunk_decode():
-            var_df = _read_dataframe(group, AteraKeys.VAR_GROUP)
-            if var_columns != "all":
-                var_df = var_df[list(var_columns)]
+            var_df = _select_var_columns(_read_dataframe(group, AteraKeys.VAR_GROUP), var_columns)
             obs_df = _read_dataframe(group, AteraKeys.OBS_GROUP)
             _add_label_id(obs_df)
 

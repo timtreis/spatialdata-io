@@ -287,3 +287,117 @@ def test_var_follows_the_xenium_layout(atera_path: Path, table: str) -> None:
     assert adata.var["gene_ids"].tolist() == ["ID_A", "ID_B"]
     assert adata.var["feature_types"].tolist() == ["Gene Expression", "Gene Expression"]
     assert "feature_type" not in adata.var.columns
+
+
+QC_VAR = pd.DataFrame(
+    {
+        str(AteraKeys.FEATURE_NAME): ["GENE_A", "NegControlProbe_1", "GENE_B", "UnassignedCodeword_7", "PROT_A"],
+        str(AteraKeys.VAR_FILTERED): [False] * 5,
+        str(AteraKeys.VAR_HIGHLY_VARIABLE): [False] * 5,
+        str(AteraKeys.VAR_FEATURE_TYPE): [
+            "Gene Expression",
+            "Negative Control Probe",
+            "Gene Expression",
+            "Unassigned Codeword",
+            "Protein Expression",
+        ],
+        str(AteraKeys.VAR_GENOME): ["g"] * 5,
+    },
+    index=pd.Index(["ID_A", "ID_N", "ID_B", "ID_U", "ID_P"], dtype=object, name=str(AteraKeys.FEATURE_ID)),
+)
+QC_X = np.arange(len(CELL_IDS) * len(QC_VAR), dtype=np.float32).reshape(len(CELL_IDS), -1)
+
+
+@pytest.fixture
+def atera_qc_path(tmp_path: Path) -> Path:
+    """A table-only bundle with a negative control probe, an unassigned codeword and a protein between the genes."""
+    import json
+
+    n = len(CELL_IDS)
+    obs = pd.DataFrame(
+        {
+            str(AteraKeys.CELL_ID): np.array(CELL_IDS, dtype=np.uint64),
+            str(AteraKeys.CENTROID_X): np.arange(n, dtype=np.float32),
+            str(AteraKeys.CENTROID_Y): np.arange(n, dtype=np.float32),
+        },
+        index=pd.Index([f"c{i}" for i in range(n)], dtype=object, name="barcode"),
+    )
+    store = zarr.storage.ZipStore(tmp_path / AteraKeys.CELL_FEATURE_MATRIX_FILE, mode="w")
+    try:
+        group = zarr.open_group(store, mode="w", zarr_format=2)
+        write_elem(group, str(AteraKeys.X_GROUP), csr_matrix(QC_X))
+        write_elem(group, str(AteraKeys.OBS_GROUP), obs)
+        write_elem(group, str(AteraKeys.VAR_GROUP), QC_VAR)
+        for key, df in ((AteraKeys.OBS_GROUP, obs), (AteraKeys.VAR_GROUP, QC_VAR)):  # as in `atera_path`
+            elem = group[str(key)]
+            elem.attrs["column-order"] = [str(df.index.name), *cast("list[str]", elem.attrs["column-order"])]
+    finally:
+        store.close()
+    (tmp_path / AteraKeys.SPECS_FILE).write_text(json.dumps({str(AteraKeys.PIXEL_SIZE): 0.2125}))
+    return tmp_path
+
+
+_TABLE_ONLY = {
+    "cells_boundaries": False,
+    "nucleus_boundaries": False,
+    "cells_labels": False,
+    "nucleus_labels": False,
+    "morphology_images": False,
+    "aligned_images": False,
+}
+
+
+@pytest.mark.parametrize("var_columns", [None, [str(AteraKeys.FEATURE_NAME)]])
+def test_atera_keeps_controls(atera_qc_path: Path, var_columns: list[str] | None) -> None:
+    from spatialdata_io.readers.atera import atera
+
+    # the type is kept even when `var_columns` leaves `feature_type` out
+    sdata = atera(atera_qc_path, **_TABLE_ONLY, **({} if var_columns is None else {"var_columns": var_columns}))
+    table, protein = sdata["table"], sdata["table_protein"]
+    assert set(sdata.tables) == {"table", "table_protein"}
+    assert table.var_names.tolist() == ["GENE_A", "NegControlProbe_1", "GENE_B", "UnassignedCodeword_7"]
+    assert table.var["feature_types"].tolist() == QC_VAR[str(AteraKeys.VAR_FEATURE_TYPE)].tolist()[:4]
+    assert table.n_vars + protein.n_vars == len(QC_VAR)
+    np.testing.assert_array_equal(np.asarray(table.X.compute().toarray()), QC_X[:, :4])
+    np.testing.assert_array_equal(np.asarray(protein.X.compute().toarray()), QC_X[:, [4]])
+    assert get_table_keys(protein) == get_table_keys(table)
+    pd.testing.assert_frame_equal(protein.obs, table.obs)
+
+
+def test_atera_drop_controls(atera_qc_path: Path) -> None:
+    from spatialdata_io.readers.atera import atera
+
+    sdata = atera(atera_qc_path, controls="drop", **_TABLE_ONLY)
+    assert sdata["table"].var_names.tolist() == ["GENE_A", "GENE_B"]
+    np.testing.assert_array_equal(np.asarray(sdata["table"].X.compute().toarray()), QC_X[:, [0, 2]])
+    assert sdata["table_protein"].var_names.tolist() == ["PROT_A"]
+
+
+def test_atera_controls_round_trip(atera_qc_path: Path, tmp_path_factory: pytest.TempPathFactory) -> None:
+    from spatialdata import read_zarr
+
+    from spatialdata_io.readers.atera import atera
+
+    sdata = atera(atera_qc_path, **_TABLE_ONLY)
+    out = tmp_path_factory.mktemp("out") / "x.zarr"
+    sdata.write(out)
+    back = read_zarr(out)
+    for key in ("table", "table_protein"):
+        assert back[key].var["feature_types"].tolist() == sdata[key].var["feature_types"].tolist()
+        np.testing.assert_array_equal(back[key].X.toarray(), np.asarray(sdata[key].X.compute().toarray()))
+
+
+def test_read_table_for_cells_keeps_every_feature(atera_qc_path: Path) -> None:
+    table = read_table_for_cells(atera_qc_path, cell_ids=[CELL_IDS[2], CELL_IDS[0]], var_columns=["feature_name"])
+    assert table.var["feature_types"].tolist() == QC_VAR[str(AteraKeys.VAR_FEATURE_TYPE)].tolist()
+    np.testing.assert_array_equal(table.X.toarray(), QC_X[[2, 0]])
+
+
+def test_read_transcripts_for_genes_indexes_the_bundle_features(tmp_path: Path) -> None:
+    # transcript gene offsets index every feature of the bundle; with controls="drop" `table.var` lacks some
+    from spatialdata import SpatialData
+
+    _write_atera_dataset(tmp_path, {"0,0": 4}, ["0,0"], ids={})
+    sdata = SpatialData(attrs={str(AteraKeys.PIXEL_SIZE): 1.0})
+    common.read_transcripts_for_genes(sdata, tmp_path, "GENE_B")
+    assert len(sdata.points["transcripts_subset"]) == 2

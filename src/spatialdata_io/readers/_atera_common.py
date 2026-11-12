@@ -353,8 +353,8 @@ def read_transcripts_for_genes(
     plotting a handful of genes across the whole dataset much cheaper than loading and filtering
     the full transcripts table.
 
-    Requires ``sdata`` to have been read with ``cells_table=True``, to look up gene indices (via
-    the table's `var`) and `pixel_size` (via ``sdata.attrs``).
+    Requires ``sdata`` to hold `pixel_size` in ``sdata.attrs``, as `atera` sets it. The gene indices are looked up
+    in the bundle's `var`.
 
     Parameters
     ----------
@@ -380,7 +380,10 @@ def read_transcripts_for_genes(
     if isinstance(genes, str):
         genes = [genes]
     path = Path(path)
-    feature_names = sdata.tables["table"].var[str(AteraKeys.FEATURE_NAME)].astype(str).tolist()
+    from spatialdata_io.readers.atera import read_var  # atera imports this module
+
+    # the gene offsets index every feature of the bundle; `table.var` lacks the controls with controls="drop"
+    feature_names = read_var(path)[str(AteraKeys.FEATURE_NAME)].astype(str).tolist()
     gene_indices = {gene: feature_names.index(gene) for gene in genes}
     pixel_size = sdata.attrs[str(AteraKeys.PIXEL_SIZE)]
 
