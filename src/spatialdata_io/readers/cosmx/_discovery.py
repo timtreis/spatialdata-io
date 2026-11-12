@@ -124,6 +124,18 @@ _WHITELIST_DIRS = {
 }
 
 
+def _is_reader_parquet_cache(p: Path) -> bool:
+    """Whether *p* is the Parquet cache the reader writes next to a transcript CSV.
+
+    ``_parquet_cache_for_tx`` (``_io.py``) writes ``src.with_suffix(".parquet")``: ``<id>_tx_file.csv.parquet`` for a
+    ``.csv.gz`` source and ``<id>_tx_file.parquet`` for a ``.csv`` source (the latter only counts with that CSV beside it).
+    """
+    if p.suffix != ".parquet":
+        return False
+    base = p.name.removesuffix(".parquet")
+    return base.endswith(".csv") or (p.parent / f"{base}.csv").exists()
+
+
 def _scan_for_files_to_read(
     path: Path,
     targets: Iterable[str],
@@ -151,6 +163,8 @@ def _scan_for_files_to_read(
         if depth > max_depth:
             return
         for child in curr.iterdir():
+            if child.is_file() and _is_reader_parquet_cache(child):
+                continue
             if dataset_id is not None:
                 for t, val in found.items():
                     if val is not None:

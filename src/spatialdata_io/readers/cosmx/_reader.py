@@ -1085,6 +1085,10 @@ def _unassigned_table(bg: pd.DataFrame, var: pd.DataFrame, *, is_protein: bool) 
         info["note"] = "cell_ID 0 rows of the exprMat (vendor definition: see vendor_definition)"
         info["vendor_definition"] = _RNA_CELL_ID_ZERO
         info["vendor_source"] = _RNA_CELL_ID_ZERO_SOURCE
+    info["lossless_copy"] = (
+        'tables["unassigned_per_fov"] is the lossless copy of the exprMat cell_ID == 0 rows, with slide ids; '
+        'cell_data.varm["fov_bg_signal"] is kept for backward compatibility'
+    )
     table.uns["cosmx_unassigned"] = info
     return table
 

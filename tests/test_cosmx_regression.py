@@ -2390,6 +2390,45 @@ def test_dataset_id_selects_only_its_own_flat_files(tmp_path: Path) -> None:
     assert _scan_for_files_to_read(tmp_path, ["tx_file"], dataset_id="Run5452_S2")["tx_file"] is None
 
 
+def test_discovery_skips_the_readers_own_parquet_cache(tmp_path: Path) -> None:
+    # job 43232842_1: a rerun picked <id>_tx_file.csv.parquet (written by _parquet_cache_for_tx) as the transcript file
+    from spatialdata_io.readers.cosmx._discovery import _scan_for_files_to_read
+
+    for name in ("S0_tx_file.csv", "S0_tx_file.parquet", "S0_tx_file.csv.parquet"):
+        (tmp_path / name).write_text("fov\n")
+    for ds in (None, "S0"):
+        assert _scan_for_files_to_read(tmp_path, ["tx_file"], dataset_id=ds)["tx_file"] == tmp_path / "S0_tx_file.csv"
+
+
+def test_second_read_with_transcripts_ignores_the_parquet_cache(sdio, fixture_a, tmp_path, monkeypatch) -> None:
+    import shutil
+
+    from spatialdata_io.readers.cosmx import _reader
+
+    monkeypatch.setattr(_reader, "_maybe_warn_big_file", lambda src: True)  # the Parquet path is for big files only
+
+    d = tmp_path / "d"
+    shutil.copytree(fixture_a, d)
+    rows = [
+        {
+            "fov": f,
+            "cell_ID": c,
+            "x_local_px": 10.0 * c,
+            "y_local_px": 10.0 * c,
+            "x_global_px": 10.0 * c + f * FOV_SIZE,
+            "y_global_px": 10.0 * c,
+            "target": f"Gene_{c % 3}",
+        }
+        for f in (1, 2)
+        for c in range(1, N_CELLS_PER_FOV + 1)
+    ]
+    _write_csv(d / "S0_tx_file.csv.gz", pd.DataFrame(rows), compress=True)
+    first = _read(sdio, d, read_transcripts=True)
+    assert list(d.glob("S0_tx_file*.parquet")), "the first read should leave the reader's cache"
+    second = _read(sdio, d, read_transcripts=True)
+    assert sorted(second.points) == sorted(first.points) and len(second.points) > 0
+
+
 class TestFeatureTypes:
     """Controls stay in the table, typed by name in ``var["feature_types"]``; ``controls="drop"`` removes them."""
 
@@ -2495,6 +2534,8 @@ class TestUnassignedPerFov:
             "note": "cell_ID 0 rows of the exprMat (vendor definition: see vendor_definition)",
             "vendor_definition": "All transcripts not assigned to a cell are show with a cell_ID value of 0.",
             "vendor_source": "https://nanostring.com/wp-content/uploads/2024/11/MK6578_CosMx_Human_Lymph_Node_FFPE_Dataset_webpage.html",
+            "lossless_copy": 'tables["unassigned_per_fov"] is the lossless copy of the exprMat cell_ID == 0 rows, with slide ids; '
+            'cell_data.varm["fov_bg_signal"] is kept for backward compatibility',
         }
         assert "spatialdata_attrs" not in un.uns  # annotates no element
         assert un.uns.get("spatialdata_io", {}).get("observation_unit") is None
