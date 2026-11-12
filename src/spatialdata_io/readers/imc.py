@@ -49,8 +49,10 @@ def imc(
           ``SizeC``), or with one OME-XML document on the first page for all channels (e.g. imctools ``full_stack`` exports): the
           channel names come from the ``<Channel Name>`` entries;
         - a multi-page TIFF or ImageJ hyperstack (e.g. a steinbock ``img/<roi>.tiff``): the channel names are the
-          ``name`` column of ``panel`` (steinbock ``panel.csv``) for the rows with ``keep`` 1 (all rows without a
-          ``keep`` column), else ``ch0``, ``ch1``, ...
+          ``name`` column of ``panel`` (steinbock ``panel.csv``), else ``ch0``, ``ch1``, ... steinbock writes every
+          panel channel to ``img/``, whatever ``keep`` says, so every channel is read; ``sdata.attrs["imc"]``
+          records each image's ``keep`` column under ``"panel_keep"`` (one value per channel). A TIFF with only the
+          ``keep`` 1 channels is named by those rows.
 
     The image is stored as ``<roi>_image``, ``<roi>`` being the file name without its image extension (``.ome.tiff``,
     ``.zarr.zip``, ...), made a valid element name by :func:`spatialdata.sanitize_name`. IMC ablates 1 µm per pixel,
@@ -89,9 +91,10 @@ def imc(
     )
     images: dict[str, Any] = {}
     label_elements: dict[str, Any] = {}
+    panel_keep: dict[str, list[int]] = {}
     for i, roi_path in enumerate(paths):
         cs = "global" if len(paths) == 1 else _roi_name(roi_path)
-        im, lab = _read_roi(
+        im, lab, keep = _read_roi(
             roi_path,
             panel,
             {name: m[i] for name, m in roi_labels.items()},
@@ -103,6 +106,8 @@ def imc(
             raise ValueError(f"Two ROIs are both named {_roi_name(roi_path)}.")
         images |= im
         label_elements |= lab
+        if keep is not None:
+            panel_keep |= dict.fromkeys(im, keep)
 
     sdata = SpatialData(images=images, labels=label_elements)
     sdata.attrs["imc"] = {
@@ -110,6 +115,8 @@ def imc(
         "pixel_size_um": PIXEL_SIZE_UM,
         "pixel_size_source": "instrument spec (Hyperion/XTi ablation)",
     }
+    if panel_keep:
+        sdata.attrs["imc"]["panel_keep"] = panel_keep
     for table in sdata.tables.values():
         _set_observation_unit(table, "cell", None)
     return _set_reader_metadata(sdata, "imc")
@@ -218,15 +225,18 @@ def _read_roi(
     transformations: dict[str, Any],
     image_models_kwargs: Mapping[str, Any],
     labels_models_kwargs: Mapping[str, Any],
-) -> tuple[dict[str, Any], dict[str, Any]]:
-    """The image and label elements of one ROI."""
+) -> tuple[dict[str, Any], dict[str, Any], list[int] | None]:
+    """The image and label elements of one ROI, and the panel's ``keep`` value of each channel if it has one."""
     names: list[str] | None
+    keep = None
     if ".zarr" in path.suffixes:
         image, names = _read_ngff(path)
     else:
         image, names = _read_tiff(path)
-        if names is None:
-            names = _panel_names(Path(panel)) if panel is not None else [f"ch{i}" for i in range(image.shape[0])]
+        if names is None and panel is not None:
+            names, keep = _panel_names(Path(panel), image.shape[0])
+        elif names is None:
+            names = [f"ch{i}" for i in range(image.shape[0])]
     if len(names) != image.shape[0]:
         raise ValueError(f"{path.name} has {image.shape[0]} channels, but {len(names)} channel names were found.")
 
@@ -252,7 +262,7 @@ def _read_roi(
             transformations=transformations,
             **_fit_scale_factors(labels_models_kwargs, mask.shape),
         )
-    return images, label_elements
+    return images, label_elements, keep
 
 
 def _read_tiff(path: Path) -> tuple[da.Array, list[str] | None]:
@@ -292,8 +302,15 @@ def _roi_name(path: Path) -> str:
     return sanitize_name(_ROI_SUFFIX.sub("", path.name))
 
 
-def _panel_names(panel: Path) -> list[str]:
+def _panel_names(panel: Path, n_channels: int) -> tuple[list[str], list[int] | None]:
+    """The channel names of a steinbock ``panel.csv`` and its ``keep`` values (`None` without that column).
+
+    steinbock's ``preprocess imc images`` writes every panel channel, so all rows name the channels. Only a TIFF with
+    as many channels as ``keep`` 1 rows, and not as many as rows, is named by the ``keep`` 1 rows.
+    """
     df = pd.read_csv(panel)
-    if "keep" in df.columns:
+    if "keep" in df.columns and len(df) != n_channels and int(df["keep"].astype(bool).sum()) == n_channels:
+        logger.info(f"{panel.name}: the image has only the {n_channels} channels with keep 1; naming them by those.")
         df = df[df["keep"].astype(bool)]
-    return [str(n) for n in df["name"]]
+    keep = df["keep"].astype(int).tolist() if "keep" in df.columns else None
+    return [str(n) for n in df["name"]], keep

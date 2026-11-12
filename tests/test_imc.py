@@ -45,9 +45,24 @@ def test_steinbock_tiff_with_panel_and_mask_round_trips(tmp_path: Path) -> None:
     np.testing.assert_array_equal(image["scale0"]["image"].values, _DATA)
     np.testing.assert_array_equal(sdata.labels["Batch1_001_cells_labels"]["scale0"]["image"].values, mask)
     assert sdata.attrs["imc"]["pixel_size_um"] == 1.0
+    assert sdata.attrs["imc"]["panel_keep"] == {"Batch1_001_image": [1, 1, 1]}  # a TIFF of the keep 1 channels
     assert sdata.coordinate_systems == ["global"]
     sdata.write(tmp_path / "x.zarr")
     assert read_zarr(tmp_path / "x.zarr").attrs["spatialdata_io_reader"] == "imc"
+
+
+def test_steinbock_tiff_keeps_every_panel_channel(tmp_path: Path) -> None:
+    # steinbock writes every panel channel to img/, whatever `keep` says; keep 0 channels are still read
+    data = np.concatenate([_DATA, _DATA[:1] + 7])
+    tifffile.imwrite(tmp_path / "Batch1_001.tiff", data, imagej=True)
+    (tmp_path / "panel.csv").write_text("channel,name,keep\nXe132,132Xe,0\nPr141,aSMA,1\nNd142,CD3,1\nNd143,MBP,1\n")
+    sdata = imc(tmp_path / "Batch1_001.tiff", panel=tmp_path / "panel.csv", image_models_kwargs=_FAST)
+    image = sdata.images["Batch1_001_image"]
+    assert get_channel_names(image) == ["132Xe", "aSMA", "CD3", "MBP"]
+    np.testing.assert_array_equal(image["scale0"]["image"].values, data)
+    assert sdata.attrs["imc"]["panel_keep"] == {"Batch1_001_image": [0, 1, 1, 1]}
+    sdata.write(tmp_path / "x.zarr")
+    assert read_zarr(tmp_path / "x.zarr").attrs["imc"]["panel_keep"] == {"Batch1_001_image": [0, 1, 1, 1]}
 
 
 def test_per_page_ome_tiff_names(tmp_path: Path) -> None:
