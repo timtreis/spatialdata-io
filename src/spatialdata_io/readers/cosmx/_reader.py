@@ -1492,6 +1492,9 @@ def cosmx(
     -------
     :class:`spatialdata.SpatialData` or ``None`` (if ``preview_fovs=True``).
 
+    Tables: a single-modality run gives one table, ``cell_data``; a multimodal run gives one table per
+    modality, ``RNA`` and ``Protein``, annotating the same labels.
+
     Every element is in pixels in ``"global"`` and in µm in ``"microns"`` (the same transformation followed by a
     scale). The pixel size is taken from the FOV positions file when it lists each FOV in both ``x_global_px`` and
     ``x_global_mm`` (a warning is logged if it is more than 1% off the spec), else it is the CosMx spec value
