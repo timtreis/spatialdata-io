@@ -2782,21 +2782,40 @@ class TestMmOnlyOrientation:
         )
         assert box.equals_exact(data_box, 1e-6)
 
-    def test_data_fovs_off_one_mm_relation_raise(self, sdio, tmp_path):
-        with pytest.raises(
-            ValueError, match=r"do not fit one x relation .* worst FOV \d+, residual 5\.0 px over 3 FOVs"
-        ):
-            self._read(sdio, _mm_only_export(tmp_path, -1, 1, shift=10.0, extra="empty"))
-        # without an empty FOV nothing is fitted, so the same shift reads
-        sdata = self._read(sdio, _mm_only_export(tmp_path / "n", -1, 1, shift=10.0))
-        assert sdata.attrs["cosmx"]["orientation"] == "from_export_global_px"
+    def test_data_fovs_off_one_mm_relation_leave_the_empty_fov_without_a_box(self, sdio, tmp_path):
+        # sddb-lead ruling 03:42 (b): no raise; data FOVs stay at their export px, the empty FOV is unverified, no box
+        from spatialdata import transform
+
+        sdata = self._read(sdio, _mm_only_export(tmp_path, -1, 1, shift=10.0, extra="empty"), add_fovs_as_shapes=True)
+        cosmx = sdata.attrs["cosmx"]
+        assert cosmx["orientation"] == "from_export_global_px, 1 empty FOV unverified (no box)"
+        assert (
+            "1 empty FOVs unverified (no box): the run's mm→px relation does not fit: max residual 5.0 px over 3 "
+            "data FOVs (worst FOV" in cosmx["orientation_reason"]
+        )
+        assert cosmx["orientation_reason"].endswith(f"FOV(s) [{_EXTRA_FOV}]")
+        assert sorted(sdata["fov_boxes"]["fov"].astype(int)) == sorted(_STAGE_MM)
+        shifted = self._offsets(sdata, -1, 1)
+        fov = (
+            sdata["cell_data"]
+            .obs.set_index("global_cell_id")
+            .loc[transform(sdata["cells_polygons"], to_coordinate_system="global").index, "fov"]
+        )
+        np.testing.assert_allclose(shifted[:, 0], np.where(fov.to_numpy() == 2, 10.0, 0.0), atol=1e-6)
+        np.testing.assert_allclose(shifted[:, 1], 0.0, atol=1e-6)
+        assert sdata["cell_data"].n_obs == len(_STAGE_MM) * N_CELLS_PER_FOV
+        # without an empty FOV nothing is fitted, so the same shift reads plainly
+        plain = self._read(sdio, _mm_only_export(tmp_path / "n", -1, 1, shift=10.0))
+        assert plain.attrs["cosmx"]["orientation"] == "from_export_global_px"
 
     def test_fov_without_data_and_no_fit_is_unverified(self):
         from spatialdata_io.readers.cosmx._orientation import _orient_mm_only
 
         locs = pd.DataFrame({"xmin": [10.0, 5000.0], "ymin": [20.0, 20.0], "flip_y": True}, index=pd.Index([1, 2]))
-        out, notes, unverified = _orient_mm_only(locs, {1: {"x": (1, 100.0, 0.0), "y": (-1, 0.0, 900.0)}}, (50, 50))
-        assert unverified == [2]
+        out, notes, unverified, dropped = _orient_mm_only(
+            locs, {1: {"x": (1, 100.0, 0.0), "y": (-1, 0.0, 900.0)}}, (50, 50)
+        )
+        assert (unverified, dropped) == ([2], [])
         assert "fewer than 2 FOVs have data" in notes[-1]
         assert out.loc[2, ["xmin", "ymin", "flip_y"]].tolist() == [5000.0, 20.0, True]
         assert out.loc[1, ["xmin", "ymin", "flip_y"]].tolist() == [100.0, 850.0, False]

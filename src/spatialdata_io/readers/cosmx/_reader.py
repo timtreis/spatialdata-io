@@ -1933,8 +1933,12 @@ def cosmx(
       (else ``ValueError``). Every element is then in the export's global px frame. A FOV with one distinct local
       px on an axis takes the run's sign there, if the other FOVs share one (else ``ValueError``). A FOV with no
       cells and no transcripts has no global px of its own; it is placed through the run's ``offset = c + s * mm *
-      1000 / 0.120280945`` (s +1 or -1), fitted on the FOVs with data, which must all lie within 2 px of it (else
-      ``ValueError``). ``orientation_reason`` names these FOVs and the fit residual.
+      1000 / 0.120280945`` (s +1 or -1), fitted on the FOVs with data, which must all lie within 2 px of it.
+      ``orientation_reason`` names these FOVs and the fit residual.
+    - ``"from_export_global_px, N empty FOVs unverified (no box)"`` (``"..., 1 empty FOV ..."``): as above, but a
+      FOV with data lies more than 2 px off that relation, so the N FOVs without cells and transcripts are left out
+      of the FOV table: they get no FOV box and are placed nowhere. ``orientation_reason`` lists them with the max
+      residual.
     - ``"from_export_global_px, N FOVs unverified"`` (``"..., 1 FOV unverified"``): as above, but fewer than 2 FOVs
       have data, so the N FOVs without data cannot be placed from the fit. They keep the placement of
       ``"unverified"`` below and are not in the export's frame; ``orientation_reason`` lists them.
