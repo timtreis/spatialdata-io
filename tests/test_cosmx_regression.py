@@ -2635,9 +2635,11 @@ def _mm_only_export(
     tx_global: bool = False,
     x_sign: int = 1,
     bump: float = 0,
+    shift: float = 0,
     extra: str | None = None,
 ) -> Path:
-    """Three mm-only FOVs, plus FOV 4 with one cell (``extra="single"``) or in fov_positions only (``"empty"``)."""
+    """Three mm-only FOVs, plus FOV 4 with one cell (``extra="single"``), with all cells (``"data"``) or in
+    fov_positions only (``"empty"``). *shift* moves FOV 2's export global x by a constant (still a translation)."""
     fovs = list(_STAGE_MM)
     stage = _STAGE_MM | ({_EXTRA_FOV: _EXTRA_MM} if extra else {})
     prefix = "MMO"
@@ -2646,13 +2648,20 @@ def _mm_only_export(
     )
     _write_csv(root / f"{prefix}_fov_positions_file.csv", pos)
     meta, poly, tx = [], [], []
-    cells = dict.fromkeys(fovs, _local_cells()) | ({_EXTRA_FOV: [(1, 200.0, 300.0)]} if extra == "single" else {})
+    cells = dict.fromkeys(fovs, _local_cells()) | (
+        {_EXTRA_FOV: [(1, 200.0, 300.0)]}
+        if extra == "single"
+        else {_EXTRA_FOV: _local_cells()}
+        if extra == "data"
+        else {}
+    )
     for f, fov_cells in cells.items():
         for c, x, y in fov_cells:
             gx, gy = _export_global(f, x, y, rx, ry, x_sign)
             row = {"fov": f, "cell_ID": c, "CenterX_local_px": x, "CenterY_local_px": y}
             if meta_global:
-                row |= {"CenterX_global_px": gx + (bump if (f, c) == (2, 3) else 0.0), "CenterY_global_px": gy}
+                gx += (bump if (f, c) == (2, 3) else 0.0) + (shift if f == 2 else 0.0)
+                row |= {"CenterX_global_px": gx, "CenterY_global_px": gy}
             meta.append(row)
             poly += _make_polygon_rows(f, c, x, y, r=3.0)
             for dx in (-2.0, 2.0):
@@ -2665,8 +2674,8 @@ def _mm_only_export(
     _write_csv(root / f"{prefix}_metadata_file.csv", pd.DataFrame(meta))
     _write_csv(root / f"{prefix}-polygons.csv", pd.DataFrame(poly))
     expr = _make_expr_mat(fovs)
-    if extra == "single":
-        expr = pd.concat([expr, _make_expr_mat([_EXTRA_FOV], n_cells=1)], ignore_index=True)
+    if extra in ("single", "data"):
+        expr = pd.concat([expr, _make_expr_mat([_EXTRA_FOV], n_cells=1 if extra == "single" else N_CELLS_PER_FOV)])
     _write_csv(root / f"{prefix}_exprMat_file.csv", expr)
     _write_csv(root / f"{prefix}_tx_file.csv", pd.DataFrame(tx))
     return root
@@ -2751,26 +2760,46 @@ class TestMmOnlyOrientation:
         np.testing.assert_allclose(self._offsets(sdata, -1, 1), 0.0, atol=1e-6)
 
     @pytest.mark.parametrize(("rx", "ry"), [(-1, 1), (1, -1)])
-    def test_fov_without_data_is_unverified_and_keeps_its_old_placement(self, sdio, tmp_path, rx, ry):
-        # no fit against the stage mm (sddb-lead 02:32): the FOV keeps the placement without orientation
+    def test_fov_without_data_lands_where_the_export_frame_puts_it(self, sdio, tmp_path, rx, ry):
+        # sddb-lead ruling 03:17 (i): through the run's own mm -> export px relation, fitted on the FOVs with data
         from spatialdata import transform
 
         sdata = self._read(sdio, _mm_only_export(tmp_path / "e", rx, ry, extra="empty"), add_fovs_as_shapes=True)
         cosmx = sdata.attrs["cosmx"]
-        assert cosmx["orientation"] == "from_export_global_px, 1 FOV unverified"
-        assert "1 FOV(s) without cells or transcripts are unverified" in cosmx["orientation_reason"]
+        assert cosmx["orientation"] == "from_export_global_px"
+        assert (
+            "1 empty FOVs placed from the run's mm→px relation (max fit residual 0.00 px over 3 data FOVs"
+            in (cosmx["orientation_reason"])
+        )
         assert cosmx["orientation_reason"].endswith(f"FOV(s) [{_EXTRA_FOV}]")
         np.testing.assert_allclose(self._offsets(sdata, rx, ry), 0.0, atol=1e-6)
 
-        old = self._read(
-            sdio, _mm_only_export(tmp_path / "o", rx, ry, meta_global=False, extra="empty"), add_fovs_as_shapes=True
-        )
-        assert old.attrs["cosmx"]["orientation"] == "unverified"
-        box, old_box = (
+        full = self._read(sdio, _mm_only_export(tmp_path / "d", rx, ry, extra="data"), add_fovs_as_shapes=True)
+        assert full.attrs["cosmx"]["orientation"] == "from_export_global_px"
+        box, data_box = (
             transform(s["fov_boxes"], to_coordinate_system="global").set_index("fov").geometry[_EXTRA_FOV]
-            for s in (sdata, old)
+            for s in (sdata, full)
         )
-        assert box.equals_exact(old_box, 1e-6)
+        assert box.equals_exact(data_box, 1e-6)
+
+    def test_data_fovs_off_one_mm_relation_raise(self, sdio, tmp_path):
+        with pytest.raises(
+            ValueError, match=r"do not fit one x relation .* worst FOV \d+, residual 5\.0 px over 3 FOVs"
+        ):
+            self._read(sdio, _mm_only_export(tmp_path, -1, 1, shift=10.0, extra="empty"))
+        # without an empty FOV nothing is fitted, so the same shift reads
+        sdata = self._read(sdio, _mm_only_export(tmp_path / "n", -1, 1, shift=10.0))
+        assert sdata.attrs["cosmx"]["orientation"] == "from_export_global_px"
+
+    def test_fov_without_data_and_no_fit_is_unverified(self):
+        from spatialdata_io.readers.cosmx._orientation import _orient_mm_only
+
+        locs = pd.DataFrame({"xmin": [10.0, 5000.0], "ymin": [20.0, 20.0], "flip_y": True}, index=pd.Index([1, 2]))
+        out, notes, unverified = _orient_mm_only(locs, {1: {"x": (1, 100.0, 0.0), "y": (-1, 0.0, 900.0)}}, (50, 50))
+        assert unverified == [2]
+        assert "fewer than 2 FOVs have data" in notes[-1]
+        assert out.loc[2, ["xmin", "ymin", "flip_y"]].tolist() == [5000.0, 20.0, True]
+        assert out.loc[1, ["xmin", "ymin", "flip_y"]].tolist() == [100.0, 850.0, False]
 
     def test_not_a_translation_raises(self, sdio, tmp_path):
         with pytest.raises(ValueError, match="not a translation of the local px"):

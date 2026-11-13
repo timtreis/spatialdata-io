@@ -18,6 +18,8 @@ import pyarrow as pa
 import pyarrow.csv as pacsv
 from spatialdata._logging import logger
 
+from ._io import MM_TO_PX
+
 if TYPE_CHECKING:
     from collections.abc import Iterator
     from pathlib import Path
@@ -144,14 +146,16 @@ def _export_frame(
 def _orient_mm_only(
     fov_locs: pd.DataFrame, frame: dict[int, dict[str, tuple[int, float, float]]], fov_size: tuple[float, float]
 ) -> tuple[pd.DataFrame, list[str], list[int]]:
-    """Place each FOV with data at its export offset and sign (``xmax`` / ``ymax`` are left to the caller).
+    """Place each FOV at its export offset and sign (``xmax`` / ``ymax`` are left to the caller).
 
-    A FOV without cells or transcripts has no offset in the export; it keeps its row of *fov_locs* (the placement
-    without orientation, sign +1 on both axes against the mm positions) and is returned as unverified. Returns the FOV
-    table, notes on the FOVs that the export does not resolve by themselves, and the unverified FOVs.
+    A FOV without cells or transcripts has no offset in the export. It is placed through the run's own relation
+    ``offset = c + s * stage px`` (:func:`_fit_stage_relation`), fitted on the FOVs with data, and takes the run's
+    local px signs. With fewer than 2 FOVs with data no fit is possible: such a FOV keeps its row of *fov_locs* (the
+    placement without orientation) and is returned as unverified. Returns the FOV table, notes on the FOVs that the
+    export does not resolve by themselves, and the unverified FOVs.
     """
     notes = []
-    unverified = sorted(int(f) for f in fov_locs.index if int(f) not in frame)
+    empty = sorted(int(f) for f in fov_locs.index if int(f) not in frame)
     placed = [int(f) for f in fov_locs.index if int(f) in frame]
     sign: dict[str, dict[int, int]] = {}
     off: dict[str, dict[int, float]] = {}
@@ -174,11 +178,34 @@ def _orient_mm_only(
             f"CosMx FOV orientation: in FOV(s) {mirrored[:5]} the export's global x runs against the local x px; the "
             "reader places local x with a sign of +1 only."
         )
-    if unverified:
+    unverified: list[int] = []
+    if empty and len(placed) >= 2:
+        if len(run_y := set(sign["y"].values())) != 1:
+            raise ValueError(
+                f"CosMx FOV orientation: FOV(s) {empty[:5]} have no data, and the FOVs with data do not share one local "
+                f"y sign ({sorted(run_y)}) for them to take."
+            )
+        fits = {ax: _fit_stage_relation(fov_locs, off[ax], ax) for ax in ("x", "y")}
+        for ax, (c, b, _, _, _) in fits.items():
+            col = "xmin" if ax == "x" else "ymin"
+            off[ax].update({f: c + b * float(fov_locs.at[f, col]) for f in empty})
+            sign[ax].update(dict.fromkeys(empty, next(iter(run_y)) if ax == "y" else 1))
+        r = max(fit[2] for fit in fits.values())
+        notes.append(
+            f"{len(empty)} empty FOVs placed from the run's mm→px relation (max fit residual {r:.2f} px over "
+            f"{len(placed)} data FOVs; offset = c + s * {MM_TO_PX:.4f} * mm with "
+            + ", ".join(
+                f"{ax}: s {b:+d}, least-squares slope / (s * k) {k:.6f}" for ax, (_, b, _, k, _) in fits.items()
+            )
+            + f"): FOV(s) {empty}"
+        )
+        placed = placed + empty
+    elif empty:
+        unverified = empty
         notes.append(
             f"{len(unverified)} FOV(s) without cells or transcripts are unverified: the export gives no global px for "
-            f"them, so they keep the placement without orientation (sign +1 on both axes against fov_positions mm, "
-            f"not the export frame): FOV(s) {unverified}"
+            f"them and fewer than 2 FOVs have data to fit the run's mm→px relation, so they keep the placement without "
+            f"orientation (sign +1 on both axes against fov_positions mm, not the export frame): FOV(s) {unverified}"
         )
     h = fov_size[1]
     out = fov_locs.copy()
@@ -190,6 +217,37 @@ def _orient_mm_only(
         out.at[f, "flip_y"] = sign["y"][f] > 0
     out["frame"] = "export_global_px"  # tells the CellStatsDir stitcher to place with this table, not the file's
     return out, notes, unverified
+
+
+def _fit_stage_relation(
+    fov_locs: pd.DataFrame, known: dict[int, float], ax: str
+) -> tuple[float, int, float, float, int]:
+    """The run's ``offset = c + s * stage px`` on *ax*, fitted on the FOVs with data (*known*).
+
+    ``stage px`` is the fov_positions mm times ``MM_TO_PX`` (``_io.py:44``, ``_read_fov_locs``), and ``s`` is +1 or
+    -1, the sign whose ``offset - s * stage px`` half-range over the FOVs is smaller; ``c`` is the midrange. Every FOV
+    with data must lie within ``ORIENTATION_TOL_PX`` of the relation, else ``ValueError`` naming the worst FOV.
+    Returns ``(c, s, max residual, least-squares slope / (s * MM_TO_PX) as a check of s and k, worst FOV)``.
+    """
+    col = "xmin" if ax == "x" else "ymin"  # mm-only: X_mm / Y_mm * MM_TO_PX (_io.py, _read_fov_locs)
+    k = np.array(sorted(known))
+    o, st = np.array([known[f] for f in k]), fov_locs.loc[k, col].astype(float).to_numpy()
+    fit = {}
+    for b in (1, -1):
+        d = o - b * st
+        c = (d.max() + d.min()) / 2
+        fit[b] = (float(c), np.abs(d - c))
+    b = min(fit, key=lambda b: fit[b][1].max())
+    c, res = fit[b]
+    worst = int(k[res.argmax()])
+    if res.max() > ORIENTATION_TOL_PX:
+        raise ValueError(
+            f"CosMx FOV orientation: the FOVs with data do not fit one {ax} relation offset = c +- stage px "
+            f"(fov_positions mm * {MM_TO_PX:.4f}) within {ORIENTATION_TOL_PX} px, so the FOVs without data cannot be "
+            f"placed from it; worst FOV {worst}, residual {res.max():.1f} px over {len(k)} FOVs."
+        )
+    slope = float(np.polyfit(st, o, 1)[0]) / b if np.ptp(st) > 0 else float("nan")
+    return c, b, float(res.max()), slope, worst
 
 
 def _orient_fov_locs(

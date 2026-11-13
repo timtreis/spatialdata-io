@@ -1931,10 +1931,13 @@ def cosmx(
       own global px, ``CenterX/Y_global_px - CenterX/Y_local_px`` in the metadata, else ``x/y_global_px -
       x/y_local_px`` in the transcripts, which must be a translation with a sign of +1 or -1 within 2 px in every FOV
       (else ``ValueError``). Every element is then in the export's global px frame. A FOV with one distinct local
-      px on an axis takes the run's sign there, if the other FOVs share one (else ``ValueError``).
-    - ``"from_export_global_px, N FOVs unverified"`` (``"..., 1 FOV unverified"``): as above, but N FOVs have no
-      cells and no transcripts, so the export gives no global px for them. They keep the placement of ``"unverified"`` below and are not in the
-      export's frame; ``orientation_reason`` lists them.
+      px on an axis takes the run's sign there, if the other FOVs share one (else ``ValueError``). A FOV with no
+      cells and no transcripts has no global px of its own; it is placed through the run's ``offset = c + s * mm *
+      1000 / 0.120280945`` (s +1 or -1), fitted on the FOVs with data, which must all lie within 2 px of it (else
+      ``ValueError``). ``orientation_reason`` names these FOVs and the fit residual.
+    - ``"from_export_global_px, N FOVs unverified"`` (``"..., 1 FOV unverified"``): as above, but fewer than 2 FOVs
+      have data, so the N FOVs without data cannot be placed from the fit. They keep the placement of
+      ``"unverified"`` below and are not in the export's frame; ``orientation_reason`` lists them.
     - ``"unverified"``: the file gives mm only and neither file has global px; local px are placed with sign +1 on
       both axes against the mm positions, which nothing in the export confirms.
 
