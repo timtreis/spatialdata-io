@@ -704,6 +704,7 @@ def stitch_segmentation_label_image(
     n_workers: int | None = None,
     fovs: set[int] | None = None,
     fov_size: tuple[float, float] | None = None,
+    fov_locs: pd.DataFrame | None = None,
 ) -> tuple[da.Array, pd.DataFrame]:
     """Stitch per-FOV label TIFFs from a CellStatsDir layout.
 
@@ -733,6 +734,9 @@ def stitch_segmentation_label_image(
         Optional set of FOV IDs to include. If ``None``, all FOVs are used.
     fov_size
         The run's FOV ``(width, height)`` in px, see :func:`_snap_fov_grid`.
+    fov_locs
+        The FOV table to place with (the reader's, which may be oriented from the export's global px); by default
+        read from *fov_position_file*.
 
     Returns
     -------
@@ -745,7 +749,8 @@ def stitch_segmentation_label_image(
 
     path = Path(path)
     dataset_id = _infer_dataset_id(path, dataset_id)
-    fov_locs = _read_fov_locs(Path(fov_position_file), fov_size=fov_size)
+    if fov_locs is None:
+        fov_locs = _read_fov_locs(Path(fov_position_file), fov_size=fov_size)
 
     df = pd.read_csv(cell_info_file)
     if fovs is not None:

@@ -76,6 +76,7 @@ from ._io import (
     _set_fov_extent,
     place_local_in_fov_grid,
 )
+from ._orientation import _orient_fov_locs
 from ._stitching import (
     _canvas_from_fov_locs_for_polygons,
     _plot_fov_preview,
@@ -862,6 +863,8 @@ class CosMxDatasetReader:
             n_workers=self.n_workers,
             fovs=self.fovs if self.fovs else None,
             fov_size=self._placement_size,
+            # an mm-only run oriented from the export's global px; others keep the file's table, as before
+            fov_locs=self.fov_locs.copy() if "frame" in self.fov_locs.columns else None,
         )
         present_ids = {int(x) for x in df["global_cell_id"].to_numpy() if x != 0}
         lbl = _parse_labels(stitched, ox, oy)
@@ -1182,7 +1185,12 @@ def _cosmx_multi(
         fovs=sorted(fov_set) if fov_set else None,
         fov_size=fov_size if fov_size_exact else None,
     )
+    orientation: dict[str, Any] = {"orientation": None, "orientation_reason": None}
     if fov_size is not None:
+        fov_locs, orientation = _orient_fov_locs(
+            fov_locs, label_ds.fov_positions_file, [label_ds, *modalities.values()], fov_size
+        )
+        _set_fov_extent(fov_locs, fov_size if fov_size_exact else None)
         _check_fov_size_use(
             fov_size_info,
             [dataset, *modalities.values()],
@@ -1292,7 +1300,7 @@ def _cosmx_multi(
                 tables[f"{UNASSIGNED_TABLE}_{mod_name}"] = mod_tables[UNASSIGNED_TABLE]
 
     logger.debug("[5/5] Assembling SpatialData object...")
-    return _assemble_sdata(images, points, labels, shapes, tables, label_ds, pixel_size_um, fov_size_info)
+    return _assemble_sdata(images, points, labels, shapes, tables, label_ds, pixel_size_um, fov_size_info, orientation)
 
 
 # ---------------------------------------------------------------------------
@@ -1585,6 +1593,7 @@ def _assemble_sdata(
     dataset: CosMxDataset,
     pixel_size_um: float | None = None,
     fov_size_info: dict[str, Any] | None = None,
+    orientation: dict[str, Any] | None = None,
 ) -> SpatialData:
     """Build and annotate the final SpatialData object."""
     # Move each image's per-channel normalization divisors from the (non-persisted) element
@@ -1610,6 +1619,7 @@ def _assemble_sdata(
     sdata.attrs["cosmx"] = {
         **_pixel_size_um(dataset, tables, pixel_size_um),
         **(fov_size_info or {"fov_size_px": None, "fov_size_source": None}),
+        **(orientation or {"orientation": None, "orientation_reason": None}),
     }
     if sdata.attrs["cosmx"]["pixel_size_um"] is not None:
         _add_microns(sdata, sdata.attrs["cosmx"]["pixel_size_um"])
@@ -1911,6 +1921,21 @@ def cosmx(
 
     With none of these, any read that places FOVs raises ``ValueError``. A table cell missing from the labels is
     kept and logged, never dropped.
+
+    How the local px of each FOV are oriented is recorded as ``orientation`` with ``orientation_reason`` in
+    ``sdata.attrs["cosmx"]`` (both ``None`` when nothing is placed):
+
+    - ``"fov_positions_px_mm"`` / ``"fov_positions_px"``: the FOV positions file gives px (and mm); FOVs are placed
+      at its px.
+    - ``"from_export_global_px"``: the file gives mm only. Each FOV's offset and per-axis sign come from the export's
+      own global px, ``CenterX/Y_global_px - CenterX/Y_local_px`` in the metadata, else ``x/y_global_px -
+      x/y_local_px`` in the transcripts, which must be a translation with a sign of +1 or -1 within 2 px in every FOV
+      (else ``ValueError``). Every element is then in the export's global px frame.
+    - ``"unverified"``: the file gives mm only and neither file has global px; local px are placed with sign +1 on
+      both axes against the mm positions, which nothing in the export confirms.
+
+    :func:`spatialdata_io.readers.cosmx.check_fov_orientation` tests an orientation from tissue continuity across
+    FOV edges.
     """
     n_workers = n_workers or 1
     path = Path(path).resolve()
@@ -1969,6 +1994,7 @@ def cosmx(
     fov_size_info: dict[str, Any] = {"fov_size_px": None, "fov_size_source": None}
     fov_size: tuple[float, float] | None = None
     fov_size_exact = True
+    orientation: dict[str, Any] = {"orientation": None, "orientation_reason": None}
 
     try:
         fov_locs = _read_fov_locs(dataset.fov_positions_file) if dataset.fov_positions_file else None
@@ -1983,6 +2009,9 @@ def cosmx(
             fov_size_info = _fov_size_px(dataset, fov_size_px)
             fov_size = cast("tuple[float, float]", tuple(fov_size_info["fov_size_px"]))
             fov_size_exact = fov_size_info["fov_size_source"] != FOV_SIZE_LOWER_BOUND
+            fov_locs, orientation = _orient_fov_locs(
+                fov_locs, cast("Path", dataset.fov_positions_file), [dataset], fov_size
+            )
             if fov_size_exact:
                 _set_fov_extent(fov_locs, fov_size)
             _check_fov_size_use(
@@ -2050,4 +2079,4 @@ def cosmx(
     if add_fovs_as_shapes:
         shapes = {**shapes, **reader.build_fov_shapes()}
 
-    return _assemble_sdata(images, points, labels, shapes, tables, dataset, pixel_size_um, fov_size_info)
+    return _assemble_sdata(images, points, labels, shapes, tables, dataset, pixel_size_um, fov_size_info, orientation)

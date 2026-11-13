@@ -529,6 +529,9 @@ class TestMicrons:
             "pixel_size_source": "unknown",
             "fov_size_px": [256, 256],
             "fov_size_source": "fov_image",
+            "orientation": "fov_positions_px",
+            "orientation_reason": "Run5642_S3_Quarter_fov_positions_file.csv gives px only; FOVs placed at its px, "
+            "local px unflipped",
         }
         assert "microns" not in sdata.coordinate_systems
         assert "FOV image 256 x 256 px" in caplog.text
@@ -539,6 +542,9 @@ class TestMicrons:
             "pixel_size_source": "argument",
             "fov_size_px": [256, 256],
             "fov_size_source": "fov_image",
+            "orientation": "fov_positions_px",
+            "orientation_reason": "Run5642_S3_Quarter_fov_positions_file.csv gives px only; FOVs placed at its px, "
+            "local px unflipped",
         }
         for _, name, element in sdata.gen_spatial_elements():
             to_px = get_transformation(element, "global").to_affine_matrix(("x", "y"), ("x", "y"))
@@ -552,6 +558,8 @@ class TestMicrons:
             "pixel_size_source": "argument",
             "fov_size_px": [TIFF_FOV_SIZE, TIFF_FOV_SIZE],
             "fov_size_source": "fov_image",
+            "orientation": "fov_positions_px",
+            "orientation_reason": "S0RNA_fov_positions_file.csv gives px only; FOVs placed at its px, local px unflipped",
         }
         assert "microns" in sdata.coordinate_systems
 
@@ -2592,3 +2600,198 @@ class TestUnassignedPerFov:
         assert un.obs_names.tolist() == ["A_1", "B_1"]
         assert un.obs["slide"].tolist() == ["A", "B"]
         assert un.uns["cosmx_unassigned"]["n_fovs"] == 2
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# mm-only FOV orientation from the export's global px, and the seam test
+# ═══════════════════════════════════════════════════════════════════════════
+
+# FOV 2 abuts FOV 1 in x and FOV 3 abuts it in y, in stage mm
+_STAGE_MM = {1: (1.0, 2.0), 2: (1.0 + FOV_SIZE / MM_TO_PX, 2.0), 3: (1.0, 2.0 + FOV_SIZE / MM_TO_PX)}
+_EXPORT_C = 50_000.0
+
+
+def _local_cells(n: int = N_CELLS_PER_FOV) -> list[tuple[int, float, float]]:
+    """Cell id and local (x, y) centre: distinct on both axes, so each FOV's sign is resolvable."""
+    s = FOV_SIZE / (n + 1)
+    return [(c, s * c, s * (n + 1 - c) + 7.0) for c in range(1, n + 1)]
+
+
+def _export_global(fov: int, x: float, y: float, rx: int, ry: int, x_sign: int = 1) -> tuple[float, float]:
+    """The export's global px for a local px: local y always runs against global y (sign -1), as in every export of
+    job 43237132; the relative signs (rx, ry) are those of report section 1 (Leuven_4: (-1, +1), GSM8554642: (+1, -1))."""
+    xm, ym = _STAGE_MM[fov]
+    return _EXPORT_C + rx * x_sign * xm * MM_TO_PX + x_sign * x, _EXPORT_C - ry * ym * MM_TO_PX - y
+
+
+def _mm_only_export(
+    root: Path, rx: int, ry: int, *, meta_global: bool = True, tx_global: bool = False, x_sign: int = 1, bump: float = 0
+) -> Path:
+    fovs = list(_STAGE_MM)
+    prefix = "MMO"
+    pos = pd.DataFrame(
+        {"Slide": 1, "FOV": fovs, "X_mm": [_STAGE_MM[f][0] for f in fovs], "Y_mm": [_STAGE_MM[f][1] for f in fovs]}
+    )
+    _write_csv(root / f"{prefix}_fov_positions_file.csv", pos)
+    meta, poly, tx = [], [], []
+    for f in fovs:
+        for c, x, y in _local_cells():
+            gx, gy = _export_global(f, x, y, rx, ry, x_sign)
+            row = {"fov": f, "cell_ID": c, "CenterX_local_px": x, "CenterY_local_px": y}
+            if meta_global:
+                row |= {"CenterX_global_px": gx + (bump if (f, c) == (2, 3) else 0.0), "CenterY_global_px": gy}
+            meta.append(row)
+            poly += _make_polygon_rows(f, c, x, y, r=3.0)
+            for dx in (-2.0, 2.0):
+                t = {"fov": f, "cell_ID": c, "x_local_px": x + dx, "y_local_px": y, "target": "Gene_0"}
+                if tx_global:
+                    t["x_global_px"], t["y_global_px"] = _export_global(f, x + dx, y, rx, ry, x_sign)
+                else:  # _read_transcripts_csv needs the columns; NaN carries no frame
+                    t["x_global_px"] = t["y_global_px"] = float("nan")
+                tx.append(t)
+    _write_csv(root / f"{prefix}_metadata_file.csv", pd.DataFrame(meta))
+    _write_csv(root / f"{prefix}-polygons.csv", pd.DataFrame(poly))
+    _write_csv(root / f"{prefix}_exprMat_file.csv", _make_expr_mat(fovs))
+    _write_csv(root / f"{prefix}_tx_file.csv", pd.DataFrame(tx))
+    return root
+
+
+class TestMmOnlyOrientation:
+    @staticmethod
+    def _read(sdio, root, **kw):
+        # the hub's read (spatialdata-db 420bf09 src/spatialdata_db/convert/cosmx.py:413-423), without images
+        hub = {"read_labels": False, "polygons_as_labels": False, "read_polygons": True}
+        return _read(sdio, root, fov_size_px=(FOV_SIZE, FOV_SIZE), **hub | kw)
+
+    @staticmethod
+    def _offsets(sdata, rx, ry, x_sign=1) -> np.ndarray:
+        """Per cell, reader global polygon centre minus the export's global px."""
+        from spatialdata import transform
+
+        shapes = transform(sdata["cells_polygons"], to_coordinate_system="global")
+        obs = sdata["cell_data"].obs.set_index("global_cell_id")
+        c = shapes.geometry.centroid
+        exp = np.array(
+            [
+                _export_global(
+                    int(obs.at[g, "fov"]), obs.at[g, "CenterX_local_px"], obs.at[g, "CenterY_local_px"], rx, ry, x_sign
+                )
+                for g in shapes.index
+            ]
+        )
+        return np.c_[c.x.to_numpy(), c.y.to_numpy()] - exp
+
+    @pytest.mark.parametrize(("rx", "ry"), [(-1, 1), (1, -1)])
+    def test_cells_land_at_the_export_global_px(self, sdio, tmp_path, rx, ry):
+        sdata = self._read(sdio, _mm_only_export(tmp_path, rx, ry))
+        assert sdata.attrs["cosmx"]["orientation"] == "from_export_global_px"
+        assert "MMO_metadata_file.csv" in sdata.attrs["cosmx"]["orientation_reason"]
+        assert sdata["cell_data"].n_obs == len(_STAGE_MM) * N_CELLS_PER_FOV
+        np.testing.assert_allclose(self._offsets(sdata, rx, ry), 0.0, atol=1e-6)
+
+    @pytest.mark.parametrize(("rx", "ry"), [(-1, 1), (1, -1)])
+    def test_without_global_px_is_unverified_and_misplaced(self, sdio, tmp_path, rx, ry):
+        # the placement before this fix (sign +1 on both axes against the mm positions): not a translation of the
+        # export's frame, so no single offset maps the cells there
+        sdata = self._read(sdio, _mm_only_export(tmp_path, rx, ry, meta_global=False))
+        assert sdata.attrs["cosmx"]["orientation"] == "unverified"
+        assert "neither the metadata" in sdata.attrs["cosmx"]["orientation_reason"]
+        d = self._offsets(sdata, rx, ry)
+        assert (d.max(axis=0) - d.min(axis=0)).max() > 100
+
+    def test_transcripts_settle_the_frame_without_metadata_global_px(self, sdio, tmp_path):
+        from spatialdata import transform
+
+        root = _mm_only_export(tmp_path, -1, 1, meta_global=False, tx_global=True)
+        sdata = self._read(sdio, root, read_transcripts=True)
+        assert sdata.attrs["cosmx"]["orientation"] == "from_export_global_px"
+        assert "MMO_tx_file.csv" in sdata.attrs["cosmx"]["orientation_reason"]
+        np.testing.assert_allclose(self._offsets(sdata, -1, 1), 0.0, atol=1e-6)
+        pts = transform(sdata["points"], to_coordinate_system="global").compute()
+        exp = np.array(
+            [
+                _export_global(f, x, y, -1, 1)
+                for f, x, y in pts[["fov", "x_local_px", "y_local_px"]].itertuples(index=False)
+            ]
+        )
+        np.testing.assert_allclose(pts[["x", "y"]].to_numpy(), exp, atol=1e-6)
+
+    def test_cells_lie_in_their_fov_boxes(self, sdio, tmp_path):
+        from spatialdata import transform
+
+        sdata = self._read(sdio, _mm_only_export(tmp_path, -1, 1), add_fovs_as_shapes=True)
+        boxes = transform(sdata["fov_boxes"], to_coordinate_system="global").set_index("fov")
+        cells = transform(sdata["cells_polygons"], to_coordinate_system="global")
+        fov = sdata["cell_data"].obs.set_index("global_cell_id").loc[cells.index, "fov"].astype(int)
+        assert all(boxes.geometry[f].contains(g) for f, g in zip(fov, cells.geometry, strict=True))
+
+    def test_not_a_translation_raises(self, sdio, tmp_path):
+        with pytest.raises(ValueError, match="not a translation of the local px"):
+            self._read(sdio, _mm_only_export(tmp_path, -1, 1, bump=10.0))
+
+    def test_global_x_against_local_x_raises(self, sdio, tmp_path):
+        with pytest.raises(ValueError, match="global x runs against the local x px"):
+            self._read(sdio, _mm_only_export(tmp_path, 1, -1, x_sign=-1))
+
+    def test_px_mm_records_its_source(self, sdio, fixture_a):
+        assert _read(sdio, fixture_a).attrs["cosmx"]["orientation"] == "fov_positions_px_mm"
+
+
+def _seam_export(root: Path, rx: int, ry: int, size: int = 512, grid: int = 4, n: int = 40_000) -> Path:
+    """grid x grid mm-only FOVs over one smooth random tissue, laid out with relative signs (rx, ry): a FOV at stage
+    origin (X0, Y0) covers [X0, X0 + size] for sign +1 and [X0 - size, X0] for -1, local x = (X - X0) / rx."""
+    from scipy.ndimage import gaussian_filter
+
+    rng = np.random.default_rng(0)
+    cell, origin = 8.0, -2.0 * size  # field[0, 0] sits at global (origin, origin)
+    field = gaussian_filter(rng.normal(size=(int((grid + 4) * size / cell),) * 2), 8)
+    field = (field - field.min()) / (field.max() - field.min())  # acceptance probability
+    stage = {1 + i + grid * j: (i * size, j * size) for i in range(grid) for j in range(grid)}
+    pos, tx = [], []
+    for f, (x0, y0) in stage.items():
+        pos.append({"Slide": 1, "FOV": f, "X_mm": x0 / MM_TO_PX, "Y_mm": y0 / MM_TO_PX})
+        lx, ly = rng.uniform(0, size, n), rng.uniform(0, size, n)
+        gx, gy = x0 + rx * lx, y0 + ry * ly
+        keep = rng.uniform(0, 1, n) < field[((gy - origin) / cell).astype(int), ((gx - origin) / cell).astype(int)]
+        tx.append(pd.DataFrame({"fov": f, "cell_ID": 0, "x_local_px": lx[keep], "y_local_px": ly[keep], "target": "g"}))
+    _write_csv(root / "SEAM_fov_positions_file.csv", pd.DataFrame(pos))
+    _write_csv(root / "SEAM_tx_file.csv", pd.concat(tx))
+    _write_csv(root / "SEAM_exprMat_file.csv", _make_expr_mat(list(stage)))
+    return root
+
+
+class TestCheckFovOrientation:
+    @pytest.mark.parametrize(("rx", "ry"), [(-1, 1), (1, -1)])
+    def test_right_orientation_scores_clearly_higher(self, tmp_path, rx, ry):
+        from spatialdata_io.readers.cosmx import check_fov_orientation
+
+        res = check_fov_orientation(_seam_export(tmp_path, rx, ry), fov_size_px=(512, 512))
+        assert res["winner"] == {"x": rx, "y": ry}
+        for ax, s in (("x", rx), ("y", ry)):
+            right, wrong = res[ax][f"{s:+d}"], res[ax][f"{-s:+d}"]
+            assert right["n_pairs"] > 0 and wrong["n_pairs"] > 0
+            assert right["median_r"] - wrong["median_r"] > 0.3, res
+
+
+def test_cellstats_stitcher_places_with_the_given_fov_table(tmp_path):
+    """An mm-only run oriented from the export's global px hands its FOV table to the CellStatsDir stitcher."""
+    from spatialdata_io.readers.cosmx._io import _read_fov_locs
+    from spatialdata_io.readers.cosmx._stitching import stitch_segmentation_label_image
+
+    pos = tmp_path / "S0_fov_positions_file.csv"
+    _write_csv(pos, pd.DataFrame({"FOV": [1], "X_mm": [1.0], "Y_mm": [2.0]}))
+    cs = tmp_path / "CellStatsDir"
+    _write_csv(
+        cs / "S0_cell_info.csv", pd.DataFrame({"fov": [1] * N_CELLS_PER_FOV, "cellID": range(1, N_CELLS_PER_FOV + 1)})
+    )
+    _write_cell_label_tiff(cs / "FOV001" / "CellLabels_F001.tif", fov_size=FOV_SIZE)
+    kw = {
+        "path": tmp_path,
+        "fov_position_file": str(pos),
+        "cell_info_file": str(cs / "S0_cell_info.csv"),
+        "dataset_id": "S0",
+    }
+    file_table, _ = stitch_segmentation_label_image(**kw)
+    oriented = _read_fov_locs(pos, fov_size=(FOV_SIZE, FOV_SIZE)).assign(flip_y=False, frame="export_global_px")
+    given, _ = stitch_segmentation_label_image(**kw, fov_locs=oriented)
+    np.testing.assert_array_equal(np.asarray(given), np.asarray(file_table)[::-1, :])
