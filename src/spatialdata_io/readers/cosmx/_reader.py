@@ -1930,7 +1930,11 @@ def cosmx(
     - ``"from_export_global_px"``: the file gives mm only. Each FOV's offset and per-axis sign come from the export's
       own global px, ``CenterX/Y_global_px - CenterX/Y_local_px`` in the metadata, else ``x/y_global_px -
       x/y_local_px`` in the transcripts, which must be a translation with a sign of +1 or -1 within 2 px in every FOV
-      (else ``ValueError``). Every element is then in the export's global px frame.
+      (else ``ValueError``). Every element is then in the export's global px frame. A FOV with one distinct local
+      px on an axis takes the run's sign there, if the other FOVs share one (else ``ValueError``).
+    - ``"from_export_global_px, N FOVs unverified"`` (``"..., 1 FOV unverified"``): as above, but N FOVs have no
+      cells and no transcripts, so the export gives no global px for them. They keep the placement of ``"unverified"`` below and are not in the
+      export's frame; ``orientation_reason`` lists them.
     - ``"unverified"``: the file gives mm only and neither file has global px; local px are placed with sign +1 on
       both axes against the mm positions, which nothing in the export confirms.
 

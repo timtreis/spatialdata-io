@@ -143,66 +143,53 @@ def _export_frame(
 
 def _orient_mm_only(
     fov_locs: pd.DataFrame, frame: dict[int, dict[str, tuple[int, float, float]]], fov_size: tuple[float, float]
-) -> tuple[pd.DataFrame, list[str]]:
-    """Place each FOV at its export offset and sign (``xmax`` / ``ymax`` are left to the caller).
+) -> tuple[pd.DataFrame, list[str], list[int]]:
+    """Place each FOV with data at its export offset and sign (``xmax`` / ``ymax`` are left to the caller).
 
-    Returns the FOV table and notes on the FOVs that the export does not resolve by themselves.
+    A FOV without cells or transcripts has no offset in the export; it keeps its row of *fov_locs* (the placement
+    without orientation, sign +1 on both axes against the mm positions) and is returned as unverified. Returns the FOV
+    table, notes on the FOVs that the export does not resolve by themselves, and the unverified FOVs.
     """
     notes = []
+    unverified = sorted(int(f) for f in fov_locs.index if int(f) not in frame)
+    placed = [int(f) for f in fov_locs.index if int(f) in frame]
     sign: dict[str, dict[int, int]] = {}
     off: dict[str, dict[int, float]] = {}
     for ax in ("x", "y"):
-        resolved = {f: a[ax][0] for f, a in frame.items() if a[ax][0] != 0}
+        resolved = {f: frame[f][ax][0] for f in placed if frame[f][ax][0] != 0}
         run = set(resolved.values())
-        open_fovs = sorted(f for f in fov_locs.index if int(f) not in resolved)
-        if open_fovs and len(run) != 1:
-            raise ValueError(
-                f"CosMx FOV orientation: FOV(s) {open_fovs[:5]} have no {ax} sign of their own (one distinct local px "
-                f"or no cells/transcripts) and the other FOVs do not share one sign ({sorted(run)})."
-            )
-        s_run = next(iter(run)) if run else 0
-        sign[ax] = {int(f): resolved.get(int(f), s_run) for f in fov_locs.index}
-        off[ax] = {f: a[ax][1] if sign[ax][f] > 0 else a[ax][2] for f, a in frame.items() if f in sign[ax]}
-        if one := [f for f in open_fovs if int(f) in frame]:
-            notes.append(f"{len(one)} FOV(s) with one distinct local {ax} px take the run's {ax} sign {s_run:+d}")
-        if none := [int(f) for f in open_fovs if int(f) not in frame]:
-            off[ax].update(_fit_offsets(fov_locs, off[ax], none, ax))
+        if one := [f for f in placed if f not in resolved]:
+            if len(run) != 1:
+                raise ValueError(
+                    f"CosMx FOV orientation: FOV(s) {one[:5]} have one distinct local {ax} px, so no {ax} sign of "
+                    f"their own, and the other FOVs do not share one sign ({sorted(run)})."
+                )
             notes.append(
-                f"{len(none)} FOV(s) without cells or transcripts are placed in {ax} from the fit of the other FOVs' "
-                "offsets against fov_positions"
+                f"{len(one)} FOV(s) with one distinct local {ax} px take the run's {ax} sign {next(iter(run)):+d}"
             )
+        sign[ax] = {f: resolved.get(f) or next(iter(run)) for f in placed}
+        off[ax] = {f: frame[f][ax][1] if sign[ax][f] > 0 else frame[f][ax][2] for f in placed}
     if mirrored := sorted(f for f, s in sign["x"].items() if s < 0):
         raise ValueError(
             f"CosMx FOV orientation: in FOV(s) {mirrored[:5]} the export's global x runs against the local x px; the "
             "reader places local x with a sign of +1 only."
         )
+    if unverified:
+        notes.append(
+            f"{len(unverified)} FOV(s) without cells or transcripts are unverified: the export gives no global px for "
+            f"them, so they keep the placement without orientation (sign +1 on both axes against fov_positions mm, "
+            f"not the export frame): FOV(s) {unverified}"
+        )
     h = fov_size[1]
     out = fov_locs.copy()
-    out["xmin"] = [off["x"][int(f)] for f in out.index]
-    # the px+mm placement (_io.py, flip_y=False): y = ymin + (height - y_local), so ymin = offset - height
-    out["ymin"] = [off["y"][int(f)] - (0.0 if sign["y"][int(f)] > 0 else float(h)) for f in out.index]
-    out["flip_y"] = [sign["y"][int(f)] > 0 for f in out.index]
+    out["flip_y"] = out["flip_y"].astype(bool)  # unverified rows keep _read_fov_locs' value
+    for f in placed:
+        out.at[f, "xmin"] = off["x"][f]
+        # the px+mm placement (_io.py, flip_y=False): y = ymin + (height - y_local), so ymin = offset - height
+        out.at[f, "ymin"] = off["y"][f] - (0.0 if sign["y"][f] > 0 else float(h))
+        out.at[f, "flip_y"] = sign["y"][f] > 0
     out["frame"] = "export_global_px"  # tells the CellStatsDir stitcher to place with this table, not the file's
-    return out, notes
-
-
-def _fit_offsets(fov_locs: pd.DataFrame, known: dict[int, float], todo: list[int], ax: str) -> dict[int, float]:
-    """Offsets of FOVs without data: ``a + b * stage px`` with ``b`` +1 or -1, fit on the FOVs with data."""
-    col = "xmin" if ax == "x" else "ymin"  # mm-only: X_mm / Y_mm * MM_TO_PX (_io.py, _read_fov_locs)
-    stage = fov_locs[col].astype(float)
-    k = np.array(sorted(known))
-    if len(k) < 2:
-        raise ValueError(f"CosMx FOV orientation: FOV(s) {todo[:5]} have no data and fewer than 2 FOVs fit their {ax}.")
-    o, s = np.array([known[f] for f in k]), stage.loc[k].to_numpy()
-    fits = {b: np.median(o - b * s) for b in (1, -1)}
-    b = min(fits, key=lambda b: np.abs(o - b * s - fits[b]).max())
-    resid = float(np.abs(o - b * s - fits[b]).max())
-    if resid > ORIENTATION_TOL_PX:
-        raise ValueError(
-            f"CosMx FOV orientation: FOV(s) {todo[:5]} have no data, and the other FOVs' {ax} offsets are not "
-            f"fov_positions +- a constant (residual {resid:.1f} px > {ORIENTATION_TOL_PX} px)."
-        )
-    return {f: float(fits[b] + b * stage.loc[f]) for f in todo}
+    return out, notes, unverified
 
 
 def _orient_fov_locs(
@@ -235,16 +222,21 @@ def _orient_fov_locs(
     if fov_size is None:
         raise ValueError("CosMx FOV orientation: placing mm-only FOVs from the export's global px needs the FOV size.")
     frame, used = found
-    out, notes = _orient_mm_only(fov_locs, frame, fov_size)
-    signs = sorted({(1, 1 if f else -1) for f in out["flip_y"]})
+    out, notes, unverified = _orient_mm_only(fov_locs, frame, fov_size)
+    signs = sorted({(1, 1 if out.at[f, "flip_y"] else -1) for f in out.index if int(f) not in unverified})
     reason = (
         f"{positions_file.name} gives mm only; per-FOV offsets and local px signs (x, y) {signs} from "
         f"{'; then '.join(used)}"
     )
     if notes:
         reason += "; " + "; ".join(notes)
-    logger.info("CosMx FOV orientation: %s.", reason)
-    return out, {"orientation": "from_export_global_px", "orientation_reason": reason}
+    value = "from_export_global_px"
+    if unverified:
+        value += f", {len(unverified)} FOV{'s' if len(unverified) > 1 else ''} unverified"
+        logger.warning("CosMx FOV orientation %s: %s.", value, reason)
+    else:
+        logger.info("CosMx FOV orientation: %s.", reason)
+    return out, {"orientation": value, "orientation_reason": reason}
 
 
 # ---------------------------------------------------------------------------
