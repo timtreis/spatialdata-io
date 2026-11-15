@@ -36,10 +36,14 @@ SUPPORTED_BACKENDS = ["dask_image", "rioxarray"]
 LEGACY_BOUNDARIES_DIR = "cell_boundaries"
 
 
-def _get_channel_names(images_dir: Path) -> list[str]:
+def _get_channel_names(images_dir: Path, z_layer: int | None = None) -> list[str]:
+    """Stains with a ``mosaic_<stain>_z<k>.tif`` in ``images_dir``; with ``z_layer``, only those of that plane.
+
+    A run can image a stain on some planes only, so each plane is read with its own stains.
+    """
     exp = r"mosaic_(?P<stain>[\w|-]+[0-9]?)_z(?P<z>[0-9]+).tif"
     matches = [re.search(exp, file.name) for file in images_dir.iterdir()]
-    stainings = {match.group("stain") for match in matches if match}
+    stainings = {m.group("stain") for m in matches if m and (z_layer is None or int(m.group("z")) == z_layer)}
     # sort for a deterministic channel order: set iteration depends on PYTHONHASHSEED, which would
     # otherwise make the image channel axis (and its `c_coords`) order change between runs.
     return sorted(stainings)
@@ -156,7 +160,8 @@ def merscope(
             - ``{ms.VPT_NAME_BOUNDARIES!r}``
     z_layers
         Indices of the z-layers to consider. Either one `int` index, or a list of `int` indices. If `None`, then no image is loaded.
-        By default, only the middle layer is considered (that is, layer 3).
+        By default, only the middle layer is considered (that is, layer 3). Each layer is read with the stains
+        that have a mosaic on it, so layers can differ in channels; a layer without any mosaic is skipped.
     region_name
         Name of the region of interest, e.g., `'region_0'`. If `None` then the name of the `path` directory is used.
     slide_name
@@ -229,16 +234,18 @@ def merscope(
         else:
             z_layers = [z_layers] if isinstance(z_layers, int) else z_layers or []
             reader = _get_reader(backend)
-            stainings = _get_channel_names(images_dir)
-            if stainings:
-                for z_layer in z_layers:
-                    images[f"{dataset_id}_z{z_layer}"] = reader(
-                        images_dir,
-                        stainings,
-                        z_layer,
-                        image_models_kwargs,
-                        **imread_kwargs,
-                    )
+            for z_layer in z_layers:
+                stainings = _get_channel_names(images_dir, z_layer)
+                if not stainings:
+                    logger.warning(f"No mosaic for z-layer {z_layer} in {images_dir}; that layer is not loaded.")
+                    continue
+                images[f"{dataset_id}_z{z_layer}"] = reader(
+                    images_dir,
+                    stainings,
+                    z_layer,
+                    image_models_kwargs,
+                    **imread_kwargs,
+                )
 
     # Transcripts
     points = {}
