@@ -56,7 +56,9 @@ def mibi(
         have the image's shape. ``{fov}`` in a path is replaced by each FOV's folder name; a mapping from FOV folder
         name to path instead gives each FOV its own mask file, for names that ``{fov}`` can't express (e.g.
         ``Point2311_labels.tiff`` for the FOV ``Point2311_pt1053_20698``). A mask file that stacks several masks
-        (HuBMAP SPRM's ``mask.ome.tiff``) gives the plane whose OME channel is named like the mask, e.g. ``cells``.
+        (HuBMAP SPRM's ``mask.ome.tiff``) must have a plane whose OME channel is named like the mask, e.g.
+        ``cells``, stored as ``<fov>_<name>_labels``; every other plane is stored too, as ``<fov>_<plane>_labels``
+        with ``<plane>`` its OME channel name.
     channel_folder
         Subfolder of each FOV folder that holds the channel files, e.g. ``"TIFs"`` for ``<fov>/TIFs/CD45.tif``
         (Risom et al. 2022), where ``<fov>`` itself also holds compartment masks. The FOV is named after ``<fov>``.
@@ -166,21 +168,32 @@ def _read_fov(
             **image_models_kwargs,
         )
     }
-    label_elements = {}
+    label_elements: dict[str, Any] = {}
+    stored: dict[tuple[Path, int], str] = {}  # (mask file, plane) -> element: a stack named twice is stored once
     for name, mask_path in labels.items():
         mask, _, _ = read_tiff(mask_path, chunks)
-        if mask.shape[0] > 1:  # a stack of masks (HuBMAP SPRM): take the plane whose OME channel is named ``name``
-            mask_names = [n.lower() for n in _ome_channel_names(mask_path) or []]
-            if name.lower() not in mask_names:
+        if mask.shape[0] > 1:  # a stack of masks (HuBMAP SPRM): ``name`` must be one plane; every plane is kept
+            deposited = _ome_channel_names(mask_path) or []
+            mask_names = [n.lower() for n in deposited]
+            if name.lower() not in mask_names or len(deposited) != mask.shape[0]:
                 raise ValueError(
                     f"Mask {mask_path} stacks {mask.shape[0]} planes; none is named {name!r}: {mask_names}."
                 )
-            mask = mask[mask_names.index(name.lower()) : mask_names.index(name.lower()) + 1]
-        if mask.shape[0] != 1 or mask.shape[1:] != planes[0].shape:
-            raise ValueError(f"Mask {mask_path} has shape {mask.shape}; expected one plane of {planes[0].shape}.")
-        label_elements[f"{fov}_{sanitize_name(name)}_labels"] = Labels2DModel.parse(
-            mask[0], dims=("y", "x"), transformations=transformations, **labels_models_kwargs
-        )
+            plane_names = [name if n.lower() == name.lower() else n for n in deposited]
+        else:
+            plane_names = [name]
+        if mask.shape[1:] != planes[0].shape:
+            raise ValueError(f"Mask {mask_path} has shape {mask.shape}; expected planes of {planes[0].shape}.")
+        for i, plane_name in enumerate(plane_names):
+            if (Path(mask_path).resolve(), i) in stored:
+                continue
+            key = f"{fov}_{sanitize_name(plane_name)}_labels"
+            if key in label_elements:
+                raise ValueError(f"Two masks of {fov} are both stored as {key}; rename one in `labels`.")
+            stored[Path(mask_path).resolve(), i] = key
+            label_elements[key] = Labels2DModel.parse(
+                mask[i], dims=("y", "x"), transformations=transformations, **labels_models_kwargs
+            )
     return images, label_elements
 
 
