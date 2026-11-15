@@ -237,7 +237,7 @@ def _read_roi(
     image_models_kwargs: Mapping[str, Any],
     labels_models_kwargs: Mapping[str, Any],
 ) -> tuple[dict[str, Any], dict[str, Any], list[int] | None, list[str] | None]:
-    """The image and label elements of one ROI, and the panel's ``keep`` value and metal of each channel if it has them."""
+    """The image and label elements of one ROI, and the panel's ``keep`` value and metal of each channel, if any."""
     names: list[str] | None
     keep = metals = None
     if ".zarr" in path.suffixes:
