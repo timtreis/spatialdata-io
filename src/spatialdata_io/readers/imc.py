@@ -52,7 +52,9 @@ def imc(
           ``name`` column of ``panel`` (steinbock ``panel.csv``), else ``ch0``, ``ch1``, ... steinbock writes every
           panel channel to ``img/``, whatever ``keep`` says, so every channel is read; ``sdata.attrs["imc"]``
           records each image's ``keep`` column under ``"panel_keep"`` (one value per channel). A TIFF with only the
-          ``keep`` 1 channels is named by those rows.
+          ``keep`` 1 channels is named by those rows. The metal tag of each channel goes under ``"panel_metal"``,
+          from a ``metal`` / ``MetalTag`` / ``metal_tag`` column, or from ``channel`` when every value there is a
+          metal isotope (``Pr141``, ``132Xe``).
 
     The image is stored as ``<roi>_image``, ``<roi>`` being the file name without its image extension (``.ome.tiff``,
     ``.zarr.zip``, ...), made a valid element name by :func:`spatialdata.sanitize_name`. IMC ablates 1 µm per pixel,
@@ -92,9 +94,10 @@ def imc(
     images: dict[str, Any] = {}
     label_elements: dict[str, Any] = {}
     panel_keep: dict[str, list[int]] = {}
+    panel_metal: dict[str, list[str]] = {}
     for i, roi_path in enumerate(paths):
         cs = "global" if len(paths) == 1 else _roi_name(roi_path)
-        im, lab, keep = _read_roi(
+        im, lab, keep, metals = _read_roi(
             roi_path,
             panel,
             {name: m[i] for name, m in roi_labels.items()},
@@ -108,6 +111,8 @@ def imc(
         label_elements |= lab
         if keep is not None:
             panel_keep |= dict.fromkeys(im, keep)
+        if metals is not None:
+            panel_metal |= dict.fromkeys(im, metals)
 
     sdata = SpatialData(images=images, labels=label_elements)
     sdata.attrs["imc"] = {
@@ -117,6 +122,8 @@ def imc(
     }
     if panel_keep:
         sdata.attrs["imc"]["panel_keep"] = panel_keep
+    if panel_metal:
+        sdata.attrs["imc"]["panel_metal"] = panel_metal
     for table in sdata.tables.values():
         _set_observation_unit(table, "cell", None)
     return _set_reader_metadata(sdata, "imc")
@@ -136,7 +143,8 @@ def imc_mcd(
     ``"global"`` (with the stage y axis negated where it points up, so the images keep their orientation); any other
     gets its own coordinate system in µm, named after the image. Acquisitions that cannot be
     read (e.g. aborted ones) are skipped with a warning. ``sdata.attrs["imc"]`` lists each acquisition's id,
-    description, pixel size and placement.
+    description, pixel size and placement, and each channel's antibody label and metal (``channel_labels``,
+    ``channel_metals``, in image order).
 
     Parameters
     ----------
@@ -190,6 +198,9 @@ def imc_mcd(
                         "description": acq.description,
                         "pixel_size_um": acq.pixel_size_x_um,
                         "coordinate_system": cs,
+                        # both, per channel in image order: the channel name keeps only one of them
+                        "channel_labels": [str(label or "") for label in acq.channel_labels],
+                        "channel_metals": [str(metal) for metal in acq.channel_names],
                     }
                 )
     if not images:
@@ -225,16 +236,16 @@ def _read_roi(
     transformations: dict[str, Any],
     image_models_kwargs: Mapping[str, Any],
     labels_models_kwargs: Mapping[str, Any],
-) -> tuple[dict[str, Any], dict[str, Any], list[int] | None]:
-    """The image and label elements of one ROI, and the panel's ``keep`` value of each channel if it has one."""
+) -> tuple[dict[str, Any], dict[str, Any], list[int] | None, list[str] | None]:
+    """The image and label elements of one ROI, and the panel's ``keep`` value and metal of each channel if it has them."""
     names: list[str] | None
-    keep = None
+    keep = metals = None
     if ".zarr" in path.suffixes:
         image, names = _read_ngff(path)
     else:
         image, names = _read_tiff(path)
         if names is None and panel is not None:
-            names, keep = _panel_names(Path(panel), image.shape[0])
+            names, keep, metals = _panel_names(Path(panel), image.shape[0])
         elif names is None:
             names = [f"ch{i}" for i in range(image.shape[0])]
     if len(names) != image.shape[0]:
@@ -262,7 +273,7 @@ def _read_roi(
             transformations=transformations,
             **_fit_scale_factors(labels_models_kwargs, mask.shape),
         )
-    return images, label_elements, keep
+    return images, label_elements, keep, metals
 
 
 def _read_tiff(path: Path) -> tuple[da.Array, list[str] | None]:
@@ -302,15 +313,32 @@ def _roi_name(path: Path) -> str:
     return sanitize_name(_ROI_SUFFIX.sub("", path.name))
 
 
-def _panel_names(panel: Path, n_channels: int) -> tuple[list[str], list[int] | None]:
-    """The channel names of a steinbock ``panel.csv`` and its ``keep`` values (`None` without that column).
+def _panel_names(panel: Path, n_channels: int) -> tuple[list[str], list[int] | None, list[str] | None]:
+    """The channel names of a steinbock ``panel.csv``, its ``keep`` values and each channel's metal tag.
 
     steinbock's ``preprocess imc images`` writes every panel channel, so all rows name the channels. Only a TIFF with
-    as many channels as ``keep`` 1 rows, and not as many as rows, is named by the ``keep`` 1 rows.
+    as many channels as ``keep`` 1 rows, and not as many as rows, is named by the ``keep`` 1 rows. ``keep`` and the
+    metals are `None` when the panel has no such column (:func:`_panel_metal_column`).
     """
     df = pd.read_csv(panel)
     if "keep" in df.columns and len(df) != n_channels and int(df["keep"].astype(bool).sum()) == n_channels:
         logger.info(f"{panel.name}: the image has only the {n_channels} channels with keep 1; naming them by those.")
         df = df[df["keep"].astype(bool)]
     keep = df["keep"].astype(int).tolist() if "keep" in df.columns else None
-    return [str(n) for n in df["name"]], keep
+    metal = _panel_metal_column(df)
+    metals = [str(m) for m in df[metal]] if metal is not None else None
+    return [str(n) for n in df["name"]], keep, metals
+
+
+_METAL_COLUMNS = ("metal", "metaltag", "metal_tag")
+_ISOTOPE = re.compile(r"^(?:[A-Z][a-z]?\d{2,3}|\d{2,3}[A-Z][a-z]?)(?:Di)?$")
+
+
+def _panel_metal_column(df: pd.DataFrame) -> str | None:
+    """The panel column holding the metal tags: one named for it, else ``channel`` when every value is an isotope."""
+    named = [c for c in df.columns if str(c).lower() in _METAL_COLUMNS]
+    if named:
+        return str(named[0])
+    if "channel" in df.columns and len(df) and all(_ISOTOPE.match(str(v).strip()) for v in df["channel"]):
+        return "channel"
+    return None
