@@ -61,7 +61,7 @@ def test_rejects_mismatched_channels_and_masks(tmp_path: Path) -> None:
 
     (fov / "CD3.tiff").unlink()
     tifffile.imwrite(tmp_path / "mask.tiff", np.zeros((32, 48), dtype=np.uint16))
-    with pytest.raises(ValueError, match="expected one plane"):
+    with pytest.raises(ValueError, match=r"has shape \(1, 32, 48\); expected planes of \(64, 48\)"):
         mibi(fov, labels={"whole_cell": tmp_path / "mask.tiff"})
     with pytest.raises(ValueError, match="No channel"):
         (tmp_path / "empty").mkdir()
