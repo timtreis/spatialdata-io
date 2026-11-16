@@ -46,6 +46,7 @@ def test_steinbock_tiff_with_panel_and_mask_round_trips(tmp_path: Path) -> None:
     np.testing.assert_array_equal(sdata.labels["Batch1_001_cells_labels"]["scale0"]["image"].values, mask)
     assert sdata.attrs["imc"]["pixel_size_um"] == 1.0
     assert sdata.attrs["imc"]["panel_keep"] == {"Batch1_001_image": [1, 1, 1]}  # a TIFF of the keep 1 channels
+    assert sdata.attrs["imc"]["panel_metal"] == {"Batch1_001_image": ["Pr141", "Nd142", "Nd143"]}  # steinbock channel
     assert sdata.coordinate_systems == ["global"]
     sdata.write(tmp_path / "x.zarr")
     assert read_zarr(tmp_path / "x.zarr").attrs["spatialdata_io_reader"] == "imc"
@@ -61,6 +62,7 @@ def test_steinbock_tiff_keeps_every_panel_channel(tmp_path: Path) -> None:
     assert get_channel_names(image) == ["132Xe", "aSMA", "CD3", "MBP"]
     np.testing.assert_array_equal(image["scale0"]["image"].values, data)
     assert sdata.attrs["imc"]["panel_keep"] == {"Batch1_001_image": [0, 1, 1, 1]}
+    assert sdata.attrs["imc"]["panel_metal"] == {"Batch1_001_image": ["Xe132", "Pr141", "Nd142", "Nd143"]}
     sdata.write(tmp_path / "x.zarr")
     assert read_zarr(tmp_path / "x.zarr").attrs["imc"]["panel_keep"] == {"Batch1_001_image": [0, 1, 1, 1]}
 
@@ -188,6 +190,9 @@ def test_mcd_acquisitions_placed_on_the_slide(tmp_path: Path, monkeypatch: pytes
     np.testing.assert_allclose(t @ [0, 0, 1], [1000, -2040, 1])
     assert set(get_transformation(sdata.images["slide_1_2_image"], get_all=True)) == {"slide_1_2"}
     assert [a["coordinate_system"] for a in sdata.attrs["imc"]["acquisitions"]] == ["global", "slide_1_2"]
+    # the antibody label and the metal of every channel are both kept, in image order
+    acq = sdata.attrs["imc"]["acquisitions"][0]
+    assert acq["channel_labels"] == ["CD3", "", "CD3"] and acq["channel_metals"] == ["Nd142", "Ir191", "Er168"]
     assert list(imc_mcd(tmp_path / "x.mcd", acquisitions=[2]).images) == ["x_2_image"]
 
 
@@ -204,3 +209,20 @@ def test_small_and_odd_rois_get_the_levels_they_fit(tmp_path: Path, shape: tuple
     image, labels = back.images["roi_001_image"], back.labels["roi_001_cells_labels"]
     np.testing.assert_array_equal(np.asarray(image["scale0"].image if hasattr(image, "keys") else image), data)
     np.testing.assert_array_equal(np.asarray(labels["scale0"].image if hasattr(labels, "keys") else labels), mask[0])
+
+
+@pytest.mark.parametrize(
+    ("header", "rows", "metals"),
+    [
+        ("metal,marker,name", ["In113,H3,H3", "La139,SMA,SMA"], ["In113", "La139"]),  # METABRIC metal_to_marker
+        ("Channel,MetalTag,name", ["1,Y89,CD45", "2,In113,CD68"], ["Y89", "In113"]),
+        ("channel,name", ["132Xe,Xe", "Ir191Di,DNA1"], ["132Xe", "Ir191Di"]),
+        ("channel,name", ["1,CD45", "2,CD68"], None),  # a channel index, not a metal: no metals
+        ("name", ["CD45", "CD68"], None),
+    ],
+)
+def test_panel_metal_tags(tmp_path: Path, header: str, rows: list[str], metals: list[str] | None) -> None:
+    tifffile.imwrite(tmp_path / "roi.tiff", _DATA[:2], imagej=True)
+    (tmp_path / "panel.csv").write_text("\n".join([header, *rows]) + "\n")
+    sdata = imc(tmp_path / "roi.tiff", panel=tmp_path / "panel.csv", image_models_kwargs=_FAST)
+    assert sdata.attrs["imc"].get("panel_metal") == (None if metals is None else {"roi_image": metals})
