@@ -302,7 +302,6 @@ def test_channel_names_sorted_deterministic(tmp_path: Path) -> None:
     assert result == sorted(stains)
 
 
-
 def test_channel_names_per_z_layer(tmp_path: Path) -> None:
     images = tmp_path / "images"
     images.mkdir()
@@ -333,6 +332,7 @@ def test_planes_with_different_stains_each_keep_their_own(tmp_path: Path, backen
     assert set(sdata.images) == {"s_r_z0", "s_r_z1"}  # z2 has no mosaic: skipped, not a crash
     assert [str(c) for c in get_channel_names(sdata.images["s_r_z0"])] == ["DAPI", "PolyT"]
     assert [str(c) for c in get_channel_names(sdata.images["s_r_z1"])] == ["Cellbound1", "DAPI"]
+
 
 def test_geo_export_unnamed_id_column_and_shuffled_metadata(tmp_path: Path) -> None:
     # GEO re-exports (GSE329718, GSE202623): the id column has an empty header, ids are 39-digit
