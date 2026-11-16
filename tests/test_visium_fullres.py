@@ -57,6 +57,8 @@ def _read(root: Path) -> object:
 def test_fullres_image_containing_the_spots_is_kept(tmp_path: Path) -> None:
     sdata = _read(_space_ranger(tmp_path, (4000, 6000)))
     assert "S1_full_image" in sdata.images
+    placement = sdata.attrs["spatialdata_io_fullres_placement"]  # the check is recorded for provenance
+    assert (placement["file"], placement["inside_fraction"], placement["reason"]) == ("image.tif", 1.0, None)
 
 
 @pytest.mark.parametrize(

@@ -22,7 +22,7 @@ from xarray import DataArray
 from spatialdata_io._constants._constants import VisiumKeys
 from spatialdata_io._docs import inject_docs
 from spatialdata_io.readers._utils._features import GENE_EXPRESSION, split_by_feature_type
-from spatialdata_io.readers._utils._fullres import not_fullres_reason
+from spatialdata_io.readers._utils._fullres import FULLRES_PLACEMENT_ATTR, fullres_placement
 from spatialdata_io.readers._utils._utils import (
     _add_gene_id_and_genome,
     _read_counts,
@@ -292,6 +292,7 @@ def visium(
             tables[key].var_names_make_unique()
 
     images = {}
+    placement = None  # the placement check of the given full-resolution image, recorded in sdata.attrs
     if fullres_image_file is not None:
         fullres_image_file = path / Path(fullres_image_file)
         if fullres_image_file.exists():
@@ -299,13 +300,15 @@ def visium(
             hires_file = path / VisiumKeys.IMAGE_HIRES_FILE
             hires_scalef = scalefactors.get(VisiumKeys.SCALEFACTORS_HIRES)
             in_tissue = adata.obs["in_tissue"].to_numpy() == 1 if "in_tissue" in adata.obs else None
-            reason = not_fullres_reason(
+            placement = fullres_placement(
                 image.shape[-2:],
                 spot_coords,
                 in_tissue,
                 hires_scalef,
                 _read_png(hires_file, imread_kwargs).shape[-2:] if hires_file.exists() else None,
             )
+            placement = {"file": fullres_image_file.name, **placement}
+            reason = placement["reason"]
             if reason is not None:
                 # e.g. a deposited crop or the CytAssist capture image: not the frame the spots were measured in
                 logger.warning(
@@ -333,6 +336,8 @@ def visium(
             )
 
     sdata = SpatialData(images=images, shapes=shapes, tables=tables)
+    if placement is not None:
+        sdata.attrs[FULLRES_PLACEMENT_ATTR] = placement
     return _set_reader_metadata(sdata, "visium")
 
 

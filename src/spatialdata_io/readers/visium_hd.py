@@ -32,7 +32,7 @@ from xarray import DataArray
 from spatialdata_io._constants._constants import VisiumHDKeys
 from spatialdata_io._docs import inject_docs
 from spatialdata_io.readers._utils._features import split_by_feature_type
-from spatialdata_io.readers._utils._fullres import not_fullres_reason
+from spatialdata_io.readers._utils._fullres import FULLRES_PLACEMENT_ATTR, MIN_BINS_INSIDE_FULLRES_HD, fullres_placement
 from spatialdata_io.readers._utils._utils import _add_gene_id_and_genome, _set_observation_unit, _set_reader_metadata
 
 if TYPE_CHECKING:
@@ -516,7 +516,11 @@ def visium_hd(
             stacklevel=2,
         )
 
-    _drop_fullres_in_another_frame(images, dataset_id, fullres_spots, scalefactors.get(VisiumHDKeys.SCALEFACTORS_HIRES))
+    placement = _drop_fullres_in_another_frame(
+        images, dataset_id, fullres_spots, scalefactors.get(VisiumHDKeys.SCALEFACTORS_HIRES)
+    )
+    if placement is not None and fullres_image_file is not None:
+        placement = {"file": Path(fullres_image_file).name, **placement}
 
     # cytassist image
     cytassist_path = [path for path in all_files if VisiumHDKeys.IMAGE_CYTASSIST in str(path)]
@@ -618,6 +622,8 @@ def visium_hd(
                     sdata=sdata, table_name=table_name, rasterized_labels_name=labels_name
                 )
 
+    if placement is not None:
+        sdata.attrs[FULLRES_PLACEMENT_ATTR] = placement
     return _set_reader_metadata(sdata, "visium_hd")
 
 
@@ -644,31 +650,38 @@ def _drop_fullres_in_another_frame(
     dataset_id: str,
     spots: tuple[ArrayLike, ArrayLike] | None,
     hires_scalef: float | None,
-) -> None:
+) -> dict[str, Any] | None:
     """Skip ``<dataset_id>_full_image`` when it is not the frame the bins were measured in (as ``visium`` does).
 
     The full-resolution image is placed at identity on the bins, so a CytAssist capture, a crop or a second stain
     passed as ``fullres_image_file`` would sit misplaced under them. The check is
-    :func:`~spatialdata_io.readers._utils._fullres.not_fullres_reason` on the bin centres (in-tissue) and, when
-    loaded, the hires image and ``tissue_hires_scalef``. Without bins (``load_segmentations_only``) nothing is
-    checked.
+    :func:`~spatialdata_io.readers._utils._fullres.fullres_placement` on the in-tissue bin centres with the Visium
+    HD floor (:data:`~spatialdata_io.readers._utils._fullres.MIN_BINS_INSIDE_FULLRES_HD`) and, when loaded, the hires
+    image and ``tissue_hires_scalef``. Returns the placement record, or ``None`` when nothing was checked (no full
+    image, or no bins with ``load_segmentations_only``).
     """
     key = f"{dataset_id}_full_image"
     if key not in images or spots is None:
-        return
+        return None
     hires = images.get(f"{dataset_id}_hires_image")
     shape_yx = _image_shape_yx(images[key])
-    reason = not_fullres_reason(
-        shape_yx, spots[0], spots[1], hires_scalef, _image_shape_yx(hires) if hires is not None else None
+    placement = fullres_placement(
+        shape_yx,
+        spots[0],
+        spots[1],
+        hires_scalef,
+        _image_shape_yx(hires) if hires is not None else None,
+        min_inside=MIN_BINS_INSIDE_FULLRES_HD,
     )
-    if reason is not None:
+    if placement["reason"] is not None:
         warnings.warn(
             f"The full-resolution image ({shape_yx[1]} x {shape_yx[0]} px) is not the image the bin coordinates "
-            f"refer to ({reason}); skipping it.",
+            f"refer to ({placement['reason']}); skipping it.",
             UserWarning,
             stacklevel=2,
         )
         del images[key]
+    return placement
 
 
 def _load_image(
