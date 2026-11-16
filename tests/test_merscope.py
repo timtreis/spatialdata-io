@@ -302,6 +302,38 @@ def test_channel_names_sorted_deterministic(tmp_path: Path) -> None:
     assert result == sorted(stains)
 
 
+def test_channel_names_per_z_layer(tmp_path: Path) -> None:
+    images = tmp_path / "images"
+    images.mkdir()
+    for name in ("mosaic_PolyT_z0.tif", "mosaic_DAPI_z0.tif", "mosaic_DAPI_z1.tif", "mosaic_Cellbound1_z1.tif"):
+        (images / name).touch()
+    assert _get_channel_names(images, 0) == ["DAPI", "PolyT"]
+    assert _get_channel_names(images, 1) == ["Cellbound1", "DAPI"]
+    assert _get_channel_names(images, 2) == []
+    assert _get_channel_names(images) == ["Cellbound1", "DAPI", "PolyT"]
+
+
+@pytest.mark.parametrize("backend", ["dask_image", "rioxarray"])
+def test_planes_with_different_stains_each_keep_their_own(tmp_path: Path, backend: str) -> None:
+    # a stain imaged on some planes only: each plane is read with the stains it has, none is dropped or raises
+    import tifffile
+    from spatialdata.models import get_channel_names
+
+    if backend == "rioxarray":
+        pytest.importorskip("rioxarray")
+    region = _write_dataset(tmp_path)
+    rng = np.random.default_rng(0)
+    planes = {0: ["PolyT", "DAPI"], 1: ["DAPI", "Cellbound1"]}
+    for z, stains in planes.items():
+        for stain in stains:
+            tile = rng.integers(0, 9, (32, 40), dtype=np.uint16)
+            tifffile.imwrite(region / "images" / f"mosaic_{stain}_z{z}.tif", tile)
+    sdata = merscope(region, z_layers=[0, 1, 2], backend=backend, slide_name="s", region_name="r")
+    assert set(sdata.images) == {"s_r_z0", "s_r_z1"}  # z2 has no mosaic: skipped, not a crash
+    assert [str(c) for c in get_channel_names(sdata.images["s_r_z0"])] == ["DAPI", "PolyT"]
+    assert [str(c) for c in get_channel_names(sdata.images["s_r_z1"])] == ["Cellbound1", "DAPI"]
+
+
 def test_geo_export_unnamed_id_column_and_shuffled_metadata(tmp_path: Path) -> None:
     # GEO re-exports (GSE329718, GSE202623): the id column has an empty header, ids are 39-digit
     # EntityIDs (beyond int64), and cell_metadata lists the cells in another order than cell_by_gene.
