@@ -57,6 +57,8 @@ def _read(root: Path) -> object:
 def test_fullres_image_containing_the_spots_is_kept(tmp_path: Path) -> None:
     sdata = _read(_space_ranger(tmp_path, (4000, 6000)))
     assert "S1_full_image" in sdata.images
+    placement = sdata.attrs["spatialdata_io_fullres_placement"]  # the check is recorded for provenance
+    assert (placement["file"], placement["inside_fraction"], placement["reason"]) == ("image.tif", 1.0, None)
 
 
 @pytest.mark.parametrize(
@@ -74,7 +76,7 @@ def test_image_not_containing_the_spots_is_skipped(
         sdata = _read(_space_ranger(tmp_path, image_shape))
     assert "S1_full_image" not in sdata.images
     assert "S1" in sdata.shapes and "table" in sdata.tables
-    assert "spots fall inside it" in caplog.text
+    assert "of in-tissue spots inside (need 99%)" in caplog.text
 
 
 def test_tissue_cropped_fullres_image_is_kept(tmp_path: Path) -> None:
@@ -90,20 +92,26 @@ def test_fullres_image_matching_the_hires_downscale_is_kept(tmp_path: Path) -> N
 
 
 @pytest.mark.parametrize(
-    ("image_shape", "hires_shape"),
+    ("image_shape", "hires_shape", "reason"),
     [
-        ((8000, 8000), (400, 600)),  # contains every spot but is not the image the hires image was made from
-        ((3000, 3200), (400, 600)),  # the CytAssist capture image
+        # contains every spot but is not the image the hires image was made from
+        ((8000, 8000), (400, 600), "scaled by tissue_hires_scalef 0.1 is off from the 600 x 400 px hires image"),
+        # the CytAssist capture image: the spots are not even inside it
+        ((3000, 3200), (400, 600), "3200 x 3000 px: 0.0% of in-tissue spots inside"),
     ],
     ids=["larger", "cytassist"],
 )
 def test_fullres_image_not_matching_the_hires_downscale_is_skipped(
-    tmp_path: Path, image_shape: tuple[int, int], hires_shape: tuple[int, int], caplog: pytest.LogCaptureFixture
+    tmp_path: Path,
+    image_shape: tuple[int, int],
+    hires_shape: tuple[int, int],
+    reason: str,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     with caplog.at_level(logging.WARNING):
         sdata = _read(_space_ranger(tmp_path, image_shape, hires_shape=hires_shape))
     assert "S1_full_image" not in sdata.images
-    assert "tissue_hires_scalef" in caplog.text
+    assert reason in caplog.text
 
 
 def test_px_per_um_from_the_visium_array() -> None:
