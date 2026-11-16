@@ -22,6 +22,7 @@ from xarray import DataArray
 from spatialdata_io._constants._constants import VisiumKeys
 from spatialdata_io._docs import inject_docs
 from spatialdata_io.readers._utils._features import GENE_EXPRESSION, split_by_feature_type
+from spatialdata_io.readers._utils._fullres import not_fullres_reason
 from spatialdata_io.readers._utils._utils import (
     _add_gene_id_and_genome,
     _read_counts,
@@ -298,7 +299,7 @@ def visium(
             hires_file = path / VisiumKeys.IMAGE_HIRES_FILE
             hires_scalef = scalefactors.get(VisiumKeys.SCALEFACTORS_HIRES)
             in_tissue = adata.obs["in_tissue"].to_numpy() == 1 if "in_tissue" in adata.obs else None
-            reason = _not_fullres_reason(
+            reason = not_fullres_reason(
                 image.shape[-2:],
                 spot_coords,
                 in_tissue,
@@ -445,8 +446,6 @@ def _read_image(image_file: Path, imread_kwargs: dict[str, Any]) -> Any:
     return image
 
 
-# a full-resolution image must contain (almost) all in-tissue spots; deposited crops and CytAssist images do not
-_MIN_SPOTS_INSIDE_FULLRES = 0.99
 # Visium array (10x Space Ranger outputs docs, "Tissue positions"): array_col "uses even numbers ... for even rows, and
 # odd numbers ... for odd rows", so spots next to each other in a row are 2 columns apart, and the 10x glossary states the
 # spots are "spaced 100 µm apart": one array_col step is 50 µm. The row spacing is not used (on Space Ranger output
@@ -474,45 +473,3 @@ def _px_per_um(array_col_row: np.ndarray, spot_xy: np.ndarray) -> float:
     if px_per_col == 0:
         raise ValueError("Cannot derive the pixel size from spots that all share one array column.")
     return px_per_col / _ARRAY_COL_UM
-
-
-# Space Ranger makes the hires image by scaling the full-resolution image by tissue_hires_scalef (then rounding)
-_MAX_HIRES_SIZE_ERROR = 0.01
-
-
-def _not_fullres_reason(
-    shape_yx: tuple[int, ...],
-    spot_xy: np.ndarray,
-    in_tissue: np.ndarray | None,
-    hires_scalef: float | None,
-    hires_shape_yx: tuple[int, ...] | None,
-) -> str | None:
-    """Why an image is not the full-resolution image the spots were measured in, or ``None`` if it is.
-
-    With a hires image and its scale factor, the image must scale to the hires image's size: an image merely larger
-    than the spot array passes a containment test but not this one. Otherwise at least 99% of the in-tissue spots
-    (all spots without an ``in_tissue`` flag) must fall inside it, so an image cropped to the tissue is kept.
-    """
-    if hires_scalef is not None and hires_shape_yx is not None:
-        err = max(abs(n * hires_scalef - m) / m for n, m in zip(shape_yx, hires_shape_yx, strict=True))
-        if err > _MAX_HIRES_SIZE_ERROR:
-            return (
-                f"scaled by tissue_hires_scalef {hires_scalef:g} it is off from the "
-                f"{hires_shape_yx[-1]} x {hires_shape_yx[-2]} px hires image by {err:.1%}"
-            )
-        return None
-    xy = spot_xy if in_tissue is None or not in_tissue.any() else spot_xy[in_tissue]
-    inside = _fraction_inside(xy, shape_yx)
-    if inside < _MIN_SPOTS_INSIDE_FULLRES:
-        return f"only {inside:.1%} of the {'in-tissue ' if in_tissue is not None else ''}spots fall inside it"
-    return None
-
-
-def _fraction_inside(spot_xy: np.ndarray, shape_yx: tuple[int, ...]) -> float:
-    """Fraction of the (x, y) spot centres, ignoring missing ones, inside an image of shape ``(y, x)``."""
-    xy = np.asarray(spot_xy, dtype=float)
-    xy = xy[~np.isnan(xy).any(axis=1)]
-    if not len(xy):
-        return 1.0
-    h, w = shape_yx
-    return float(((xy[:, 0] >= 0) & (xy[:, 0] <= w) & (xy[:, 1] >= 0) & (xy[:, 1] <= h)).mean())
