@@ -770,6 +770,12 @@ def stereoseq_wrapper(
     "suffix_to). [default: None]",
 )
 @click.option(
+    "--min-barcode-match",
+    type=float,
+    default=1.0,
+    help="Share of the counts barcodes that must be in tissue_positions, else the reader raises. [default: 1.0]",
+)
+@click.option(
     "--imread-kwargs",
     type=str,
     default="{}",
@@ -793,6 +799,7 @@ def visium_wrapper(
     protein_file: str | None = None,
     controls: Literal["keep", "drop"] = "keep",
     barcode_rule: str | None = None,
+    min_barcode_match: float = 1.0,
     imread_kwargs: str = "{}",
     image_models_kwargs: str = "{}",
 ) -> None:
@@ -810,6 +817,7 @@ def visium_wrapper(
         protein_file=protein_file,
         controls=controls,
         barcode_rule=None if barcode_rule is None else _parse_json_param(barcode_rule, "barcode_rule"),
+        min_barcode_match=min_barcode_match,
         imread_kwargs=_parse_json_param(imread_kwargs, "imread_kwargs"),
         image_models_kwargs=_parse_json_param(image_models_kwargs, "image_models_kwargs"),
     )

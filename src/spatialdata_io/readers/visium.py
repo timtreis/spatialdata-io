@@ -47,6 +47,7 @@ def visium(
     protein_file: str | Path | None = None,
     controls: Literal["keep", "drop"] = "keep",
     barcode_rule: Mapping[str, str] | None = None,
+    min_barcode_match: float = 1.0,
     imread_kwargs: Mapping[str, Any] = MappingProxyType({}),
     image_models_kwargs: Mapping[str, Any] = MappingProxyType({}),
     **kwargs: Any,
@@ -111,9 +112,13 @@ def visium(
         How the counts file's barcodes map to the ``tissue_positions`` barcodes when a re-export spells them
         differently (e.g. ``Injury72h_AAACAAGTATCTCCCA.1`` for ``AAACAAGTATCTCCCA-1``). ``"strip_prefix"`` is a
         regular expression removed from the start of each barcode; ``"suffix_from"`` and ``"suffix_to"`` replace a
-        trailing suffix. The rule is never guessed. Every counts barcode must be in ``tissue_positions``, with or
-        without a rule, else this raises. With a rule, the deposited barcodes stay in ``obs["barcode_deposited"]``.
-        The rule and the match rate are recorded in each table's ``uns["visium_barcodes"]``.
+        trailing suffix. The rule is never guessed. With a rule, the deposited barcodes stay in
+        ``obs["barcode_deposited"]``. The rule, the match rate and the unmatched barcodes are recorded in each table's
+        ``uns["visium_barcodes"]``.
+    min_barcode_match
+        Share of the counts barcodes (after ``barcode_rule``) that must be in ``tissue_positions``, else this raises.
+        The default 1.0 raises on any miss. Below 1.0, every counts barcode is still kept: an unmatched one has no
+        position (NaN) and is listed in ``uns["visium_barcodes"]["unmatched"]``.
     imread_kwargs
         Keyword arguments passed to :func:`dask_image.imread.imread`.
     image_models_kwargs
@@ -215,7 +220,9 @@ def visium(
         coords = pd.read_csv(tissue_positions_file, header=0, index_col=0)
 
     assert isinstance(adata.obs, pd.DataFrame)
-    barcodes = _match_barcodes(adata, coords.index, barcode_rule, f"{counts_file} vs {tissue_positions_file.name}")
+    barcodes = _match_barcodes(
+        adata, coords.index, barcode_rule, min_barcode_match, f"{counts_file} vs {tissue_positions_file.name}"
+    )
     adata.obs = pd.merge(adata.obs, coords, how="left", left_index=True, right_index=True)
     # `coords` above is the raw `tissue_positions` table; the circles are built from the
     # spot coordinates in the order of `adata`, so keep them in a separate variable
@@ -244,7 +251,8 @@ def visium(
         scalefactors = {}
         logger.warning(f"No scale factors file in {path}: the hires/lowres images are skipped.")
     # the circles are the physical spots, placed by the array (spots 100 µm apart), never by spot_diameter_fullres
-    px_per_um = _px_per_um(adata.obs[["array_col", "array_row"]].to_numpy(float), spot_coords)
+    placed = ~np.isnan(spot_coords.astype(float)).any(axis=1)  # unmatched barcodes (min_barcode_match < 1) have none
+    px_per_um = _px_per_um(adata.obs[["array_col", "array_row"]].to_numpy(float)[placed], spot_coords[placed])
 
     transform_original = Identity()
     transforms = {
@@ -327,14 +335,17 @@ def visium(
     return _set_reader_metadata(sdata, "visium")
 
 
-# Every counts barcode needs a tissue_positions row: Space Ranger's positions list every spot of the array, so a
-# counts barcode outside it is a spelling mismatch, and its spot would get no coordinates.
-_MIN_BARCODE_MATCH = 1.0
 _BARCODE_RULE_KEYS = frozenset({"strip_prefix", "suffix_from", "suffix_to"})
 
 
-def _match_barcodes(adata: AnnData, positions: pd.Index, rule: Mapping[str, str] | None, what: str) -> dict[str, Any]:
-    """Apply the declared ``rule`` to ``adata.obs_names`` in place; raise unless every barcode is in ``positions``."""
+def _match_barcodes(
+    adata: AnnData, positions: pd.Index, rule: Mapping[str, str] | None, min_match: float, what: str
+) -> dict[str, Any]:
+    """Apply the declared ``rule`` to ``adata.obs_names`` in place; raise below ``min_match`` barcodes in ``positions``.
+
+    Space Ranger's positions list every spot of the array, so a counts barcode outside them is a spelling mismatch
+    (or a foreign barcode) and its spot has no coordinates.
+    """
     rule = dict(rule or {})
     if unknown := set(rule) - _BARCODE_RULE_KEYS:
         raise ValueError(f"Unknown barcode_rule keys {sorted(unknown)}; expected {sorted(_BARCODE_RULE_KEYS)}.")
@@ -358,14 +369,21 @@ def _match_barcodes(adata: AnnData, positions: pd.Index, rule: Mapping[str, str]
         adata.obs_names = names
     matched = adata.obs_names.isin(positions)
     rate = float(matched.mean()) if len(matched) else 1.0
-    if rate < _MIN_BARCODE_MATCH:
-        missing = adata.obs_names[~matched]
+    missing = adata.obs_names[~matched]
+    if rate < min_match:
         raise ValueError(
             f"{len(missing)} of {adata.n_obs} counts barcodes are not in tissue_positions ({what}), e.g. "
-            f"{missing[0]!r} (positions: {positions[0]!r}); their spots would have no coordinates. Declare how they "
-            "map with `barcode_rule`."
+            f"{missing[0]!r} (positions: {positions[0]!r}); match rate {rate:.4f} < min_barcode_match {min_match}. "
+            "Declare how they map with `barcode_rule`."
         )
-    return {"rule": rule, "match_rate": rate, "n_counts_barcodes": int(adata.n_obs), "n_matched": int(matched.sum())}
+    return {
+        "rule": rule,
+        "min_barcode_match": float(min_match),
+        "match_rate": rate,
+        "n_counts_barcodes": int(adata.n_obs),
+        "n_matched": int(matched.sum()),
+        "unmatched": {"n": len(missing), "barcodes": [str(b) for b in missing]},
+    }
 
 
 def _read_protein(file: Path, spots: pd.DataFrame) -> AnnData:
