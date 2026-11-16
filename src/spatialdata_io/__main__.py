@@ -763,6 +763,13 @@ def stereoseq_wrapper(
     help="Whether to keep the control features in the table. [default: keep]",
 )
 @click.option(
+    "--barcode-rule",
+    type=str,
+    default=None,
+    help="JSON object mapping the counts barcodes to the tissue_positions ones (strip_prefix, suffix_from, "
+    "suffix_to). [default: None]",
+)
+@click.option(
     "--imread-kwargs",
     type=str,
     default="{}",
@@ -785,6 +792,7 @@ def visium_wrapper(
     var_names_make_unique: bool = True,
     protein_file: str | None = None,
     controls: Literal["keep", "drop"] = "keep",
+    barcode_rule: str | None = None,
     imread_kwargs: str = "{}",
     image_models_kwargs: str = "{}",
 ) -> None:
@@ -801,6 +809,7 @@ def visium_wrapper(
         var_names_make_unique=var_names_make_unique,
         protein_file=protein_file,
         controls=controls,
+        barcode_rule=None if barcode_rule is None else _parse_json_param(barcode_rule, "barcode_rule"),
         imread_kwargs=_parse_json_param(imread_kwargs, "imread_kwargs"),
         image_models_kwargs=_parse_json_param(image_models_kwargs, "image_models_kwargs"),
     )
