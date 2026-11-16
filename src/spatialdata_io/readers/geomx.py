@@ -30,6 +30,8 @@ _SHAPES = "aois"
 _NEGATIVE = "Negative Control Probe"
 _UNANNOTATED = "Unannotated Probe"
 _PROTEIN = "Protein Expression"
+# without a PKC (or deposited CodeClass) a target is a negative control only if its name starts exactly with this
+_NEGPROBE_PREFIX = "NegProbe-"
 _DCC_SECTIONS = ("Header", "Scan_Attributes", "NGS_Processing_Attributes")
 # numeric NGS fields, as GeomxTools coerces them (readDccFile.R)
 _DCC_NUMERIC = ("Raw", "Trimmed", "Stitched", "Aligned", "umiQ30", "rtsQ30", "DeduplicatedReads")
@@ -57,6 +59,7 @@ def geomx(
     area: str | None = None,
     aoi_radius: float | None = None,
     coordinates_in_image: bool = False,
+    segment_map: Mapping[str, str] | None = None,
 ) -> SpatialData:
     """Read a *GeoMx DSP* (NanoString/Bruker) experiment: one table row per AOI (area of illumination).
 
@@ -75,7 +78,9 @@ def geomx(
         - ``table``: AOIs x targets. Probe counts are **summed** per target, so the counts stay integers and their
           total equals the probe total (GeomxTools' ``aggregateCounts`` takes the geometric mean instead).
           ``var["feature_types"]`` is ``"Negative Control Probe"`` where the PKC ``CodeClass`` contains
-          ``"Negative"`` (GeomxTools' rule), with ``var["is_control"]``. Protein kits (PKC ``AnalyteType``
+          ``"Negative"`` (GeomxTools' rule), with ``var["is_control"]``. A target that no PKC or deposited
+          ``CodeClass`` types is a negative control if its name starts with ``"NegProbe-"`` (e.g. ``NegProbe-WTX``);
+          the rule and the number of targets it typed are in ``uns["spatialdata_io"]["negprobe_rule"]``. Protein kits (PKC ``AnalyteType``
           ``"Protein"``) go to ``table_protein`` the same way.
         - ``table_probe`` (DCC or ``probe_level`` input): AOIs x probes, every ``RTS_ID`` in the PKCs or the DCCs,
           counts as deposited. A probe in no PKC is kept as ``"Unannotated Probe"``. A probe listed twice in one DCC
@@ -126,6 +131,11 @@ def geomx(
         AOI radius in coordinate units, without ``area``.
     coordinates_in_image
         Whether ``x``/``y`` are pixels of ``image``.
+    segment_map
+        Segment names of the AOIs mapped to those of the annotation, e.g. ``{"Desmin": "Cardiomyocyte"}``, for AOI
+        names in the DSP form ``<scan> | <ROI> | <segment>`` whose segment the annotation names differently. The map
+        is applied to the AOI names only to join the annotation; the AOIs keep their deposited names, their deposited
+        segment is in ``obs["segment_deposited"]`` and the map in ``uns["spatialdata_io"]["segment_map"]``.
 
     Returns
     -------
@@ -165,6 +175,17 @@ def geomx(
         obs = pd.DataFrame(index=df.columns.astype(str))
         target = ad.AnnData(X=None, obs=obs.copy(), var=_annotate_targets(fvar, pkc_var))
         meta["no_raw_counts"] = True
+    tvar = cast(pd.DataFrame, target.var)
+    if "CodeClass" not in tvar or tvar["CodeClass"].isna().any():
+        n_neg = _negprobe_rule(tvar, pd.Series(tvar.index, index=tvar.index))
+        meta["negprobe_rule"] = {
+            "prefix": _NEGPROBE_PREFIX,
+            "applies_to": "targets that no PKC or deposited CodeClass types",
+            "n_targets": n_neg,
+        }
+        if probe is not None:
+            pvar = cast(pd.DataFrame, probe.var)
+            _negprobe_rule(pvar, pvar["Target"])
     if target.X is not None:
         values = cast(sp.csr_matrix, target.X).data if sp.issparse(target.X) else np.asarray(target.X)
         meta["counts_integer"] = bool(np.all(np.mod(values, 1) == 0))
@@ -186,13 +207,22 @@ def geomx(
                 obs=pd.DataFrame(index=df.columns.astype(str)),
                 var=_annotate_targets(fvar, pkc_var),
             )
+            evar = cast(pd.DataFrame, extra.var)
+            _negprobe_rule(evar, pd.Series(evar.index, index=evar.index))
             extra.uns["spatialdata_io"] = {"values": name}
             tables[f"table_{name}"] = extra
 
     renamed: list[list[str]] = []
+    if segment_map is not None and annotation is None:
+        raise ValueError("`segment_map` needs `annotation`.")
     if annotation is not None:
         ann = _read_annotation(Path(annotation), annotation_sheet, meta)
-        obs, unmatched, join = _join_annotation(obs, ann, aoi_id)
+        keys = None
+        if segment_map is not None:
+            keys, segments = _map_segments(obs.index, segment_map)
+            obs = obs.assign(segment_deposited=np.asarray(segments, dtype=object))
+            meta["segment_map"] = {"map": dict(segment_map), "n_aois": int((keys != obs.index).sum())}
+        obs, unmatched, join = _join_annotation(obs, ann, aoi_id, keys)
         meta["annotation_join"] = join
         if len(unmatched):
             tables["table_annotation_unmatched"] = ad.AnnData(
@@ -311,6 +341,32 @@ def _types(code_class: pd.Series, analyte: pd.Series) -> pd.DataFrame:
     return pd.DataFrame(
         {FEATURE_TYPES: np.where(negative, _NEGATIVE, base), "is_control": negative}, index=code_class.index
     )
+
+
+def _negprobe_rule(var: pd.DataFrame, names: pd.Series) -> int:
+    """Type the targets that nothing typed and whose name starts with ``NegProbe-`` as negative controls, in place.
+
+    Returns how many it typed. A probe ``var`` passes its ``Target`` column as ``names``.
+    """
+    untyped = var["CodeClass"].isna() if "CodeClass" in var else pd.Series(True, index=var.index)
+    hit = (untyped & names.astype("string").str.startswith(_NEGPROBE_PREFIX).fillna(False)).to_numpy(dtype=bool)
+    var.loc[hit, FEATURE_TYPES] = _NEGATIVE
+    var.loc[hit, "is_control"] = True
+    return int(hit.sum())
+
+
+def _map_segments(names: pd.Index, segment_map: Mapping[str, str]) -> tuple[pd.Index, list[str | None]]:
+    """AOI names with their segment (after the last ``" | "``) mapped, and the deposited segments."""
+    keys, segments = [], []
+    for name in map(str, names):
+        head, sep, seg = name.rpartition(" | ")
+        segments.append(seg if sep else None)
+        keys.append(f"{head}{sep}{segment_map[seg]}" if sep and seg in segment_map else name)
+    if keys == list(map(str, names)):
+        raise ValueError(
+            f"`segment_map` keys {sorted(segment_map)[:5]} name no AOI segment (`<scan> | <ROI> | <segment>`)."
+        )
+    return pd.Index(keys), segments
 
 
 def _annotate_probes(var: pd.DataFrame, pkc: pd.DataFrame | None) -> pd.DataFrame:
@@ -490,9 +546,12 @@ def _read_annotation(path: Path, sheet: str | int, meta: dict[str, Any]) -> pd.D
 
 
 def _join_annotation(
-    obs: pd.DataFrame, ann: pd.DataFrame, aoi_id: str | None
+    obs: pd.DataFrame, ann: pd.DataFrame, aoi_id: str | None, names: pd.Index | None = None
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict[str, Any]]:
-    """``obs`` with the annotation columns, the annotation rows that match no AOI, and how they were joined."""
+    """``obs`` with the annotation columns, the annotation rows that match no AOI, and how they were joined.
+
+    ``names`` replaces the AOI names for matching (e.g. with mapped segments); ``obs`` keeps its index.
+    """
     if aoi_id is None:
         aoi_id = "Sample_ID" if "Sample_ID" in ann.columns else str(ann.columns[0])
     if "{" in aoi_id:
@@ -505,7 +564,7 @@ def _join_annotation(
     if keys.duplicated().any():
         raise ValueError(f"AOI names from {aoi_id!r} are not unique: {sorted(set(keys[keys.duplicated()]))[:5]}")
     # match the DCC stems, or else the DCC Scan_Attributes ID (e.g. GEO files named GSM..._<ID>.dcc)
-    candidates = {"name": pd.Series(obs.index, index=obs.index)}
+    candidates = {"name": pd.Series(obs.index if names is None else names, index=obs.index)}
     if "dcc_ID" in obs.columns:
         candidates["dcc_ID"] = obs["dcc_ID"].astype(str)
     by, ids = max(candidates.items(), key=lambda kv: kv[1].isin(set(keys)).sum())

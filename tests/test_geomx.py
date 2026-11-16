@@ -303,7 +303,87 @@ def test_normalised_only_dsp_export_like_figshare_30505616(tmp_path: Path) -> No
     assert list(sdata["table_no_coordinates"].obs_names) == ["x | 002 | y"]
     assert t.uns["spatialdata_io"]["n_no_coordinates"] == 1
     assert t.uns["spatialdata_io"]["radius_source"] == "stated"
+    # no PKC: the NegProbe- name rule types the negative pool
+    assert list(t.var["feature_types"]) == ["Gene Expression", "Negative Control Probe"]
+    assert t.uns["spatialdata_io"]["negprobe_rule"]["n_targets"] == 1
     sdata.write(tmp_path / "n.zarr")
+
+
+def test_negprobe_rule_without_pkc(tmp_path: Path) -> None:
+    # figshare 16818415 names its pool "NegProbe" (no dash): it stays Gene Expression
+    (tmp_path / "m.csv").write_text(
+        "TargetName,s | 001 | a,s | 002 | a\nActb,5,6\nNegProbe-WTX,1,2\nNegProbe,3,4\nxNegProbe-WTX,0,1\n"
+    )
+    t = geomx(counts=tmp_path / "m.csv")["table"]
+    assert t.var["feature_types"].tolist() == [
+        "Gene Expression",
+        "Negative Control Probe",
+        "Gene Expression",
+        "Gene Expression",
+    ]
+    assert t.var["is_control"].tolist() == [False, True, False, False]
+    assert t.n_vars == 4  # nothing dropped
+    assert dict(t.uns["spatialdata_io"]["negprobe_rule"]) == {
+        "prefix": "NegProbe-",
+        "applies_to": "targets that no PKC or deposited CodeClass types",
+        "n_targets": 1,
+    }
+
+
+def test_negprobe_rule_leaves_pkc_and_codeclass_typing_alone(tmp_path: Path) -> None:
+    # a PKC types every target: no rule, and a PKC "Endogenous" NegProbe- target stays Gene Expression
+    (tmp_path / "m.csv").write_text("TargetName,s | 001 | a\nNegProbe-X,1\nNeg,2\n")
+    pkc = _pkc(tmp_path / "k_v1.0.pkc", "k", "RNA", [("NegProbe-X", "Endogenous", ["R1"]), ("Neg", "Negative", ["R2"])])
+    t = geomx(pkc=pkc, counts=tmp_path / "m.csv")["table"]
+    assert t.var["is_control"].tolist() == [False, True]
+    assert "negprobe_rule" not in t.uns["spatialdata_io"]
+    # probe level without a CodeClass column: the rule types the target and its probes
+    (tmp_path / "p.csv").write_text("ProbeName,TargetName,s | 001 | a\n1,GAL,6\n2,NegProbe-WTX,2\n3,NegProbe-WTX,1\n")
+    sdata = geomx(counts=tmp_path / "p.csv", probe_level=True, feature_columns=["TargetName"])
+    assert sdata["table"].var["is_control"].tolist() == [False, True]
+    assert sdata["table_probe"].var["is_control"].tolist() == [False, True, True]
+    assert sdata["table"].uns["spatialdata_io"]["negprobe_rule"]["n_targets"] == 1
+
+
+def test_segment_map_like_figshare_30505616(tmp_path: Path) -> None:
+    # TargetCountMatrix names a segment "Desmin" that SegmentProperties calls "Cardiomyocyte"
+    (tmp_path / "ann.csv").write_text(
+        "SegmentDisplayName,SegmentLabel,AOINucleiCount\n"
+        "Grp3_MI-PATCH_2 | 001 | Cardiomyocyte,Cardiomyocyte,0\n"
+        "Grp3_MI-PATCH_2 | 001 | Tissue,Tissue,1\n"
+    )
+    (tmp_path / "m.csv").write_text(
+        "TargetName,Grp3_MI-PATCH_2 | 001 | Desmin,Grp3_MI-PATCH_2 | 001 | Tissue,Grp3_MI-PATCH_2 | 002 | Other\n"
+        "Actb,1,2,3\n"
+    )
+    kw = {"counts": tmp_path / "m.csv", "annotation": tmp_path / "ann.csv", "aoi_id": "SegmentDisplayName"}
+
+    plain = geomx(**kw)
+    assert len(plain["table_annotation_unmatched"]) == 1  # default: the Desmin AOI misses its row
+    assert "segment_deposited" not in plain["table"].obs and "segment_map" not in plain["table"].uns["spatialdata_io"]
+
+    sdata = geomx(**kw, segment_map={"Desmin": "Cardiomyocyte"})
+    t = sdata["table"]
+    assert "table_annotation_unmatched" not in sdata.tables
+    # the AOIs keep their deposited names; the Desmin AOI now carries the Cardiomyocyte row
+    assert list(t.obs_names) == [
+        "Grp3_MI-PATCH_2 | 001 | Desmin",
+        "Grp3_MI-PATCH_2 | 001 | Tissue",
+        "Grp3_MI-PATCH_2 | 002 | Other",
+    ]
+    assert t.obs["SegmentLabel"].tolist()[:2] == ["Cardiomyocyte", "Tissue"]
+    assert t.obs["segment_deposited"].tolist() == ["Desmin", "Tissue", "Other"]
+    smap = t.uns["spatialdata_io"]["segment_map"]
+    assert dict(smap["map"]) == {"Desmin": "Cardiomyocyte"} and smap["n_aois"] == 1
+    assert t.uns["spatialdata_io"]["annotation_join"]["n_matched"] == 2
+    sdata.write(tmp_path / "s.zarr")
+    back = read_zarr(tmp_path / "s.zarr")["table"]
+    assert back.obs["segment_deposited"].tolist() == ["Desmin", "Tissue", "Other"]
+
+    with pytest.raises(ValueError, match="name no AOI segment"):
+        geomx(**kw, segment_map={"Vimentin": "x"})
+    with pytest.raises(ValueError, match="needs `annotation`"):
+        geomx(counts=tmp_path / "m.csv", segment_map={"Desmin": "Cardiomyocyte"})
 
 
 def test_probe_level_matrix_like_mendeley_gmgcdhmmdx(tmp_path: Path) -> None:
