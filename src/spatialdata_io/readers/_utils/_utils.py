@@ -159,8 +159,9 @@ def _add_gene_id_and_genome(adata: AnnData) -> AnnData:
 def _set_observation_unit(table: AnnData, unit: str | None, size_um: float | None) -> AnnData:
     """Record what a table row is in ``table.uns["spatialdata_io"]``.
 
-    ``unit`` is ``"cell"`` or ``None``; with ``None`` it is derived from ``size_um`` (the side of a square bin or the
-    diameter of a spot, in µm): below 10 µm ``"subcellular_bin"``, otherwise ``"spot_or_bin"``.
+    ``unit`` is ``"cell"``, ``"region"`` (e.g. a GeoMx AOI) or ``None``; with ``None`` it is derived from ``size_um``
+    (the side of a square bin or the diameter of a spot, in µm): below 10 µm ``"subcellular_bin"``, otherwise
+    ``"spot_or_bin"``.
     """
     if unit is None:
         unit = "subcellular_bin" if size_um is not None and size_um < 10 else "spot_or_bin"

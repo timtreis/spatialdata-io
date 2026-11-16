@@ -26,6 +26,7 @@ I/O for the `spatialdata` project.
     dbit
     dbit_fragments
     dbit_matrix
+    geomx
     experimental.iss
     imc
     imc_mcd
