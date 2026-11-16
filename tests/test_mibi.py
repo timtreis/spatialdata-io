@@ -61,7 +61,7 @@ def test_rejects_mismatched_channels_and_masks(tmp_path: Path) -> None:
 
     (fov / "CD3.tiff").unlink()
     tifffile.imwrite(tmp_path / "mask.tiff", np.zeros((32, 48), dtype=np.uint16))
-    with pytest.raises(ValueError, match="expected one plane"):
+    with pytest.raises(ValueError, match=r"has shape \(1, 32, 48\); expected planes of \(64, 48\)"):
         mibi(fov, labels={"whole_cell": tmp_path / "mask.tiff"})
     with pytest.raises(ValueError, match="No channel"):
         (tmp_path / "empty").mkdir()
@@ -151,6 +151,15 @@ def test_hubmap_multichannel_ome_tiff_with_stacked_masks(tmp_path: Path) -> None
     assert list(get_channel_names(image)) == ["CD45", "Ki67", "dsDNA"]
     level0 = lambda el: el["scale0"].image if hasattr(el, "keys") else el
     np.testing.assert_array_equal(level0(image).data.compute(), expr)
-    np.testing.assert_array_equal(level0(sdata.labels["3D_image_stack_expr_cells_labels"]).data.compute(), masks[0])
+    # every plane of the stack is its own labels element, named from the OME channels
+    assert sorted(sdata.labels) == sorted(f"3D_image_stack_expr_{n}_labels" for n in names)
+    for i, n in enumerate(names):
+        np.testing.assert_array_equal(level0(sdata.labels[f"3D_image_stack_expr_{n}_labels"]).data.compute(), masks[i])
+    # the same stack named twice is stored once
+    twice = mibi(
+        tmp_path / "3D_image_stack_expr.ome.tiff",
+        labels={"cells": tmp_path / "mask.ome.tiff", "nuclei": tmp_path / "mask.ome.tiff"},
+    )
+    assert sorted(twice.labels) == sorted(sdata.labels)
     with pytest.raises(ValueError, match="none is named 'whole_cell'"):
         mibi(tmp_path / "3D_image_stack_expr.ome.tiff", labels={"whole_cell": tmp_path / "mask.ome.tiff"})
