@@ -94,6 +94,31 @@ def test_pitch_unknown_and_3d_error(tmp_path: Path) -> None:
         imzml(tmp_path / "dup.imzML")
 
 
+def test_spectra_sharing_one_position_are_kept_unplaced(tmp_path: Path) -> None:
+    # PXD070149: the Thermo converter writes the scans off the grid at x=1 y=1, between the pixels
+    extra = [([100.0, 300.0], [2.0, 7.0]), ([200.0], [9.0]), ([450.0], [0.5])]
+    with ImzMLWriter(str(tmp_path / "p.imzML"), mode="processed") as w:
+        for i, ((x, y), (mz, it)) in enumerate(_SPECTRA.items()):
+            w.addSpectrum(np.array(mz), np.array(it, dtype=np.float32), (x, y, 1))
+            w.addSpectrum(np.array(extra[i][0]), np.array(extra[i][1], dtype=np.float32), (1, 1, 1))
+    sdata = imzml(tmp_path / "p.imzML", ppm=50)
+    table, unplaced = sdata["table"], sdata["spectra_without_position"]
+    assert sorted(table.obs_names) == ["1_2", "2_1"]
+    assert unplaced.obs["spectrum"].tolist() == [0, 1, 3, 5] and list(unplaced.var_names) == list(table.var_names)
+    # no spectrum is dropped: every intensity is in one of the two tables
+    written = sum(sum(it) for _, it in _SPECTRA.values()) + sum(sum(it) for _, it in extra)
+    assert table.obs["total_ion_current"].sum() + unplaced.obs["total_ion_current"].sum() == pytest.approx(written)
+    uns = table.uns["spatialdata_io"]
+    assert uns["spectra_without_position"] == {"n": 4, "x": 1, "y": 1} and uns["n_pixels_empty"] == 0
+    sdata.write(tmp_path / "p.zarr")
+    assert read_zarr(tmp_path / "p.zarr")["spectra_without_position"].n_obs == 4
+    with ImzMLWriter(str(tmp_path / "two.imzML"), mode="processed") as w:
+        for x, y in [(1, 1), (1, 1), (2, 1), (2, 1), (1, 2)]:  # repeats at two positions stay refused
+            w.addSpectrum(np.array([100.0]), np.array([1.0], dtype=np.float32), (x, y, 1))
+    with pytest.raises(ValueError, match="repeat an x/y position"):
+        imzml(tmp_path / "two.imzML")
+
+
 def test_bruker_3d_positions(tmp_path: Path) -> None:
     path = tmp_path / "3d.imzML"
     # two planes on one 2 x 1 grid; SCiLS stores each voxel's µm position as 3DPosition userParams
