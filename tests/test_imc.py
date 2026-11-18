@@ -119,6 +119,26 @@ def test_ngff_zarr(tmp_path: Path, zipped: bool) -> None:
     np.testing.assert_array_equal(image["scale0"]["image"].values, _DATA)
 
 
+def test_ngff_zip_with_nested_root_keeps_its_labels(tmp_path: Path) -> None:
+    # S-BIAD1961 layout: the image group two folders deep, with a binary "tumor" area label
+    import shutil
+
+    src = tmp_path / "src"
+    group = zarr.open_group(src / "experimentA_backup" / "RP-TMA" / "ROI73_multichannel.zarr", mode="w", zarr_format=2)
+    group.create_array("0", data=_DATA[None, :, None])
+    multiscales = [{"axes": [{"name": a} for a in "tczyx"], "datasets": [{"path": "0"}]}]
+    group.attrs.update({"multiscales": multiscales, "omero": {"channels": [{"label": n} for n in "abc"]}})
+    tumor = (np.arange(_DATA[0].size).reshape(_DATA.shape[1:]) % 2 * 255).astype(np.uint8)
+    labels = group.create_group("labels")
+    labels.attrs["labels"] = ["tumor"]
+    labels.create_group("tumor").create_array("0", data=tumor[None, None, None])
+    labels["tumor"].attrs["multiscales"] = multiscales
+    path = Path(shutil.make_archive(str(tmp_path / "ROI73_multichannel.zarr"), "zip", src))
+    sdata = imc(path, image_models_kwargs=_FAST, labels_models_kwargs=_FAST)
+    np.testing.assert_array_equal(sdata.images["ROI73_multichannel_image"]["scale0"]["image"].values, _DATA)
+    np.testing.assert_array_equal(sdata.labels["ROI73_multichannel_tumor_labels"]["scale0"]["image"].values, tumor)
+
+
 def test_errors(tmp_path: Path) -> None:
     path = tmp_path / "roi.tiff"
     tifffile.imwrite(path, _DATA)
