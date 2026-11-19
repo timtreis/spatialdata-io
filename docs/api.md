@@ -39,6 +39,7 @@ I/O for the `spatialdata` project.
     steinbock
     stereoseq
     stereoseq_gef
+    stereoseq_gem
     visium
     visium_hd
     xenium
