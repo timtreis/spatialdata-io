@@ -270,3 +270,30 @@ def test_panel_metal_tags(tmp_path: Path, header: str, rows: list[str], metals: 
     (tmp_path / "panel.csv").write_text("\n".join([header, *rows]) + "\n")
     sdata = imc(tmp_path / "roi.tiff", panel=tmp_path / "panel.csv", image_models_kwargs=_FAST)
     assert sdata.attrs["imc"].get("panel_metal") == (None if metals is None else {"roi_image": metals})
+
+
+def test_fluidigm_txt_roi(tmp_path: Path) -> None:
+    pytest.importorskip("readimc")
+    # zenodo:5018260 layout: push columns, X/Y/Z, then one "<label>(<metal><mass>Di)" column per channel
+    header = [
+        "Start_push",
+        "End_push",
+        "Pushes_duration",
+        "X",
+        "Y",
+        "Z",
+        "80ArAr(ArAr80Di)",
+        "CD45(Y89Di)",
+        "DNA1(Ir191Di)",
+    ]
+    rows = ["\t".join(map(str, [0, 0, 0, x, y, 0, 1.0, x + 10 * y, 5.0])) for y in range(4) for x in range(3)]
+    (tmp_path / "Patient03_ROI3.txt").write_text("\t".join(header) + "\n" + "\n".join(rows) + "\n")
+
+    sdata = imc(tmp_path / "Patient03_ROI3.txt")
+
+    image = sdata.images["Patient03_ROI3_image"]
+    image = image["scale0"]["image"] if "scale0" in image else image
+    assert get_channel_names(image) == ["80ArAr", "CD45", "DNA1"]
+    assert image.shape == (3, 4, 3)
+    assert image.values[1, 2, 1] == 21  # CD45 at x 1, y 2
+    assert sdata.attrs["imc"]["panel_metal"] == {"Patient03_ROI3_image": ["ArAr80", "Y89", "Ir191"]}

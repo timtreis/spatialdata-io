@@ -28,7 +28,7 @@ __all__ = ["imc", "imc_mcd"]
 # Hyperion/XTi ablate a 1 µm spot per pixel; no IMC export states it
 PIXEL_SIZE_UM = 1.0
 _CHANNEL_NAME = re.compile(r'<(?:\w+:)?Channel [^>]*Name="([^"]+)"')
-_ROI_SUFFIX = re.compile(r"(\.ome)?\.tiff?$|\.zarr(\.zip)?$", re.IGNORECASE)
+_ROI_SUFFIX = re.compile(r"(\.ome)?\.tiff?$|\.zarr(\.zip)?$|\.txt$", re.IGNORECASE)
 
 
 def imc(
@@ -48,6 +48,9 @@ def imc(
         - an OME-TIFF with one single-channel OME-XML document per page (e.g. MCD Viewer exports, which lack
           ``SizeC``), or with one OME-XML document on the first page for all channels (e.g. imctools ``full_stack`` exports): the
           channel names come from the ``<Channel Name>`` entries;
+        - a Fluidigm/Hyperion ``.txt`` ROI export (one row per pixel, one column per channel; read with :mod:`readimc`,
+          extra ``mcd``): channels are named by their antibody label, else the metal, as in :func:`imc_mcd`, and
+          ``sdata.attrs["imc"]["panel_metal"]`` records each channel's metal;
         - a multi-page TIFF or ImageJ hyperstack (e.g. a steinbock ``img/<roi>.tiff``): the channel names are the
           ``name`` column of ``panel`` (steinbock ``panel.csv``), else ``ch0``, ``ch1``, ... steinbock writes every
           panel channel to ``img/``, whatever ``keep`` says, so every channel is read; ``sdata.attrs["imc"]``
@@ -185,9 +188,7 @@ def imc_mcd(
                     logger.warning(f"{path.name}: skipping acquisition {acq.id} ({acq.description}): {e}")
                     continue
                 key = f"{stem}_{acq.id}"
-                names = [label or metal for label, metal in zip(acq.channel_labels, acq.channel_names, strict=True)]
-                if len(set(names)) < len(names):
-                    names = [f"{n}_{m}" for n, m in zip(names, acq.channel_names, strict=True)]
+                names = _label_names(acq.channel_labels, acq.channel_names)
                 transform, cs = _stage_transform(acq), "global"
                 if transform is None:
                     transform, cs = (
@@ -260,6 +261,8 @@ def _read_roi(
     ngff_labels: dict[str, da.Array] = {}
     if ".zarr" in path.suffixes:
         image, names, ngff_labels = _read_ngff(path)
+    elif path.suffix.lower() == ".txt":
+        image, names, metals = _read_txt(path)
     else:
         image, names = _read_tiff(path)
         if names is None and panel is not None:
@@ -319,6 +322,22 @@ def _read_tiff(path: Path) -> tuple[da.Array, list[str] | None]:
     image = da.from_zarr(zarr.open(tifffile.imread(path, is_ome=False, aszarr=True), mode="r"))
     image = image.reshape((-1, *image.shape[-2:]))
     return image, names if all(names) and len(names) == image.shape[0] else None  # type: ignore[return-value]
+
+
+def _label_names(labels: Sequence[str], metals: Sequence[str]) -> list[str]:
+    """Channel names: the antibody label, else the metal; every name gets its metal when two labels repeat."""
+    names = [label or metal for label, metal in zip(labels, metals, strict=True)]
+    return [f"{n}_{m}" for n, m in zip(names, metals, strict=True)] if len(set(names)) < len(names) else names
+
+
+def _read_txt(path: Path) -> tuple[da.Array, list[str], list[str]]:
+    """The ``(c, y, x)`` image of a Fluidigm/Hyperion ``.txt`` ROI export (read with :mod:`readimc`), names and metals."""
+    from readimc import TXTFile
+
+    with TXTFile(path) as f:
+        data = f.read_acquisition()
+        labels, metals = list(f.channel_labels), list(f.channel_names)
+    return da.from_array(data), _label_names(labels, metals), metals
 
 
 def _read_ngff(path: Path) -> tuple[da.Array, list[str], dict[str, da.Array]]:
