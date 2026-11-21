@@ -88,6 +88,48 @@ def test_normalized_counts_rejected(tmp_path: Path) -> None:
         cell_table(_write(tmp_path / "n.csv", rows), unit="um")
 
 
+def test_keep_noninteger(tmp_path: Path) -> None:
+    rows = [ROWS[0].replace(",1,2,0", ",0.5,2.25,0"), *ROWS[1:]]
+    sdata = cell_table(_write(tmp_path / "n.csv", rows), unit="um", keep_noninteger=True)
+    table = sdata.tables["table"]
+    assert table.X.dtype == np.float32
+    assert table.X.toarray().tolist() == [[0.5, 2.25, 0], [3, 0, 1], [0, 5, 2]]
+    uns = table.uns["spatialdata_io"]
+    assert (uns["x_dtype"], uns["integer_counts"]) == ("float32", False)
+
+
+@pytest.mark.parametrize("value", ["-0.5", "nan", "inf"])
+def test_keep_noninteger_rejects_negative_nan_inf(tmp_path: Path, value: str) -> None:
+    X = pd.DataFrame([[0.5, float(value), 0.0]], columns=["GeneA", "GeneB", "GeneC"])
+    obs = pd.DataFrame({"center_x": [1.0], "center_y": [2.0]}, index=["c1"])
+    with pytest.raises(ValueError, match="negative, NaN or infinite"):
+        _build(
+            X,
+            X.columns,
+            obs,
+            unit="um",
+            pixel_size=None,
+            x="center_x",
+            y="center_y",
+            split_by=None,
+            cell_radius=None,
+            n_coordinates_unmatched=0,
+            keep_noninteger=True,
+        )
+    if value != "nan":  # a wide CSV refuses missing values before the matrix check
+        rows = [ROWS[0].replace(",1,2,0", f",0.5,{value},0"), *ROWS[1:]]
+        with pytest.raises(ValueError, match="negative, NaN or infinite"):
+            cell_table(_write(tmp_path / "n.csv", rows), unit="um", keep_noninteger=True)
+
+
+def test_keep_noninteger_integer_counts_unchanged(csv: Path) -> None:
+    table = cell_table(csv, unit="um", keep_noninteger=True).tables["table"]
+    assert table.X.dtype == np.int32
+    assert table.X.toarray().tolist() == [[1, 2, 0], [3, 0, 1], [0, 5, 2]]
+    uns = table.uns["spatialdata_io"]
+    assert (uns["x_dtype"], uns["integer_counts"]) == ("int32", True)
+
+
 def test_integral_floats_accepted(tmp_path: Path) -> None:
     rows = [r.replace(",1,2,0", ",3.0,2.0,0") for r in ROWS[:1]] + ROWS[1:]
     sdata = cell_table(_write(tmp_path / "f.csv", rows), unit="um")

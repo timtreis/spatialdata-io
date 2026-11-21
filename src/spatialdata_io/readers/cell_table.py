@@ -123,6 +123,7 @@ def _build(
     coordinate_labels: tuple[str, str] | None = None,
     var: pd.DataFrame | None = None,
     controls: Literal["keep", "drop"] = "keep",
+    keep_noninteger: bool = False,
 ) -> SpatialData:
     """Validate counts and assemble the SpatialData object.
 
@@ -143,7 +144,7 @@ def _build(
     var
         Per-feature metadata indexed by ``var_names`` (e.g. from an h5ad file), kept in ``table.var``. Its
         ``feature_types`` column, if any, types the features instead of the names.
-    controls
+    controls, keep_noninteger
         See :func:`cell_table`.
     """
     for col in (x, y):
@@ -190,14 +191,22 @@ def _build(
             raise ValueError(f"Cell ids are not unique after prefixing them with the split value, for example {dup}.")
 
     csr = sp.csr_matrix(cast("Any", X.to_numpy() if isinstance(X, pd.DataFrame) else X))
-    if not np.all(np.mod(csr.data, 1) == 0):
+    integer = bool(np.all(np.mod(csr.data, 1) == 0))
+    if not integer and not keep_noninteger:
         raise ValueError(
             "Found non-integer values in the counts; this looks like a normalized matrix. "
-            "cell_table() only reads raw integer counts."
+            "cell_table() only reads raw integer counts; pass keep_noninteger=True to keep the deposited values."
         )
-    i32 = np.iinfo(np.int32)
-    fits = csr.data.size == 0 or (csr.data.min() >= 0 and csr.data.max() <= i32.max)
-    x_dtype = "int32" if fits else "int64"
+    if integer:
+        i32 = np.iinfo(np.int32)
+        fits = csr.data.size == 0 or (csr.data.min() >= 0 and csr.data.max() <= i32.max)
+        x_dtype = "int32" if fits else "int64"
+    else:
+        if not np.all(np.isfinite(csr.data)) or csr.data.min() < 0:
+            raise ValueError(
+                "Found negative, NaN or infinite values in the matrix; keep_noninteger only keeps finite values >= 0."
+            )
+        x_dtype = "float32"
     csr = sp.csr_matrix(csr.astype(x_dtype))
 
     n = len(obs)
@@ -240,6 +249,7 @@ def _build(
             "max": float(np.max(radius_um)),
         },
         "x_dtype": x_dtype,
+        "integer_counts": integer,
         "n_coordinates_unmatched": n_coordinates_unmatched,
     }
     sdata = SpatialData(shapes=shapes_by_region, tables=split_by_feature_type(table, controls=controls))
@@ -559,6 +569,7 @@ def cell_table(
     cell_radius: float | None = None,
     area_column: str | None = None,
     controls: Literal["keep", "drop"] = "keep",
+    keep_noninteger: bool = False,
 ) -> SpatialData:
     """Read a cell x gene counts table with per-cell centroids.
 
@@ -631,6 +642,11 @@ def cell_table(
         ``"keep"`` keeps the blank codewords (and any other control type an h5ad ``var["feature_types"]`` names)
         in ``table``, ``"drop"`` removes them. Protein and other types of such a column go to ``table_protein`` and
         ``table_<type>``.
+    keep_noninteger
+        Keep a matrix with non-integer values (e.g. counts the depositor divided by cell volume) as deposited,
+        stored as ``float32``, instead of raising. Negative, NaN and infinite values still raise. An integer
+        matrix keeps the integer dtype either way. ``table.uns["spatialdata_io"]["integer_counts"]`` records
+        whether the values are integer counts.
 
     Returns
     -------
@@ -642,7 +658,8 @@ def cell_table(
     Raises
     ------
     ValueError
-        If ``unit`` is invalid, ``unit="px"`` has no ``pixel_size``, the counts are not integral, cell ids
+        If ``unit`` is invalid, ``unit="px"`` has no ``pixel_size``, the counts are not integral (unless
+        ``keep_noninteger``) or, with ``keep_noninteger``, negative, NaN or infinite, cell ids
         are duplicated, the id, ``x``, ``y`` or ``split_by`` columns are missing, ``split_by`` has missing values,
         two values map to the same element name, coordinates are NaN, a gene column is non-numeric or has missing
         values, a derived radius is missing or non-positive, or ``layer`` / ``metadata_columns`` would be ignored.
@@ -711,5 +728,6 @@ def cell_table(
         coordinate_labels=(labels[x], labels[y]) if labels else None,
         var=var,
         controls=controls,
+        keep_noninteger=keep_noninteger,
     )
     return sdata

@@ -734,6 +734,20 @@ def _read_bins(
         raise ValueError(f"{f.filename}: `{group.name}/expression` has no rows with counts.")
 
     region = f"{dataset_id}_{_bin_name(bin_size, resolution_nm)}"
+    adata, squares = _bins_table(bins, x_mat, var_names, bin_size, region, transform)
+    return adata, squares, gef_kind, "precomputed" if precomputed else "aggregated_from_bin1"
+
+
+def _bins_table(
+    bins: np.ndarray,
+    x_mat: csr_matrix,
+    var_names: np.ndarray,
+    bin_size: int,
+    region: str,
+    transform: Mapping[str, BaseTransformation],
+) -> tuple[ad.AnnData, GeoDataFrame]:
+    """The bins x genes table and its square shapes from the sorted bin keys ``(y // bin_size) << 32 | (x // bin_size)``."""
+    n = len(bins)
     bin_id = np.arange(n, dtype=np.int64)
     obs = pd.DataFrame(index=pd.Index(bin_id.astype(str)))
     obs["bin_id"] = bin_id
@@ -746,8 +760,7 @@ def _read_bins(
     cy = (obs["array_row"].to_numpy() * bin_size).astype(np.float64)
     adata.obsm["spatial"] = np.stack([cx + bin_size / 2, cy + bin_size / 2], axis=1)
     gdf = GeoDataFrame(geometry=shapely.box(cx, cy, cx + bin_size, cy + bin_size), index=pd.Index(bin_id))
-    squares = ShapesModel.parse(gdf, transformations=dict(transform))
-    return adata, squares, gef_kind, "precomputed" if precomputed else "aggregated_from_bin1"
+    return adata, ShapesModel.parse(gdf, transformations=dict(transform))
 
 
 def stereoseq_gef(

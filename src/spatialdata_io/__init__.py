@@ -27,6 +27,7 @@ _LAZY_IMPORTS: dict[str, str] = {
     "steinbock": "spatialdata_io.readers.steinbock",
     "stereoseq": "spatialdata_io.readers.stereoseq",
     "stereoseq_gef": "spatialdata_io.readers.stereoseq",
+    "stereoseq_gem": "spatialdata_io.readers.stereoseq_gem",
     "visium": "spatialdata_io.readers.visium",
     "visium_hd": "spatialdata_io.readers.visium_hd",
     "xenium": "spatialdata_io.readers.xenium",
@@ -64,6 +65,7 @@ __all__ = [
     "steinbock",
     "stereoseq",
     "stereoseq_gef",
+    "stereoseq_gem",
     "visium",
     "visium_hd",
     "xenium",
@@ -125,6 +127,7 @@ if TYPE_CHECKING:
     from spatialdata_io.readers.seqfish import seqfish
     from spatialdata_io.readers.steinbock import steinbock
     from spatialdata_io.readers.stereoseq import stereoseq, stereoseq_gef
+    from spatialdata_io.readers.stereoseq_gem import stereoseq_gem
     from spatialdata_io.readers.visium import visium
     from spatialdata_io.readers.visium_hd import visium_hd
     from spatialdata_io.readers.xenium import (

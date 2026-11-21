@@ -61,6 +61,10 @@ def imzml(
 
     ``ppm`` defaults to the mass analyser named in the header: 5 for Orbitrap and FT-ICR, 20 for time-of-flight,
     else 10. Processed and continuous imzML are read the same way; files with several z planes raise an error.
+    Spectra that all share one x/y position while every other position has one spectrum (a converter placeholder for
+    scans off the grid) are kept unplaced in the table ``"spectra_without_position"`` (``obs`` ``spectrum``, the index in
+    the file, and ``total_ion_current``), and ``uns["spatialdata_io"]["spectra_without_position"]`` records their
+    number and position; repeats at several positions raise an error.
 
     Parameters
     ----------
@@ -113,9 +117,17 @@ def imzml(
     pos3d = _positions_3d(path, len(coords))
     if pos3d is None and (coords[:, 2] > 1).any():
         raise ValueError(f"{path.name} has {coords[:, 2].max()} z planes; only 2-D imzML is supported.")
+    unplaced = np.zeros(len(coords), dtype=bool)
     if pos3d is None and (n_dup := len(coords) - len(np.unique(coords[:, :2], axis=0))) > 0:
-        # e.g. Bruker 3D exports: the planes share one x/y grid and only the 3DPositionZ parameter tells them apart
-        raise ValueError(f"{path.name}: {n_dup} spectra repeat an x/y position; only 2-D imzML is supported.")
+        positions, counts = np.unique(coords[:, :2], axis=0, return_counts=True)
+        unplaced = (coords[:, :2] == positions[counts > 1][0]).all(axis=1)
+        # one shared position (PXD070149: Thermo scans off the grid, all at x=1 y=1) is a converter placeholder; repeats
+        # at several positions are e.g. Bruker 3D exports, whose planes only the 3DPositionZ parameter tells apart
+        if (counts > 1).sum() > 1 or unplaced.all():
+            raise ValueError(f"{path.name}: {n_dup} spectra repeat an x/y position; only 2-D imzML is supported.")
+        logger.warning(
+            f"{path.name}: {unplaced.sum()} spectra share one x/y position; kept in spectra_without_position."
+        )
 
     analyser = _analyser(head)
     if ppm is not None:
@@ -145,7 +157,7 @@ def imzml(
     var.index = pd.Index([f"mz_{mz:.4f}" for mz in var["mz"]])
 
     X, tic, n_peaks, mz_range = _count(parser, lookup, len(var), ibd_path)
-    keep = np.flatnonzero(n_peaks > 0)
+    keep = np.flatnonzero((n_peaks > 0) & ~unplaced)
     xy = coords[keep, :2]
 
     raw_px = _pixel_size(parser)
@@ -186,7 +198,7 @@ def imzml(
         "ppm_source": ppm_source,
         "feature_space": space,
         "n_features": len(var),
-        "n_pixels_empty": int(len(coords) - len(keep)),
+        "n_pixels_empty": int((~unplaced).sum() - len(keep)),
         "pixel_size_um": px,
         "pixel_size_source": px_source,
         "pixel_size_header": raw_px,
@@ -195,6 +207,12 @@ def imzml(
     }
     if measured is not None:
         uns["measured_spacing_um"] = measured
+    if unplaced.any():
+        uns["spectra_without_position"] = {
+            "n": int(unplaced.sum()),
+            "x": int(coords[unplaced][0, 0]),
+            "y": int(coords[unplaced][0, 1]),
+        }
     if pos3d is not None:
         return _set_reader_metadata(
             _sdata_3d(X[keep], var, coords[keep], pos3d[keep], tic[keep], keep, spacing, uns), "imzml"
@@ -218,7 +236,14 @@ def imzml(
     transform = Scale([px, px], axes=("x", "y")) if px is not None else Identity()
     squares = gpd.GeoDataFrame({"geometry": [box(x - 1, y - 1, x, y) for x, y in xy]}, index=keep)
     shapes = ShapesModel.parse(squares, transformations={"global": transform})
-    return _set_reader_metadata(SpatialData(shapes={_SHAPES: shapes}, tables={"table": table}), "imzml")
+    tables = {"table": table}
+    if unplaced.any():
+        idx = np.flatnonzero(unplaced)
+        obs = pd.DataFrame(
+            {"spectrum": idx, "total_ion_current": tic[idx]}, index=pd.Index([f"spectrum_{i}" for i in idx])
+        )
+        tables["spectra_without_position"] = TableModel.parse(ad.AnnData(X=X[idx], obs=obs, var=var.copy()))
+    return _set_reader_metadata(SpatialData(shapes={_SHAPES: shapes}, tables=tables), "imzml")
 
 
 def _positions_3d(path: Path, n: int) -> np.ndarray | None:

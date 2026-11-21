@@ -44,7 +44,7 @@ def imc(
     ``path`` is one of:
 
         - an OME-NGFF ``.zarr`` folder or ``.zarr.zip`` (e.g. IDR/BioImage Archive conversions): the full-resolution
-          level, with the ``omero`` channel labels;
+          level, with the ``omero`` channel labels, and each ``labels`` image as ``<roi>_<name>_labels``;
         - an OME-TIFF with one single-channel OME-XML document per page (e.g. MCD Viewer exports, which lack
           ``SizeC``), or with one OME-XML document on the first page for all channels (e.g. imctools ``full_stack`` exports): the
           channel names come from the ``<Channel Name>`` entries;
@@ -257,8 +257,9 @@ def _read_roi(
     """The image and label elements of one ROI, and the panel's ``keep`` value and metal of each channel, if any."""
     names: list[str] | None
     keep = metals = None
+    ngff_labels: dict[str, da.Array] = {}
     if ".zarr" in path.suffixes:
-        image, names = _read_ngff(path)
+        image, names, ngff_labels = _read_ngff(path)
     else:
         image, names = _read_tiff(path)
         if names is None and panel is not None:
@@ -278,7 +279,15 @@ def _read_roi(
             **_fit_scale_factors(image_models_kwargs, image.shape[1:]),
         )
     }
-    label_elements = {}
+    label_elements = {
+        f"{roi}_{sanitize_name(name)}_labels": Labels2DModel.parse(
+            mask,
+            dims=("y", "x"),
+            transformations=transformations,
+            **_fit_scale_factors(labels_models_kwargs, mask.shape),
+        )
+        for name, mask in ngff_labels.items()
+    }
     for name, mask_path in labels.items():
         label_elements[f"{roi}_{sanitize_name(name)}_labels"] = _parse_mask(
             mask_path, image.shape[1:], transformations, labels_models_kwargs
@@ -312,23 +321,41 @@ def _read_tiff(path: Path) -> tuple[da.Array, list[str] | None]:
     return image, names if all(names) and len(names) == image.shape[0] else None  # type: ignore[return-value]
 
 
-def _read_ngff(path: Path) -> tuple[da.Array, list[str]]:
-    """The full-resolution ``(c, y, x)`` image of an OME-NGFF ROI and its ``omero`` channel labels."""
+def _read_ngff(path: Path) -> tuple[da.Array, list[str], dict[str, da.Array]]:
+    """The full-resolution ``(c, y, x)`` image of an OME-NGFF ROI, its ``omero`` channel labels and its ``labels``.
+
+    The image group is the shallowest one with ``multiscales``: BioImage Archive zips can nest it (S-BIAD1961 has
+    ``experimentA_backup/<TMA>/<ROI>.zarr/``). Each ``labels`` image (https://ngff.openmicroscopy.org/0.4/#labels-md)
+    is returned as its full-resolution ``(y, x)`` array.
+    """
     if path.suffix == ".zip":
         with zipfile.ZipFile(path) as zf:
-            root = next(n.split("/")[0] for n in zf.namelist() if n.endswith(".zattrs"))
+            roots = [
+                n.removesuffix(".zattrs").rstrip("/")
+                for n in zf.namelist()
+                if n.endswith(".zattrs") and "multiscales" in zf.read(n).decode()
+            ]
+        if not roots:
+            raise ValueError(f"{path.name} has no OME-NGFF multiscales group.")
+        root = min(roots, key=lambda n: n.count("/"))
         group = zarr.open_group(zarr.storage.ZipStore(path, mode="r"), path=root, mode="r")
     else:
         group = zarr.open_group(path, mode="r")
+    image, attrs = _ngff_level0(group)
+    names = [str(c.get("label", f"ch{i}")) for i, c in enumerate(attrs.get("omero", {}).get("channels", []))]
+    names = names or [f"ch{i}" for i in range(image.shape[0])]
+    label_names = group["labels"].attrs.get("labels", []) if "labels" in group else []
+    labels = {str(n): _ngff_level0(group["labels"][n])[0].squeeze() for n in label_names}
+    return image, names, labels
+
+
+def _ngff_level0(group: zarr.Group) -> tuple[da.Array, dict[str, Any]]:
+    """The full-resolution level of an OME-NGFF multiscales group without its t/z axes, and the group's attrs."""
     attrs: dict[str, Any] = dict(group.attrs.asdict())
     multiscales = attrs["multiscales"][0]
     axes = [a["name"] if isinstance(a, dict) else a for a in multiscales["axes"]]
     image = da.from_zarr(group[multiscales["datasets"][0]["path"]])
-    # drop singleton t/z axes
-    index = tuple(0 if a in ("t", "z") else slice(None) for a in axes)
-    image = image[index]
-    names = [str(c.get("label", f"ch{i}")) for i, c in enumerate(attrs.get("omero", {}).get("channels", []))]
-    return image, names or [f"ch{i}" for i in range(image.shape[0])]
+    return image[tuple(0 if a in ("t", "z") else slice(None) for a in axes)], attrs
 
 
 def _roi_name(path: Path) -> str:
