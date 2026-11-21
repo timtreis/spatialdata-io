@@ -133,7 +133,9 @@ def imc_mcd(
     path: str | Path,
     *,
     acquisitions: Sequence[int] | None = None,
+    labels: Mapping[str, Mapping[int, str | Path]] = MappingProxyType({}),
     image_models_kwargs: Mapping[str, Any] = MappingProxyType({}),
+    labels_models_kwargs: Mapping[str, Any] = MappingProxyType({}),
 ) -> SpatialData:
     """Read all acquisitions (ROIs) of a raw *IMC* ``.mcd`` file with :mod:`readimc` (extra ``mcd``).
 
@@ -152,8 +154,13 @@ def imc_mcd(
         The ``.mcd`` file.
     acquisitions
         Acquisition ids to read (e.g. one core of a tissue microarray); all by default.
+    labels
+        Deposited segmentation masks by name and acquisition id, e.g. ``{"cells": {1: ".../<mcd>_a1_mask.tiff"}}``.
+        Each is stored as ``<mcd>_<id>_<name>_labels`` in the acquisition's frame and must have its shape.
     image_models_kwargs
         Keyword arguments for :class:`spatialdata.models.Image2DModel`.
+    labels_models_kwargs
+        Keyword arguments for :class:`spatialdata.models.Labels2DModel`.
 
     Returns
     -------
@@ -162,9 +169,11 @@ def imc_mcd(
     from readimc import MCDFile
 
     path = Path(path)
-    image_models_kwargs, _ = _initialize_raster_models_kwargs(image_models_kwargs, {})
+    image_models_kwargs, labels_models_kwargs = _initialize_raster_models_kwargs(
+        image_models_kwargs, labels_models_kwargs
+    )
     stem = sanitize_name(path.stem)
-    images, info = {}, []
+    images, label_elements, info = {}, {}, []
     with MCDFile(path) as f:
         for slide in f.slides:
             for acq in slide.acquisitions:
@@ -192,6 +201,11 @@ def imc_mcd(
                     transformations={cs: transform},
                     **_fit_scale_factors(image_models_kwargs, data.shape[-2:]),
                 )
+                for name, masks in labels.items():
+                    if acq.id in masks:
+                        label_elements[f"{key}_{sanitize_name(name)}_labels"] = _parse_mask(
+                            Path(masks[acq.id]), data.shape[-2:], {cs: transform}, labels_models_kwargs
+                        )
                 info.append(
                     {
                         "id": acq.id,
@@ -205,7 +219,10 @@ def imc_mcd(
                 )
     if not images:
         raise ValueError(f"No readable acquisition in {path}.")
-    sdata = SpatialData(images=images)
+    read = {a["id"] for a in info}
+    if missing := {name: ids for name, m in labels.items() if (ids := sorted(set(m) - read))}:
+        raise ValueError(f"Masks for acquisitions that were not read: {missing}.")
+    sdata = SpatialData(images=images, labels=label_elements)
     sdata.attrs["imc"] = {
         "mcd": path.name,
         "acquisitions": info,
@@ -263,17 +280,23 @@ def _read_roi(
     }
     label_elements = {}
     for name, mask_path in labels.items():
-        mask = tifffile.imread(mask_path, is_ome=False)
-        mask = mask.reshape(mask.shape[-2:]) if mask.ndim > 2 and mask.size == mask.shape[-2] * mask.shape[-1] else mask
-        if mask.shape != image.shape[1:]:
-            raise ValueError(f"Mask {mask_path} has shape {mask.shape}; expected {image.shape[1:]}.")
-        label_elements[f"{roi}_{sanitize_name(name)}_labels"] = Labels2DModel.parse(
-            mask,
-            dims=("y", "x"),
-            transformations=transformations,
-            **_fit_scale_factors(labels_models_kwargs, mask.shape),
+        label_elements[f"{roi}_{sanitize_name(name)}_labels"] = _parse_mask(
+            mask_path, image.shape[1:], transformations, labels_models_kwargs
         )
     return images, label_elements, keep, metals
+
+
+def _parse_mask(
+    path: Path, shape: tuple[int, ...], transformations: dict[str, Any], labels_models_kwargs: Mapping[str, Any]
+) -> Any:
+    """A mask TIFF as a labels element; it must have the image's ``(y, x)`` shape."""
+    mask = tifffile.imread(path, is_ome=False)
+    mask = mask.reshape(mask.shape[-2:]) if mask.ndim > 2 and mask.size == mask.shape[-2] * mask.shape[-1] else mask
+    if mask.shape != tuple(shape):
+        raise ValueError(f"Mask {path} has shape {mask.shape}; expected {tuple(shape)}.")
+    return Labels2DModel.parse(
+        mask, dims=("y", "x"), transformations=transformations, **_fit_scale_factors(labels_models_kwargs, mask.shape)
+    )
 
 
 def _read_tiff(path: Path) -> tuple[da.Array, list[str] | None]:

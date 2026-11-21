@@ -196,6 +196,30 @@ def test_mcd_acquisitions_placed_on_the_slide(tmp_path: Path, monkeypatch: pytes
     assert list(imc_mcd(tmp_path / "x.mcd", acquisitions=[2]).images) == ["x_2_image"]
 
 
+def test_mcd_deposited_masks(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    readimc = pytest.importorskip("readimc")
+    monkeypatch.setattr(readimc, "MCDFile", _MCD)
+    mask = np.zeros((40, 30), dtype=np.uint16)
+    mask[5:10, 5:10] = 7
+    tifffile.imwrite(tmp_path / "a1_mask.tiff", mask)
+    tifffile.imwrite(tmp_path / "small.tiff", mask[:20])
+
+    sdata = imc_mcd(tmp_path / "s.mcd", labels={"cells": {1: tmp_path / "a1_mask.tiff"}}, image_models_kwargs=_FAST)
+
+    assert list(sdata.labels) == ["s_1_cells_labels"]
+    labels = sdata.labels["s_1_cells_labels"]
+    assert labels["scale0"]["image"].values.max() == 7
+    # the mask shares its acquisition's frame
+    assert (
+        get_transformation(labels, get_all=True).keys()
+        == get_transformation(sdata.images["s_1_image"], get_all=True).keys()
+    )
+    with pytest.raises(ValueError, match="expected"):
+        imc_mcd(tmp_path / "s.mcd", labels={"cells": {1: tmp_path / "small.tiff"}})
+    with pytest.raises(ValueError, match="not read"):
+        imc_mcd(tmp_path / "s.mcd", labels={"cells": {3: tmp_path / "a1_mask.tiff"}})
+
+
 @pytest.mark.parametrize("shape", [(12, 13), (801, 802), (3, 5), (2, 2), (1, 50)])
 def test_small_and_odd_rois_get_the_levels_they_fit(tmp_path: Path, shape: tuple[int, int]) -> None:
     # the default 2x2x2x2 pyramid needs >= 16 px a side; smaller ROIs keep fewer levels instead of failing
