@@ -676,3 +676,19 @@ def test_read_transcripts_zarr_partitions(tmp_path: Path) -> None:
     ddf = _read_transcripts_zarr(tmp_path / "transcripts.zarr.zip", rows_per_partition=len(tx) // 3)
     assert ddf.npartitions > 1
     assert len(ddf.compute()) == len(tx)
+
+
+def test_xenium_csv_only_empty_nucleus_boundaries(tmp_path: Path) -> None:
+    # zenodo:17729106: a run without nucleus segmentation ships an empty nucleus_boundaries.csv.gz
+    import gzip
+    import shutil
+
+    for f in XENIUM_CSV_ONLY.iterdir():
+        shutil.copy(f, tmp_path / f.name)
+    with gzip.open(tmp_path / "nucleus_boundaries.csv.gz", "wb"):
+        pass
+
+    with pytest.warns(UserWarning, match="nucleus boundary file is empty"):
+        sdata = xenium(tmp_path, morphology_mip=False, morphology_focus=False, aligned_images=False)
+    assert "nucleus_boundaries" not in sdata.shapes and "nucleus_labels" not in sdata.labels
+    assert len(sdata["cell_boundaries"]) == 30

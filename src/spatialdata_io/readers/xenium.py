@@ -435,6 +435,12 @@ def xenium(
     # cell_id <-> label_index mappings. The zarr provides them; without it the same information lives
     # in the boundary parquet's or CSV's ``label_id`` column (v2/v3). Pre-1.3.0 CSVs have no ``label_id``,
     # so the mappings stay None and labels are keyed directly by the integer cell_id.
+    if (nucleus_boundaries or nucleus_labels) and _empty_boundaries(
+        path, XeniumKeys.NUCLEUS_BOUNDARIES_FILE, XeniumKeys.NUCLEUS_BOUNDARIES_FILE_CSV
+    ):
+        # a run without nucleus segmentation ships an empty nucleus boundary file (header-less CSV, 0-row parquet)
+        warnings.warn("The nucleus boundary file is empty: no nucleus layer is read.", UserWarning, stacklevel=2)
+        nucleus_boundaries = nucleus_labels = False
     if cells_zarr_ctx is not None:
         cell_im = cells_zarr_ctx.cell_indices_mapping
         nucleus_im = cells_zarr_ctx.nucleus_indices_mapping
@@ -932,6 +938,18 @@ def _resolve_csv(path: Path, gz_name: str) -> Path:
         if (path / name).is_file():
             return path / name
     raise FileNotFoundError(f"Neither {gz_name} nor {gz_name.removesuffix('.gz')} found in {path}.")
+
+
+def _empty_boundaries(path: Path, parquet_name: str, gz_name: str) -> bool:
+    """Whether the boundary file the reader would read holds no polygon: a 0-row parquet or an empty CSV."""
+    if (path / parquet_name).is_file():
+        return pq.read_metadata(path / parquet_name).num_rows == 0
+    try:
+        return pd.read_csv(_resolve_csv(path, gz_name), nrows=1).empty
+    except FileNotFoundError:
+        return False
+    except pd.errors.EmptyDataError:
+        return True
 
 
 def _has_label_id(csv: Path) -> bool:
