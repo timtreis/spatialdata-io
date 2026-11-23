@@ -705,3 +705,29 @@ def test_xenium_images_are_read_by_their_tiles(tmp_path: Path) -> None:
     image = _get_images(tmp_path, "m.ome.tif", image_models_kwargs={"c_coords": ["a", "b"]})
     assert image.data.chunksize == (1, 16, 16)
     np.testing.assert_array_equal(image.data.compute(), data)
+
+
+def test_labels_from_boundaries_tiled_match_one_fill(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Labels rebuilt from polygons tile by tile equal one fill of the whole raster (overlaps: later polygon wins)."""
+    import geopandas as gpd
+    from shapely import Polygon
+    from skimage.draw import polygon
+
+    from spatialdata_io.readers import xenium as xenium_mod
+
+    polys = [
+        Polygon([(0, 0), (9, 1), (8, 12), (1, 10)]),
+        Polygon([(5, 4), (20, 3), (19, 17), (6, 16)]),  # overlaps the first and crosses tile edges
+        Polygon([(15, 15), (30, 14), (28, 25), (16, 26)]),
+    ]
+    shapes = gpd.GeoDataFrame(geometry=polys, index=pd.Index([3, 7, 11]))
+    monkeypatch.setattr(xenium_mod, "_LABELS_TILE", (7, 5))
+    tiled = xenium_mod._get_labels_from_boundaries(shapes, {"pixel_size": 1.0})
+    assert tiled.data.chunksize == (7, 5)
+
+    expected = np.zeros(tiled.shape, dtype=np.uint32)
+    for geom, value in zip(polys, (3, 7, 11), strict=True):
+        xs, ys = geom.exterior.coords.xy
+        rr, cc = polygon(np.asarray(ys), np.asarray(xs), shape=expected.shape)
+        expected[rr, cc] = value
+    np.testing.assert_array_equal(tiled.data.compute(), expected)

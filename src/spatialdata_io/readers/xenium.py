@@ -785,6 +785,9 @@ def _get_labels(
     return Labels2DModel.parse(masks, dims=("y", "x"), transformations={"global": Identity()}, **labels_models_kwargs)
 
 
+_LABELS_TILE = (4096, 4096)  # tile of the labels rebuilt from boundary polygons (64 MB of uint32)
+
+
 def _get_labels_from_boundaries(
     shapes: GeoDataFrame,
     specs: dict[str, Any],
@@ -817,14 +820,24 @@ def _get_labels_from_boundaries(
     inv = 1.0 / specs["pixel_size"]
     minx, miny, maxx, maxy = shapes.total_bounds * inv
     x0, y0 = math.floor(minx), math.floor(miny)
-    raster = np.zeros((math.ceil(maxy) - y0, math.ceil(maxx) - x0), dtype=np.uint32)
-    # This explicit fill exploits the known Xenium geometry; spatialdata.rasterize() could replace it
-    # (dropping the Python loop) once scverse/spatialdata#987 lands. Only legacy/CSV bundles reach here,
-    # so the loop's performance is not a concern.
-    for geom, value in zip(shapes.geometry.to_numpy(), label.astype(np.uint32), strict=True):
-        xs, ys = geom.exterior.coords.xy
-        rr, cc = polygon(np.asarray(ys) * inv - y0, np.asarray(xs) * inv - x0, shape=raster.shape)
-        raster[rr, cc] = value
+    shape = (math.ceil(maxy) - y0, math.ceil(maxx) - x0)
+    rings = [np.asarray(g.exterior.coords) * inv - (x0, y0) for g in shapes.geometry.to_numpy()]
+    lo = np.array([r.min(axis=0) for r in rings]).reshape(-1, 2)  # (x, y) bounding box per polygon
+    hi = np.array([r.max(axis=0) for r in rings]).reshape(-1, 2)
+    label = label.astype(np.uint32)
+
+    # Filled tile by tile: a whole-slide raster is ~18 GB of uint32 (GEO flat deposits without cells.zarr.zip).
+    # Each tile fills the polygons whose box overlaps it, in order, so later polygons win as in one global fill.
+    def fill(block_info: dict[Any, Any]) -> np.ndarray:
+        (ya, yb), (xa, xb) = block_info[None]["array-location"]
+        tile = np.zeros((yb - ya, xb - xa), dtype=np.uint32)
+        hit = np.flatnonzero((lo[:, 0] < xb) & (hi[:, 0] >= xa) & (lo[:, 1] < yb) & (hi[:, 1] >= ya))
+        for i in hit:
+            rr, cc = polygon(rings[i][:, 1] - ya, rings[i][:, 0] - xa, shape=tile.shape)
+            tile[rr, cc] = label[i]
+        return tile
+
+    raster = da.map_blocks(fill, dtype=np.uint32, chunks=da.core.normalize_chunks(_LABELS_TILE, shape))
     transform = Translation([x0, y0], axes=("x", "y"))
     return Labels2DModel.parse(raster, dims=("y", "x"), transformations={"global": transform}, **labels_models_kwargs)
 
