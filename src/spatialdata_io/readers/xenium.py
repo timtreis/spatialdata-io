@@ -45,6 +45,7 @@ from xarray import DataArray, DataTree
 from spatialdata_io._constants._constants import XeniumKeys
 from spatialdata_io._docs import inject_docs
 from spatialdata_io._utils import deprecation_alias
+from spatialdata_io.readers._atera_common import _tiled_imread
 from spatialdata_io.readers._utils._features import split_by_feature_type
 from spatialdata_io.readers._utils._utils import (
     _initialize_raster_models_kwargs,
@@ -1107,7 +1108,9 @@ def _get_images(
     imread_kwargs: Mapping[str, Any] = MappingProxyType({}),
     image_models_kwargs: Mapping[str, Any] = MappingProxyType({}),
 ) -> DataArray | DataTree:
-    image = imread(path / file, **imread_kwargs)
+    # without dask_image options, read by the file's own tiles: imread makes each whole plane one chunk, and a
+    # 4-channel 81664x54001 morphology_focus then decodes 4 x 8.8 GB planes at once (GEO GSM8978583: OOM at 64 GB)
+    image = imread(path / file, **imread_kwargs) if imread_kwargs else _tiled_imread(path / file)[0]
     if "c_coords" in image_models_kwargs and "dummy" in image_models_kwargs["c_coords"]:
         # Napari currently interprets 4 channel images as RGB; a series of PRs to fix this is almost ready but they will
         # not be merged soon.

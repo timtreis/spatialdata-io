@@ -692,3 +692,16 @@ def test_xenium_csv_only_empty_nucleus_boundaries(tmp_path: Path) -> None:
         sdata = xenium(tmp_path, morphology_mip=False, morphology_focus=False, aligned_images=False)
     assert "nucleus_boundaries" not in sdata.shapes and "nucleus_labels" not in sdata.labels
     assert len(sdata["cell_boundaries"]) == 30
+
+
+def test_xenium_images_are_read_by_their_tiles(tmp_path: Path) -> None:
+    """A tiled OME-TIFF is chunked by its tiles, not one chunk per plane (whole-plane chunks OOM on large slides)."""
+    import tifffile
+
+    from spatialdata_io.readers.xenium import _get_images
+
+    data = np.arange(2 * 64 * 48, dtype=np.uint16).reshape(2, 64, 48)
+    tifffile.imwrite(tmp_path / "m.ome.tif", data, tile=(16, 16), metadata={"axes": "CYX"})
+    image = _get_images(tmp_path, "m.ome.tif", image_models_kwargs={"c_coords": ["a", "b"]})
+    assert image.data.chunksize == (1, 16, 16)
+    np.testing.assert_array_equal(image.data.compute(), data)
