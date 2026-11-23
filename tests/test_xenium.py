@@ -769,3 +769,7 @@ def test_zarr_polygons_from_cells_zarr_without_masks() -> None:
     assert list(polys.index) == list(cells.cell_id_str[:2]) and polys.geometry.area.tolist() == [16.0, 16.0]
     labels = _get_labels_from_boundaries(polys, {"pixel_size": 1.0}, cells.cell_indices_mapping)
     assert set(np.unique(labels.data.compute())) == {0, 7, 8}  # the zarr's seg_mask_value labels
+    mapping = cells.cell_indices_mapping.assign(label_index=[0, 8, 9])  # a deposit labelling a cell 0 (background)
+    with pytest.warns(UserWarning, match="1 polygon"):
+        labels = _get_labels_from_boundaries(polys, {"pixel_size": 1.0}, mapping)
+    assert set(np.unique(labels.data.compute())) == {0, 8}

@@ -857,6 +857,13 @@ def _get_labels_from_boundaries(
     lo = np.array([r.min(axis=0) for r in rings]).reshape(-1, 2)  # (x, y) bounding box per polygon
     hi = np.array([r.max(axis=0) for r in rings]).reshape(-1, 2)
     label = label.astype(np.uint32)
+    if n_zero := int((label == 0).sum()):  # 0 is background: such a cell stays in the shapes and table, not the raster
+        warnings.warn(
+            f"{n_zero} polygon(s) have label 0 (background), so they are not drawn in the labels: "
+            f"{list(shapes.index[label == 0][:5])}",
+            UserWarning,
+            stacklevel=2,
+        )
 
     # Filled tile by tile: a whole-slide raster is ~18 GB of uint32 (GEO flat deposits without cells.zarr.zip).
     # Each tile fills the polygons whose box overlaps it, in order, so later polygons win as in one global fill.
