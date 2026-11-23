@@ -731,3 +731,41 @@ def test_labels_from_boundaries_tiled_match_one_fill(monkeypatch: pytest.MonkeyP
         rr, cc = polygon(np.asarray(ys), np.asarray(xs), shape=expected.shape)
         expected[rr, cc] = value
     np.testing.assert_array_equal(tiled.data.compute(), expected)
+
+
+def test_zarr_polygons_from_cells_zarr_without_masks() -> None:
+    """An ROI subset export ships polygons in cells.zarr but no masks: boundaries and labels come from the polygons."""
+    import packaging.version
+    import zarr
+
+    from spatialdata_io.readers.xenium import (
+        _get_labels_from_boundaries,
+        _XeniumCells,
+        _zarr_polygons,
+        cell_id_str_from_prefix_suffix_uint32,
+    )
+
+    g = zarr.group()
+    ids = np.array([[1, 1], [2, 1], [3, 1]], dtype=np.uint32)
+    square = [0, 0, 4, 0, 4, 4, 0, 4, 0, 0]  # x, y interleaved, microns
+    verts = np.zeros((2, 3, 10), dtype=np.float32)
+    verts[:, 0] = square
+    verts[:, 1] = [10 + v if i % 2 == 0 else v for i, v in enumerate(square)]
+    verts[:, 2, :4] = [20, 0, 21, 0]
+    g.create_array("polygon_vertices", data=verts)
+    g.create_array("polygon_num_vertices", data=np.array([[5, 5, 2], [5, 5, 2]], dtype=np.int32))
+    g.create_array("cell_id", data=ids)
+    g.create_array("seg_mask_value", data=np.array([7, 8, 9], dtype=np.uint32))
+    cells = _XeniumCells(
+        group=g,
+        cell_id_str=cell_id_str_from_prefix_suffix_uint32(ids[:, 0], ids[:, 1]),
+        version=packaging.version.parse("1.3.0"),
+        has_polygon_sets=False,
+        has_seg_mask_value=True,
+        has_masks=False,
+    )
+    with pytest.warns(UserWarning, match="Dropping 1 polygons"):
+        polys = _zarr_polygons(cells, 1, {"pixel_size": 1.0})
+    assert list(polys.index) == list(cells.cell_id_str[:2]) and polys.geometry.area.tolist() == [16.0, 16.0]
+    labels = _get_labels_from_boundaries(polys, {"pixel_size": 1.0}, cells.cell_indices_mapping)
+    assert set(np.unique(labels.data.compute())) == {0, 7, 8}  # the zarr's seg_mask_value labels

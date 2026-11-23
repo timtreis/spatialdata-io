@@ -22,6 +22,7 @@ import pyarrow as pa
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import scanpy as sc
+import shapely
 import tifffile
 import zarr
 from dask.dataframe import read_csv as dask_read_csv
@@ -134,6 +135,7 @@ class _XeniumCells:
     version: packaging.version.Version | None
     has_polygon_sets: bool
     has_seg_mask_value: bool
+    has_masks: bool
     nucleus_indices_mapping: pd.DataFrame | None = field(init=False)
     cell_indices_mapping: pd.DataFrame | None = field(init=False)
 
@@ -187,6 +189,7 @@ class _XeniumCells:
             version=version,
             has_polygon_sets=has_polygon_sets,
             has_seg_mask_value=has_seg_mask_value,
+            has_masks="masks" in group,  # an ROI subset export can ship polygons without the raster masks
         )
 
     def get_indices_mapping(self, mask_index: int) -> pd.DataFrame | None:
@@ -516,19 +519,24 @@ def xenium(
         ),
     ):
         is_nucleus = name == "nucleus"
+        masks = cells_zarr_ctx is not None and cells_zarr_ctx.has_masks
         polys = None
-        if want_boundaries or (want_labels and cells_zarr_ctx is None):
-            polys = _get_polygons(
-                path, pq_file, csv_file, specs, indices_mapping=indices_mapping, is_nucleus=is_nucleus
-            )
+        if want_boundaries or (want_labels and not masks):
+            if cells_zarr_ctx is not None and not masks and not _has_boundary_file(path, pq_file, csv_file):
+                polys = _zarr_polygons(cells_zarr_ctx, 0 if is_nucleus else 1, specs)
+            else:
+                polys = _get_polygons(
+                    path, pq_file, csv_file, specs, indices_mapping=indices_mapping, is_nucleus=is_nucleus
+                )
         if want_labels:
-            if cells_zarr_ctx is not None:
+            if masks:
                 labels[f"{name}_labels"] = _get_labels(
                     cells_zarr_ctx.group, 0 if is_nucleus else 1, labels_models_kwargs
                 )
             elif polys is not None:
+                # v1.x nuclei map 1:1 to the cells, so without a nucleus mapping they take the cells'
                 labels[f"{name}_labels"] = _get_labels_from_boundaries(
-                    polys, specs, indices_mapping, labels_models_kwargs
+                    polys, specs, indices_mapping if indices_mapping is not None else cell_im, labels_models_kwargs
                 )
         if want_boundaries and polys is not None:
             polygons[f"{name}_boundaries"] = polys
@@ -769,6 +777,30 @@ def _get_polygons(
         geo_df = GeoDataFrame({"geometry": geoms}, index=index.values)
         geo_df.index.name = "cell_id"
 
+    scale = Scale([1.0 / specs["pixel_size"], 1.0 / specs["pixel_size"]], axes=("x", "y"))
+    return ShapesModel.parse(geo_df, transformations={"global": scale})
+
+
+def _has_boundary_file(path: Path, file: str, csv_file: str) -> bool:
+    return any((path / n).is_file() for n in (file, csv_file, csv_file.removesuffix(".gz")))
+
+
+def _zarr_polygons(cells: _XeniumCells, mask_index: int, specs: dict[str, Any]) -> GeoDataFrame:
+    """Boundary polygons from cells.zarr ``polygon_vertices`` (v1.x: x, y interleaved, in microns), indexed by cell_id.
+
+    For bundles whose cells.zarr has no raster ``masks`` and no boundary file beside it (an ROI subset export,
+    Zenodo 17822301). Polygons with fewer than 3 vertices are dropped with a warning.
+    """
+    if cells.cell_id_str is None:
+        raise ValueError("cells.zarr.zip has no masks and no boundary file, and its cell ids cannot be decoded")
+    verts = np.asarray(_zarr_array(cells.group, "polygon_vertices")[mask_index])
+    n_vertices = np.asarray(_zarr_array(cells.group, "polygon_num_vertices")[mask_index])
+    keep = n_vertices >= 3
+    if not keep.all():
+        warnings.warn(f"Dropping {int((~keep).sum())} polygons with fewer than 3 vertices.", UserWarning, stacklevel=3)
+    geoms = shapely.polygons([verts[i, : 2 * n].reshape(n, 2) for i, n in enumerate(n_vertices) if n >= 3])
+    geo_df = GeoDataFrame({"geometry": geoms}, index=cells.cell_id_str[keep])
+    geo_df.index.name = "cell_id"
     scale = Scale([1.0 / specs["pixel_size"], 1.0 / specs["pixel_size"]], axes=("x", "y"))
     return ShapesModel.parse(geo_df, transformations={"global": scale})
 
