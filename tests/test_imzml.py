@@ -345,11 +345,11 @@ def _write_many(path: Path, n: int, bad: int) -> Path:
 
 
 def test_spectra_failing_the_decode_check(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
-    with pytest.raises(ValueError, match="2 of 100 spectra have decreasing m/z"):
+    with pytest.raises(ValueError, match="2 of 100 spectra have m/z that drops"):
         imzml(_write_many(tmp_path / "bad.imzML", 100, 2))  # above 1%: refused
     sdata = imzml(_write_many(tmp_path / "ok.imzML", 200, 1))  # at or below 1%: kept, counted and logged
     assert sdata["table"].uns["spatialdata_io"]["n_spectra_undecodable"] == 1
-    assert "1 of 200 spectra have decreasing m/z" in caplog.text
+    assert "1 of 200 spectra have m/z that drops" in caplog.text
 
 
 def test_mz_outside_the_declared_scan_window_fails_the_decode_check(tmp_path: Path) -> None:
@@ -428,3 +428,28 @@ def test_other_malformed_xml_is_not_repaired(tmp_path: Path) -> None:
     path.write_text(path.read_text().replace('unitName="m/z"/>', 'unitName="m/z" name="x"/>', 1))
     with pytest.raises(ParseError, match="duplicate attribute"):
         imzml(path)
+
+
+def test_ppm_order_jitter_is_not_a_decode_failure(tmp_path: Path) -> None:
+    # PXD070149 recalibrated spectra: close peaks a few ppm out of order (here 2.5e-6 of the m/z)
+    path = tmp_path / "j.imzML"
+    with ImzMLWriter(str(path), mode="processed") as w:
+        for i in range(4):
+            w.addSpectrum(np.array([100.0, 200.0, 199.9995, 300.0]), np.ones(4, dtype=np.float32), (i + 1, 1, 1))
+    text = path.read_text()
+    end = text.index("/>", text.index('name="max count of pixels y"')) + 2
+    path.write_text(text[:end] + _PIXEL_SIZE + text[end:])
+    assert imzml(path)["table"].uns["spatialdata_io"]["n_spectra_undecodable"] == 0
+
+
+def test_unsorted_shared_mz_array_is_not_a_decode_failure(tmp_path: Path) -> None:
+    # HuBMAP lipid panels (sddb_ze5exaan3q): one shared m/z array listing annotated features out of m/z order
+    path = tmp_path / "c.imzML"
+    mz = np.array([480.31, 500.278, 436.283, 544.268])
+    with ImzMLWriter(str(path), mode="continuous") as w:
+        for i in range(4):
+            w.addSpectrum(mz, np.ones(4, dtype=np.float32), (i + 1, 1, 1))
+    text = path.read_text()
+    end = text.index("/>", text.index('name="max count of pixels y"')) + 2
+    path.write_text(text[:end] + _PIXEL_SIZE + text[end:])
+    assert imzml(path)["table"].uns["spatialdata_io"]["n_spectra_undecodable"] == 0

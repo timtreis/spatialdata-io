@@ -169,7 +169,7 @@ def imzml(
     window = _scan_window(head)
     X, tic, n_peaks, mz_range, undecodable = _count(parser, lookup, len(var), ibd_path, window)
     if n_bad := int(undecodable.sum()):
-        what = f"{path.name}: {n_bad} of {len(coords)} spectra have decreasing m/z" + (
+        what = f"{path.name}: {n_bad} of {len(coords)} spectra have m/z that drops or is not finite" + (
             f" or m/z outside the declared scan window {window[0]:g}-{window[1]:g}" if window else ""
         )
         # a replaced .ibd (e.g. a recalibrated one) can decode fine; with a checksum mismatch too, it does not belong
@@ -354,6 +354,9 @@ def _sdata_3d(
 
 _MAX_UNDECODABLE = 0.01  # share of spectra that may fail the decode check before the file is refused
 _WINDOW_MARGIN = 1e-3  # relative slack on the declared scan window
+# largest m/z decrease within a spectrum that is still order jitter: PXD070149's recalibrated spectra reach 4.4e-6 of
+# the m/z, its mis-decoded ones exceed 1e-2
+_MZ_DROP_TOLERANCE = 1e-4
 _IBD_CHECKSUMS = {"IMS:1000091": "sha1", "IMS:1000090": "md5"}  # "ibd SHA-1", "ibd MD5"
 
 
@@ -601,7 +604,8 @@ def _count(
 ) -> tuple[sp.csr_matrix, np.ndarray, np.ndarray, tuple[float, float], np.ndarray]:
     """Pixels x features CSR of summed intensities, TIC and peaks per pixel, m/z range, and decode-check failures.
 
-    A spectrum fails the decode check when its m/z decreases, or lies outside the declared scan ``window``.
+    A spectrum fails the decode check when its m/z drops by more than :data:`_MZ_DROP_TOLERANCE` of the m/z (spectra
+    with their own m/z array only), is not finite, or lies outside the declared scan ``window``.
     """
     n = len(parser.coordinates)
     tic, n_peaks = np.zeros(n), np.zeros(n, dtype=np.int64)
@@ -613,7 +617,12 @@ def _count(
         n_peaks += np.bincount(pix, minlength=n)
         if len(mz):
             lo, hi = min(lo, float(mz.min())), max(hi, float(mz.max()))
-            undecodable[pix[1:][(np.diff(mz) < 0) & (pix[1:] == pix[:-1])]] = True
+            # recalibrated spectra (PXD070149) keep close peaks a few ppm out of order; a mis-decoded .ibd drops by far more.
+            # A shared m/z array (continuous mode, ibd_path) may list features in any order (HuBMAP lipid panels).
+            if ibd_path is None:
+                drop = mz[:-1] - mz[1:] > _MZ_DROP_TOLERANCE * np.abs(mz[:-1])
+                undecodable[pix[1:][drop & (pix[1:] == pix[:-1])]] = True
+            undecodable[pix[~np.isfinite(mz)]] = True
             if window is not None:
                 undecodable[pix[(mz < window[0] * (1 - _WINDOW_MARGIN)) | (mz > window[1] * (1 + _WINDOW_MARGIN))]] = (
                     True
