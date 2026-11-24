@@ -1014,6 +1014,9 @@ class CosMxDatasetReader:
         else:
             obs["global_cell_id"] = np.arange(1, adata.n_obs + 1, dtype=int)
 
+        if (offset := _vendor_frame_offset(obs, self.fov_locs, self._fov_height)) is not None:
+            adata.uns.setdefault("spatialdata_io", {})["vendor_frame"] = offset
+
         # Determine region
         region = regions[0] if regions else "cells"
         if (
@@ -1054,6 +1057,38 @@ class CosMxDatasetReader:
 
         tables["cell_data"] = _parse_cell_table(tables["cell_data"], region=region)
         return tables
+
+
+_VENDOR_CENTRE_COLS = ("CenterX_global_px", "CenterY_global_px")
+
+
+def _vendor_frame_offset(obs: pd.DataFrame, fov_locs: pd.DataFrame, fov_height: float | None) -> dict[str, Any] | None:
+    """How the vendor's ``Center*_global_px`` columns relate to the ``global`` coordinate system of the elements.
+
+    Each cell centre is placed from its ``Center*_local_px`` as the polygons and transcripts are; when the vendor
+    columns differ from that by one translation (within 1 px), it is recorded (sddb_hwz6am5fuv: one FOV height in y).
+    """
+    cols = ["fov", "CenterX_local_px", "CenterY_local_px", *_VENDOR_CENTRE_COLS]
+    if not set(cols) <= set(obs.columns):
+        return None
+    df = obs[cols].dropna()
+    df = df[df["fov"].isin(fov_locs.index)].rename(
+        columns={"CenterX_local_px": "x_local_px", "CenterY_local_px": "y_local_px"}
+    )
+    if df.empty:
+        return None
+    try:
+        placed = place_local_in_fov_grid(df, fov_locs, out_x="_x", out_y="_y", fov_height=fov_height)
+    except ValueError:  # no FOV height to place by
+        return None
+    d = np.column_stack([placed["_x"] - df["CenterX_global_px"], placed["_y"] - df["CenterY_global_px"]])
+    offset = np.median(d, axis=0)
+    info: dict[str, Any] = {"columns": list(_VENDOR_CENTRE_COLS), "frame": "vendor"}
+    if np.abs(d - offset).max() <= 1.0:
+        info |= {"offset_px": [float(offset[0]), float(offset[1])], "rule": "global = vendor + offset_px"}
+    else:
+        info["rule"] = "not one translation from global"
+    return info
 
 
 UNASSIGNED_TABLE = "unassigned_per_fov"

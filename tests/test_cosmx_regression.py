@@ -2926,3 +2926,17 @@ def test_cellstats_stitcher_places_with_the_given_fov_table(tmp_path):
     oriented = _read_fov_locs(pos, fov_size=(FOV_SIZE, FOV_SIZE)).assign(flip_y=False, frame="export_global_px")
     given, _ = stitch_segmentation_label_image(**kw, fov_locs=oriented)
     np.testing.assert_array_equal(np.asarray(given), np.asarray(file_table)[::-1, :])
+
+
+def test_vendor_frame_offset_is_recorded_when_one_translation():
+    from spatialdata_io.readers.cosmx._reader import _vendor_frame_offset
+
+    # sddb_hwz6am5fuv: the vendor's global y is fov_y - y_local; io places y at fov_y + (4256 - y_local)
+    fov_locs = pd.DataFrame({"xmin": [21280.0, 25536.0], "ymin": [123424.0, 123424.0]}, index=[1, 2])
+    obs = pd.DataFrame({"fov": [1, 1, 2], "CenterX_local_px": [4170, 3109, 10], "CenterY_local_px": [88, 758, 4000]})
+    obs["CenterX_global_px"] = obs["fov"].map(fov_locs["xmin"]) + obs["CenterX_local_px"]
+    obs["CenterY_global_px"] = obs["fov"].map(fov_locs["ymin"]) - obs["CenterY_local_px"]
+    info = _vendor_frame_offset(obs, fov_locs, 4256.0)
+    assert info["offset_px"] == [0.0, 4256.0] and info["columns"] == ["CenterX_global_px", "CenterY_global_px"]
+    obs["CenterY_global_px"] = obs["fov"].map(fov_locs["ymin"]) + obs["CenterY_local_px"]  # mirrored: no translation
+    assert "offset_px" not in _vendor_frame_offset(obs, fov_locs, 4256.0)
