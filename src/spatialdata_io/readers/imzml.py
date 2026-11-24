@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import io
 import math
 import mmap
@@ -100,6 +101,7 @@ def imzml(
 
     path = Path(path)
     head = _header(path)
+    _check_ibd_checksum(path, head)
 
     source: Any = str(path)
     ibd: Any = INFER_IBD_FROM_IMZML
@@ -156,7 +158,15 @@ def imzml(
         space = f"mz_top{len(top)}_{ppm:g}ppm"
     var.index = pd.Index([f"mz_{mz:.4f}" for mz in var["mz"]])
 
-    X, tic, n_peaks, mz_range = _count(parser, lookup, len(var), ibd_path)
+    window = _scan_window(head)
+    X, tic, n_peaks, mz_range, undecodable = _count(parser, lookup, len(var), ibd_path, window)
+    if n_bad := int(undecodable.sum()):
+        what = f"{path.name}: {n_bad} of {len(coords)} spectra have decreasing m/z" + (
+            f" or m/z outside the declared scan window {window[0]:g}-{window[1]:g}" if window else ""
+        )
+        if n_bad > _MAX_UNDECODABLE * len(coords):
+            raise ValueError(f"{what}: the .ibd does not decode with this .imzML.")
+        logger.warning(what)
     keep = np.flatnonzero((n_peaks > 0) & ~unplaced)
     xy = coords[keep, :2]
 
@@ -197,6 +207,7 @@ def imzml(
         "ppm": ppm,
         "ppm_source": ppm_source,
         "feature_space": space,
+        "n_spectra_undecodable": n_bad,
         "n_features": len(var),
         "n_pixels_empty": int((~unplaced).sum() - len(keep)),
         "pixel_size_um": px,
@@ -309,6 +320,34 @@ def _sdata_3d(
         for name in names
     }
     return SpatialData(shapes=shapes, tables={"table": table})
+
+
+_MAX_UNDECODABLE = 0.01  # share of spectra that may fail the decode check before the file is refused
+_WINDOW_MARGIN = 1e-3  # relative slack on the declared scan window
+_IBD_CHECKSUMS = {"IMS:1000091": "sha1", "IMS:1000090": "md5"}  # "ibd SHA-1", "ibd MD5"
+
+
+def _check_ibd_checksum(path: Path, head: str) -> None:
+    """Raise when the .ibd's SHA-1 or MD5 differs from the one the imzML declares (MTBLS2960: a mismatched .ibd)."""
+    for accession, algorithm in _IBD_CHECKSUMS.items():
+        if m := re.search(rf'accession="{accession}"[^>]*value="([0-9a-fA-F]+)"', head):
+            digest = hashlib.new(algorithm)
+            with open(_ibd_path(path), "rb") as f:
+                while chunk := f.read(1 << 24):
+                    digest.update(chunk)
+            if digest.hexdigest().lower() != m[1].lower():
+                raise ValueError(
+                    f"{path.name}: the .ibd {algorithm} is {digest.hexdigest()}, but the imzML declares {m[1].lower()}: "
+                    "the .ibd does not belong to this .imzML."
+                )
+            return
+
+
+def _scan_window(head: str) -> tuple[float, float] | None:
+    """The declared m/z acquisition range: the widest scan window lower/upper limit in the header, if stated."""
+    lo = [float(v) for v in re.findall(r'accession="MS:1000501"[^>]*value="([-0-9.eE+]+)"', head)]
+    hi = [float(v) for v in re.findall(r'accession="MS:1000500"[^>]*value="([-0-9.eE+]+)"', head)]
+    return (min(lo), max(hi)) if lo and hi else None
 
 
 def _ibd_path(path: Path) -> Path:
@@ -468,11 +507,19 @@ def _deposited_lookup(feat: np.ndarray, tol: float) -> Any:
 
 
 def _count(
-    parser: Any, lookup: Any, n_feat: int, ibd_path: Path | None = None
-) -> tuple[sp.csr_matrix, np.ndarray, np.ndarray, tuple[float, float]]:
-    """Pixels x features CSR of summed intensities, the TIC and number of peaks per pixel, and the m/z range."""
+    parser: Any,
+    lookup: Any,
+    n_feat: int,
+    ibd_path: Path | None = None,
+    window: tuple[float, float] | None = None,
+) -> tuple[sp.csr_matrix, np.ndarray, np.ndarray, tuple[float, float], np.ndarray]:
+    """Pixels x features CSR of summed intensities, TIC and peaks per pixel, m/z range, and decode-check failures.
+
+    A spectrum fails the decode check when its m/z decreases, or lies outside the declared scan ``window``.
+    """
     n = len(parser.coordinates)
     tic, n_peaks = np.zeros(n), np.zeros(n, dtype=np.int64)
+    undecodable = np.zeros(n, dtype=bool)
     blocks: list[sp.csr_matrix] = []
     lo, hi, done = np.inf, -np.inf, 0
     for pix, mz, it in _spectra(parser, ibd_path):
@@ -480,6 +527,11 @@ def _count(
         n_peaks += np.bincount(pix, minlength=n)
         if len(mz):
             lo, hi = min(lo, float(mz.min())), max(hi, float(mz.max()))
+            undecodable[pix[1:][(np.diff(mz) < 0) & (pix[1:] == pix[:-1])]] = True
+            if window is not None:
+                undecodable[pix[(mz < window[0] * (1 - _WINDOW_MARGIN)) | (mz > window[1] * (1 + _WINDOW_MARGIN))]] = (
+                    True
+                )
         f = lookup(mz)
         m = f >= 0
         # stacked row blocks: adding n x n_feat blocks was quadratic in the number of batches. Each block runs from
@@ -488,4 +540,4 @@ def _count(
         blocks.append(sp.csr_matrix((it[m].astype(np.float32), (pix[m] - done, f[m])), shape=(end - done, n_feat)))
         done = end
     blocks.append(sp.csr_matrix((n - done, n_feat), dtype=np.float32))  # trailing spectra without peaks
-    return sp.vstack(blocks, format="csr"), tic, n_peaks, (lo, hi)
+    return sp.vstack(blocks, format="csr"), tic, n_peaks, (lo, hi), undecodable

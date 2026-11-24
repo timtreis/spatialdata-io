@@ -292,3 +292,45 @@ def test_memmap_path_matches_pyimzml(tmp_path: Path, mode: str, monkeypatch: pyt
     assert (fast.X != slow.X).nnz == 0 and fast.X.dtype == slow.X.dtype
     pd.testing.assert_frame_equal(fast.var, slow.var)
     pd.testing.assert_frame_equal(fast.obs, slow.obs)
+
+
+def test_ibd_that_does_not_match_its_imzml_is_refused(tmp_path: Path) -> None:
+    # MTBLS2960: the published .ibd is not the one the imzML's "ibd SHA-1" names
+    path = _write(tmp_path / "s.imzML", extra_settings=_PIXEL_SIZE)
+    ibd = tmp_path / "s.ibd"
+    data = bytearray(ibd.read_bytes())
+    data[-1] ^= 0xFF
+    ibd.write_bytes(bytes(data))
+    with pytest.raises(ValueError, match="does not belong to this .imzML"):
+        imzml(path)
+
+
+def _write_many(path: Path, n: int, bad: int) -> Path:
+    """``n`` spectra on a row; the first ``bad`` of them have decreasing m/z (a mis-decoded .ibd)."""
+    with ImzMLWriter(str(path), mode="processed") as w:
+        for i in range(n):
+            mz = [300.0, 200.0, 100.0] if i < bad else [100.0, 200.0, 300.0]
+            w.addSpectrum(np.array(mz), np.array([1.0, 2.0, 3.0], dtype=np.float32), (i + 1, 1, 1))
+    text = path.read_text()
+    marker = 'name="max count of pixels y"'
+    line_end = text.index("/>", text.index(marker)) + 2
+    path.write_text(text[:line_end] + _PIXEL_SIZE + text[line_end:])
+    return path
+
+
+def test_spectra_failing_the_decode_check(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    with pytest.raises(ValueError, match="2 of 100 spectra have decreasing m/z"):
+        imzml(_write_many(tmp_path / "bad.imzML", 100, 2))  # above 1%: refused
+    sdata = imzml(_write_many(tmp_path / "ok.imzML", 200, 1))  # at or below 1%: kept, counted and logged
+    assert sdata["table"].uns["spatialdata_io"]["n_spectra_undecodable"] == 1
+    assert "1 of 200 spectra have decreasing m/z" in caplog.text
+
+
+def test_mz_outside_the_declared_scan_window_fails_the_decode_check(tmp_path: Path) -> None:
+    window = (
+        '<cvParam cvRef="MS" accession="MS:1000501" name="scan window lower limit" value="150.0"/>'
+        '<cvParam cvRef="MS" accession="MS:1000500" name="scan window upper limit" value="500.0"/>'
+    )
+    path = _write(tmp_path / "w.imzML", extra_settings=_PIXEL_SIZE + window)  # two spectra start at m/z 100
+    with pytest.raises(ValueError, match="outside the declared scan window 150-500"):
+        imzml(path)
