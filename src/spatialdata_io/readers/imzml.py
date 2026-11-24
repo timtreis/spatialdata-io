@@ -95,7 +95,7 @@ def imzml(
     centroid), before the feature summary, so it's larger than the row sum of the kept features.
     """
     try:
-        from pyimzml.ImzMLParser import INFER_IBD_FROM_IMZML, ImzMLParser
+        from pyimzml.ImzMLParser import ImzMLParser
     except ImportError as e:  # pragma: no cover
         raise ImportError("imzml() needs pyimzml: pip install 'spatialdata-io[imzml]'.") from e
 
@@ -103,12 +103,9 @@ def imzml(
     head = _header(path)
     checksum_mismatch = _check_ibd_checksum(path, head)
 
-    source: Any = str(path)
-    ibd: Any = INFER_IBD_FROM_IMZML
     data, repairs = _repaired_header(path, head)
-    if data is not None:
-        source = io.BytesIO(data)
-        ibd = open(_ibd_path(path), "rb")  # kept open: the parser reads spectra from it lazily
+    source: Any = str(path) if data is None else io.BytesIO(data)
+    ibd = open(_ibd_path(path), "rb")  # kept open: the parser reads spectra from it lazily
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)  # pyimzml warns about outdated ontology term names
         parser = ImzMLParser(source, ibd_file=ibd)
@@ -440,8 +437,15 @@ def _scan_window(head: str) -> tuple[float, float] | None:
 
 
 def _ibd_path(path: Path) -> Path:
-    """The ``.ibd`` next to ``path``, matching the extension case-insensitively."""
+    """The ``.ibd`` next to ``path``, matching the extension case-insensitively.
+
+    A folder holding one ``.imzML`` and one ``.ibd`` pairs them whatever their names (S-BIAD993: ``File1_x_imzml_data.imzml``
+    beside ``File2_x_ibd_data.ibd``).
+    """
     hits = [p for p in path.parent.glob(f"{path.stem}.*") if p.suffix.lower() == ".ibd"]
+    if not hits:
+        by_suffix = [[p for p in path.parent.iterdir() if p.suffix.lower() == s] for s in (".imzml", ".ibd")]
+        hits = by_suffix[1] if [len(b) for b in by_suffix] == [1, 1] else []
     if not hits:
         raise FileNotFoundError(f"No .ibd next to {path}.")
     return hits[0]

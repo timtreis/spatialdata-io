@@ -453,3 +453,13 @@ def test_unsorted_shared_mz_array_is_not_a_decode_failure(tmp_path: Path) -> Non
     end = text.index("/>", text.index('name="max count of pixels y"')) + 2
     path.write_text(text[:end] + _PIXEL_SIZE + text[end:])
     assert imzml(path)["table"].uns["spatialdata_io"]["n_spectra_undecodable"] == 0
+
+
+def test_lone_ibd_with_another_name_is_paired(tmp_path: Path) -> None:
+    # S-BIAD993: File1_brain_coronal_imzml_data.imzml beside File2_brain_coronal_ibd_data.ibd
+    path = _write(tmp_path / "s.imzML", extra_settings=_PIXEL_SIZE)
+    (tmp_path / "s.ibd").rename(tmp_path / "other.ibd")
+    assert imzml(path)["table"].n_obs == len(_SPECTRA)
+    (tmp_path / "t.imzML").write_bytes(path.read_bytes())
+    with pytest.raises(FileNotFoundError, match="No .ibd"):
+        imzml(path)
