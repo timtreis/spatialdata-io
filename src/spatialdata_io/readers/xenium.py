@@ -1163,6 +1163,8 @@ def _get_images(
     # without dask_image options, read by the file's own tiles: imread makes each whole plane one chunk, and a
     # 4-channel 81664x54001 morphology_focus then decodes 4 x 8.8 GB planes at once (GEO GSM8978583: OOM at 64 GB)
     image = imread(path / file, **imread_kwargs) if imread_kwargs else _tiled_imread(path / file)[0]
+    if image.ndim == 2:  # tifffile drops a single channel (pre-2.0 morphology_mip); dask_image.imread kept it
+        image = image[None]
     if "c_coords" in image_models_kwargs and "dummy" in image_models_kwargs["c_coords"]:
         # Napari currently interprets 4 channel images as RGB; a series of PRs to fix this is almost ready but they will
         # not be merged soon.

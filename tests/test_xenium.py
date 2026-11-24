@@ -706,6 +706,12 @@ def test_xenium_images_are_read_by_their_tiles(tmp_path: Path) -> None:
     assert image.data.chunksize == (1, 16, 16)
     np.testing.assert_array_equal(image.data.compute(), data)
 
+    one = np.arange(64 * 48, dtype=np.uint16).reshape(1, 64, 48)  # a single-channel mip keeps its c axis
+    tifffile.imwrite(tmp_path / "mip.ome.tif", one, tile=(16, 16), metadata={"axes": "CYX"})
+    image = _get_images(tmp_path, "mip.ome.tif")
+    assert image.dims == ("c", "y", "x") and image.shape == (1, 64, 48)
+    np.testing.assert_array_equal(image.data.compute(), one)
+
 
 def test_labels_from_boundaries_tiled_match_one_fill(monkeypatch: pytest.MonkeyPatch) -> None:
     """Labels rebuilt from polygons tile by tile equal one fill of the whole raster (overlaps: later polygon wins)."""
