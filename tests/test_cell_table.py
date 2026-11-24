@@ -82,6 +82,33 @@ def test_unit_required(csv: Path) -> None:
         cell_table(csv, unit="inch")  # type: ignore[arg-type]
 
 
+def test_feature_types_split_columns_of_another_unit(tmp_path: Path) -> None:
+    # zenodo:4953173: sequential-FISH intensities (fluorescence per µm³) in the same matrix as the MERFISH genes
+    units = {"Gene Expression": "counts", "Blank Codeword": "counts", "Fluorescence": "fluorescence per µm³"}
+    sdata = cell_table(
+        _write(tmp_path / "f.csv"), unit="um", feature_types={"GeneB": "Fluorescence"}, feature_units=units
+    )
+    main, fl = sdata.tables["table"], sdata.tables["table_fluorescence"]
+    assert list(main.var_names) == ["GeneA", "Blank-1"] and list(fl.var_names) == ["GeneB"]
+    assert fl.X.toarray().ravel().tolist() == [2, 0, 5] and fl.var["unit"].tolist() == ["fluorescence per µm³"]
+    assert "split by unit" in fl.uns["spatialdata_io"]["feature_split"]
+    with pytest.raises(ValueError, match="does not have"):
+        cell_table(_write(tmp_path / "f.csv"), unit="um", feature_types={"Fos": "Fluorescence"})
+    with pytest.raises(ValueError, match="no unit"):
+        cell_table(_write(tmp_path / "f.csv"), unit="um", feature_types={"GeneB": "Fluorescence"}, feature_units={})
+
+
+def test_feature_types_keep_missing_values_of_typed_columns(tmp_path: Path) -> None:
+    # zenodo:4953173: Fos is empty for the naive animals (not measured); a missing gene count still raises
+    rows = [r.rsplit(",", 2)[0] + ",," + r.rsplit(",", 1)[1] if i == 0 else r for i, r in enumerate(ROWS)]
+    sdata = cell_table(
+        _write(tmp_path / "f.csv", rows), unit="um", keep_noninteger=True, feature_types={"GeneB": "Fluorescence"}
+    )
+    assert np.isnan(sdata.tables["table_fluorescence"].X.toarray()[0, 0])
+    with pytest.raises(ValueError, match="missing values"):
+        cell_table(_write(tmp_path / "f.csv", rows), unit="um", keep_noninteger=True)
+
+
 def test_normalized_counts_rejected(tmp_path: Path) -> None:
     rows = [ROWS[0].replace(",1,2,0", ",0.5,2,0"), *ROWS[1:]]
     with pytest.raises(ValueError, match="non-integer"):

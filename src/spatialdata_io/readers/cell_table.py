@@ -23,7 +23,7 @@ from spatialdata_io.readers._utils._features import (
 from spatialdata_io.readers._utils._utils import _set_observation_unit, _set_reader_metadata
 
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Collection, Mapping, Sequence
 
 __all__ = ["cell_table"]
 
@@ -124,6 +124,8 @@ def _build(
     var: pd.DataFrame | None = None,
     controls: Literal["keep", "drop"] = "keep",
     keep_noninteger: bool = False,
+    feature_types: Mapping[str, str] | None = None,
+    feature_units: Mapping[str, str] | None = None,
 ) -> SpatialData:
     """Validate counts and assemble the SpatialData object.
 
@@ -144,7 +146,7 @@ def _build(
     var
         Per-feature metadata indexed by ``var_names`` (e.g. from an h5ad file), kept in ``table.var``. Its
         ``feature_types`` column, if any, types the features instead of the names.
-    controls, keep_noninteger
+    controls, keep_noninteger, feature_types, feature_units
         See :func:`cell_table`.
     """
     for col in (x, y):
@@ -191,7 +193,9 @@ def _build(
             raise ValueError(f"Cell ids are not unique after prefixing them with the split value, for example {dup}.")
 
     csr = sp.csr_matrix(cast("Any", X.to_numpy() if isinstance(X, pd.DataFrame) else X))
-    integer = bool(np.all(np.mod(csr.data, 1) == 0))
+    # NaN in a typed non-count column (zenodo:4953173: no Fos for the naive animals) means "not measured"
+    nan_ok = np.isin(np.asarray(var_names), list(feature_types or ()))[csr.indices] & np.isnan(csr.data)
+    integer = not nan_ok.any() and bool(np.all(np.mod(csr.data, 1) == 0))
     if not integer and not keep_noninteger:
         raise ValueError(
             "Found non-integer values in the counts; this looks like a normalized matrix. "
@@ -202,7 +206,7 @@ def _build(
         fits = csr.data.size == 0 or (csr.data.min() >= 0 and csr.data.max() <= i32.max)
         x_dtype = "int32" if fits else "int64"
     else:
-        if not np.all(np.isfinite(csr.data)) or csr.data.min() < 0:
+        if not np.all(np.isfinite(csr.data[~nan_ok])) or np.nanmin(csr.data) < 0:
             raise ValueError(
                 "Found negative, NaN or infinite values in the matrix; keep_noninteger only keeps finite values >= 0."
             )
@@ -219,6 +223,14 @@ def _build(
     var_frame = var.copy() if var is not None else pd.DataFrame(index=var_names)
     if FEATURE_TYPES not in var_frame:
         var_frame[FEATURE_TYPES] = feature_types_by_name(var_frame.index, BLANK_NAME_RULES)
+    if feature_types:
+        if missing := sorted(set(feature_types) - set(var_frame.index)):
+            raise ValueError(f"feature_types names columns the table does not have: {missing[:5]}")
+        var_frame[FEATURE_TYPES] = [feature_types.get(n, t) for n, t in var_frame[FEATURE_TYPES].items()]
+    if feature_units is not None:
+        if missing := sorted(set(var_frame[FEATURE_TYPES]) - set(feature_units)):
+            raise ValueError(f"feature_units gives no unit for the feature type(s) {missing}")
+        var_frame["unit"] = var_frame[FEATURE_TYPES].map(feature_units)
     adata = ad.AnnData(X=csr, obs=obs, var=var_frame)
     adata.obsm["spatial"] = obs[[x, y]].to_numpy(dtype=float)
 
@@ -252,6 +264,8 @@ def _build(
         "integer_counts": integer,
         "n_coordinates_unmatched": n_coordinates_unmatched,
     }
+    if feature_types:
+        table.uns["spatialdata_io"]["feature_split"] = "the deposit stored these features in one matrix; split by unit"
     sdata = SpatialData(shapes=shapes_by_region, tables=split_by_feature_type(table, controls=controls))
     for table in sdata.tables.values():
         _set_observation_unit(table, "cell", None)
@@ -267,6 +281,7 @@ def _read_wide(
     split_by: str | None,
     metadata_columns: Sequence[str] | None,
     skiprows: int,
+    nan_ok: Collection[str] = (),
 ) -> tuple[pd.DataFrame, pd.Index, pd.DataFrame]:
     header = _read_delimited(counts, skiprows, nrows=0).columns
     id_col = cell_id if cell_id is not None else header[0]
@@ -288,7 +303,7 @@ def _read_wide(
         for i, c in enumerate(df.columns)
         if c != id_col and c not in meta and not (i > 0 and str(c).startswith("Unnamed:"))
     ]
-    bad = [c for c in gene_cols if not pd.api.types.is_numeric_dtype(df[c]) or df[c].isna().any()]
+    bad = [c for c in gene_cols if not pd.api.types.is_numeric_dtype(df[c]) or (c not in nan_ok and df[c].isna().any())]
     if bad:
         raise ValueError(
             f"Gene columns {bad[:5]} in {counts.name} are non-numeric or contain missing values; "
@@ -570,6 +585,8 @@ def cell_table(
     area_column: str | None = None,
     controls: Literal["keep", "drop"] = "keep",
     keep_noninteger: bool = False,
+    feature_types: Mapping[str, str] | None = None,
+    feature_units: Mapping[str, str] | None = None,
 ) -> SpatialData:
     """Read a cell x gene counts table with per-cell centroids.
 
@@ -647,6 +664,13 @@ def cell_table(
         stored as ``float32``, instead of raising. Negative, NaN and infinite values still raise. An integer
         matrix keeps the integer dtype either way. ``table.uns["spatialdata_io"]["integer_counts"]`` records
         whether the values are integer counts.
+    feature_types
+        Feature type by column name, for columns the deposit stores in the same matrix in another unit (e.g.
+        ``{"Fos": "Fluorescence"}`` for sequential-FISH intensities next to MERFISH counts); a type other than gene
+        or control goes to its own ``table_<type>``. Unnamed columns keep their type by name. A missing value in a
+        typed column is kept as NaN (not measured, e.g. no Fos for the naive animals); counts stay NaN-free.
+    feature_units
+        Unit by feature type, written to ``var["unit"]``; every type in the table needs one.
 
     Returns
     -------
@@ -709,6 +733,7 @@ def cell_table(
             split_by=split_by,
             metadata_columns=metadata_columns,
             skiprows=skiprows,
+            nan_ok=feature_types or (),
         )
     if var is not None:
         var_names = var.index
@@ -729,5 +754,7 @@ def cell_table(
         var=var,
         controls=controls,
         keep_noninteger=keep_noninteger,
+        feature_types=feature_types,
+        feature_units=feature_units,
     )
     return sdata
