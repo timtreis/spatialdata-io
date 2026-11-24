@@ -8,6 +8,7 @@ import math
 import re
 import shutil
 import subprocess
+from io import BytesIO, StringIO
 from typing import TYPE_CHECKING, Any, cast
 
 import dask.array as da
@@ -299,7 +300,7 @@ def _read_expr_mat_polars(
         The cell expression table and, if any ``cell_ID == 0`` rows were present, those rows as read: ``fov``, the
         slide column when there is one, and every feature column, one row per exprMat row.
     """
-    schema = pl.read_csv(expr_path, n_rows=100).schema
+    schema = pl.read_csv(expr_path, n_rows=100, null_values=["NA"]).schema  # as pyarrow reads it below
     # Some GEO exports key cells only by the AtoMx string id (`cell_id` = c_<slide>_<fov>_<cell>, no fov column).
     id_col = next((c for c in ("cell_ID", "cell_id", "cell") if c in schema), None)
     if id_col is None:
@@ -332,25 +333,62 @@ def _read_expr_mat_polars(
         )
 
     obs_parts, bg_parts, x_parts = [prep(pl.DataFrame(types.empty_table())).select(obs_cols)], [], []
+    split_parts: list[pl.DataFrame] = []
+    short_rows: list[str] = []  # lines with fewer fields than the header (a split cell, sddb_kdbxjw425i)
+
+    def keep_short(row: Any) -> str:
+        short_rows.append(row.text)
+        return "skip"
+
+    def add(batch: pl.DataFrame) -> None:
+        is_bg = batch["cell_ID"] == 0
+        if is_bg.any():
+            bg_parts.append(batch.filter(is_bg).select(bg_cols))
+            batch = batch.filter(~is_bg)
+        if sum(batch.select(expr_cols).null_count().row(0)):  # a cell written one value per row (sddb_njfiyowyqo)
+            is_split = batch.select(pl.any_horizontal(pl.col(expr_cols).is_null())).to_series()
+            split_parts.append(batch.filter(is_split))
+            batch = batch.filter(~is_split)
+        obs_parts.append(batch.select(obs_cols))
+        x_parts.append(scipy.sparse.csr_matrix(batch.select(expr_cols).to_numpy()))
+
     with gzip.open(expr_path, "rb") if expr_path.suffix == ".gz" else open(expr_path, "rb") as fin:
         reader = pacsv.open_csv(
             fin,
             read_options=pacsv.ReadOptions(block_size=_EXPR_BLOCK_BYTES),
+            parse_options=pacsv.ParseOptions(invalid_row_handler=keep_short),
             convert_options=pacsv.ConvertOptions(column_types=types),
         )
         seen = 0
         for block in reader:
             if n_rows is not None:
                 block, seen = block.slice(0, n_rows - seen), seen + block.num_rows
-            batch = prep(pl.DataFrame(pa.Table.from_batches([block])))
-            is_bg = batch["cell_ID"] == 0
-            if is_bg.any():
-                bg_parts.append(batch.filter(is_bg).select(bg_cols))
-                batch = batch.filter(~is_bg)
-            obs_parts.append(batch.select(obs_cols))
-            x_parts.append(scipy.sparse.csr_matrix(batch.select(expr_cols).to_numpy()))
+            add(prep(pl.DataFrame(pa.Table.from_batches([block]))))
             if n_rows is not None and seen >= n_rows:
                 break
+    # a cell's rows can straddle read blocks; short and NA-padded rows are rebuilt apart (a cell never mixes them)
+    split_parts = [pl.concat(split_parts)] if split_parts else []
+    if short_rows:
+        rows = list(csv.reader(short_rows))
+        if any(len(r) > len(schema) for r in rows):
+            raise ValueError(f"{expr_path.name}: rows with more fields than the header")
+        buf = StringIO()
+        csv.writer(buf).writerows(r + [""] * (len(schema) - len(r)) for r in rows)
+        padded = pacsv.read_csv(
+            BytesIO(buf.getvalue().encode()),
+            read_options=pacsv.ReadOptions(column_names=list(schema)),
+            convert_options=pacsv.ConvertOptions(column_types=types),
+        )
+        n_before = len(split_parts)
+        add(prep(pl.DataFrame(padded)))
+        if len(split_parts) == n_before:  # short rows are all null after the first gene, so they must be split
+            raise ValueError(f"{expr_path.name}: short rows that are not a split cell")
+    rebuilt: list[str] = []
+    for part in split_parts:
+        obs, x = _rebuild_split_cells(part, obs_cols, expr_cols, expr_path.name)
+        obs_parts.append(obs)
+        x_parts.append(x)
+        rebuilt += obs["fov_cellID"].to_list()
 
     bg_df: pd.DataFrame | None = None
     if bg_parts:
@@ -365,8 +403,41 @@ def _read_expr_mat_polars(
     obs = _index_by_cell(pl.concat(obs_parts).to_pandas(), expr_path.name)
     X = scipy.sparse.vstack(x_parts, format="csr") if x_parts else scipy.sparse.csr_matrix((0, len(expr_cols)))
     var = pd.DataFrame({"gene": expr_cols}).set_index("gene")
+    adata = AnnData(X=X, obs=obs, var=var)
+    if rebuilt:
+        logger.warning(
+            "%s: %d cell(s) were written one value per row; rebuilt in gene-column order: %s",
+            expr_path.name,
+            len(rebuilt),
+            rebuilt,
+        )
+        adata.uns["spatialdata_io"] = {
+            "split_cells_rebuilt": rebuilt,
+            "split_cells_rule": "the cell's rows number the gene columns, each holds one value in the first gene "
+            "column, and row k is gene column k",
+        }
+    return adata, bg_df
 
-    return AnnData(X=X, obs=obs, var=var), bg_df
+
+def _rebuild_split_cells(
+    rows: pl.DataFrame, obs_cols: list[str], expr_cols: list[str], name: str
+) -> tuple[pl.DataFrame, scipy.sparse.csr_matrix]:
+    """One row per cell from cells written as one value per row, the k-th row being gene column k; else raise."""
+    rest = expr_cols[1:]
+    if (
+        rows.select(pl.any_horizontal(pl.col(expr_cols[0]).is_null(), *[pl.col(c).is_not_null() for c in rest]))
+        .to_series()
+        .any()
+    ):
+        raise ValueError(f"{name}: rows with missing values that are not one value in the first gene column")
+    cells = rows.group_by("fov_cellID", maintain_order=True).agg(
+        *[pl.col(c).first() for c in obs_cols if c != "fov_cellID"], pl.col(expr_cols[0]).alias("_v")
+    )
+    bad = cells.filter(pl.col("_v").list.len() != len(expr_cols))["fov_cellID"].to_list()
+    if bad:
+        raise ValueError(f"{name}: split cell(s) {bad[:5]} do not have one row per gene column ({len(expr_cols)})")
+    x = scipy.sparse.csr_matrix(np.vstack(cells["_v"].to_list()))
+    return cells.select(obs_cols), x
 
 
 _EXPR_BLOCK_BYTES = 16 << 20  # CSV text per block: ~0.5 GB dense for 19k int64 genes

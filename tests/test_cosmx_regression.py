@@ -2199,6 +2199,42 @@ class TestExprMatMetadataColumns:
         assert adata.X.toarray().tolist() == full.X.toarray().tolist() == [[0, 5], [3, 0], [1, 2]]
         assert bg.equals(full_bg) and bg.values.tolist() == [[1, 9, 7], [2, 8, 6]]
 
+    @pytest.mark.parametrize("pad", ["NA", None])  # NA-padded lines (sddb_njfiyowyqo), short lines (sddb_kdbxjw425i)
+    @pytest.mark.parametrize("block", [None, 40])  # 40 bytes: the cell's rows straddle read blocks
+    def test_split_cell_rebuilt_in_gene_order(self, tmp_path, monkeypatch, pad, block):
+        from spatialdata_io.readers.cosmx import _io
+        from spatialdata_io.readers.cosmx._io import _read_expr_mat_polars
+
+        if block:
+            monkeypatch.setattr(_io, "_EXPR_BLOCK_BYTES", block)
+
+        tail = "" if pad is None else f",{pad},{pad}"
+        p = tmp_path / "x_exprMat_file.csv"
+        p.write_text(
+            "fov,cell_ID,cell,G1,G2,G3\n1,1,c_1_1_1,1,2,3\n"
+            + "".join(f"1,2,c_1_1_2,{v}{tail}\n" for v in (4, 0, 6))
+            + "1,3,c_1_1_3,7,8,9\n"
+        )
+        adata, _ = _read_expr_mat_polars(p)
+        assert adata.obs_names.tolist() == ["1_1", "1_3", "1_2"]
+        assert adata.X.toarray().tolist() == [[1, 2, 3], [7, 8, 9], [4, 0, 6]]
+        assert adata.uns["spatialdata_io"]["split_cells_rebuilt"] == ["1_2"]
+
+    @pytest.mark.parametrize(
+        "rows",
+        [
+            "1,2,c_1_1_2,4,NA,NA\n1,2,c_1_1_2,0,NA,NA\n",
+            "1,2,c_1_1_2,4,NA,5\n1,2,c_1_1_2,0,NA,NA\n1,2,c_1_1_2,6,NA,NA\n",
+        ],
+    )
+    def test_split_cell_not_one_value_per_gene_raises(self, tmp_path, rows):
+        from spatialdata_io.readers.cosmx._io import _read_expr_mat_polars
+
+        p = tmp_path / "x_exprMat_file.csv"
+        p.write_text("fov,cell_ID,cell,G1,G2,G3\n1,1,c_1_1_1,1,2,3\n" + rows)
+        with pytest.raises(ValueError, match="gene column"):
+            _read_expr_mat_polars(p)
+
     def test_r_exported_rownames_and_metadata(self, tmp_path):
         from spatialdata_io.readers.cosmx._io import _read_expr_mat_polars
 

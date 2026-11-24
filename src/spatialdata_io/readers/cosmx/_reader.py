@@ -999,12 +999,14 @@ class CosMxDatasetReader:
         if by_slide:
             # fov * base + cell_ID repeats across slides, so number the cells instead
             obs["global_cell_id"] = np.arange(1, adata.n_obs + 1, dtype=int)
-            adata.uns["spatialdata_io"] = {
-                "instance_id_includes_slide": True,
-                "slide_column": by_slide,
-                "reason": "fov_cell ids repeat across the slides of one export; cells are keyed <slide>_<fov>_<cell> "
-                "and global_cell_id is the row number",
-            }
+            adata.uns.setdefault("spatialdata_io", {}).update(
+                {
+                    "instance_id_includes_slide": True,
+                    "slide_column": by_slide,
+                    "reason": "fov_cell ids repeat across the slides of one export; cells are keyed <slide>_<fov>_<cell> "
+                    "and global_cell_id is the row number",
+                }
+            )
         elif "fov" in obs.columns and "cell_ID" in obs.columns:
             tmp = obs.reset_index(drop=False)
             tmp["global_cell_id"] = self.global_cell_id(tmp)
