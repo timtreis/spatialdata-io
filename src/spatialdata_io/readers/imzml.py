@@ -101,7 +101,7 @@ def imzml(
 
     path = Path(path)
     head = _header(path)
-    _check_ibd_checksum(path, head)
+    checksum_mismatch = _check_ibd_checksum(path, head)
 
     source: Any = str(path)
     ibd: Any = INFER_IBD_FROM_IMZML
@@ -172,7 +172,8 @@ def imzml(
         what = f"{path.name}: {n_bad} of {len(coords)} spectra have decreasing m/z" + (
             f" or m/z outside the declared scan window {window[0]:g}-{window[1]:g}" if window else ""
         )
-        if n_bad > _MAX_UNDECODABLE * len(coords):
+        # a replaced .ibd (e.g. a recalibrated one) can decode fine; with a checksum mismatch too, it does not belong
+        if n_bad > _MAX_UNDECODABLE * len(coords) or checksum_mismatch:
             raise ValueError(f"{what}: the .ibd does not decode with this .imzML.")
         logger.warning(what)
     keep = np.flatnonzero((n_peaks > 0) & ~unplaced)
@@ -218,6 +219,7 @@ def imzml(
         "ppm_source": ppm_source,
         "feature_space": space,
         "n_spectra_undecodable": n_bad,
+        "ibd_checksum_mismatch": checksum_mismatch,
         "n_features": len(var),
         "n_pixels_empty": int((~unplaced).sum() - len(keep)),
         "pixel_size_um": px,
@@ -354,13 +356,16 @@ _WINDOW_MARGIN = 1e-3  # relative slack on the declared scan window
 _IBD_CHECKSUMS = {"IMS:1000091": "sha1", "IMS:1000090": "md5"}  # "ibd SHA-1", "ibd MD5"
 
 
-def _check_ibd_checksum(path: Path, head: str) -> None:
-    """Raise when the .ibd's SHA-1 or MD5 differs from the one the imzML declares (MTBLS2960: a mismatched .ibd)."""
+def _check_ibd_checksum(path: Path, head: str) -> dict[str, str] | None:
+    """Warn and return both hashes when the .ibd's SHA-1 or MD5 differs from the one the imzML declares.
+
+    The decode check then decides: a mismatched .ibd that also fails it is refused (MTBLS2960).
+    """
     for accession, algorithm in _IBD_CHECKSUMS.items():
         if m := re.search(rf'accession="{accession}"[^>]*value="([0-9a-fA-F]+)"', head):
             declared = m[1].lower()
             if not declared.strip("0"):  # value="0": a placeholder, no checksum (12 of 972 deposited imzML)
-                return
+                return None
             digest = hashlib.new(algorithm)
             with open(_ibd_path(path), "rb") as f:
                 while chunk := f.read(1 << 24):
@@ -368,11 +373,12 @@ def _check_ibd_checksum(path: Path, head: str) -> None:
             # one writer pads only the first byte (51 of 972 deposited imzML, MD5: 0DCD2BADDA658989C821C1FF58988F)
             d = digest.digest()
             if declared not in (digest.hexdigest(), f"{d[0]:02x}" + "".join(f"{b:x}" for b in d[1:])):
-                raise ValueError(
-                    f"{path.name}: the .ibd {algorithm} is {digest.hexdigest()}, but the imzML declares {declared}: "
-                    "the .ibd does not belong to this .imzML."
+                logger.warning(
+                    f"{path.name}: the .ibd {algorithm} is {digest.hexdigest()}, the imzML declares {declared}"
                 )
-            return
+                return {"algorithm": algorithm, "declared": declared, "ibd": digest.hexdigest()}
+            return None
+    return None
 
 
 def _scan_window(head: str) -> tuple[float, float] | None:

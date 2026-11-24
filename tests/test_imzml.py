@@ -294,14 +294,26 @@ def test_memmap_path_matches_pyimzml(tmp_path: Path, mode: str, monkeypatch: pyt
     pd.testing.assert_frame_equal(fast.obs, slow.obs)
 
 
-def test_ibd_that_does_not_match_its_imzml_is_refused(tmp_path: Path) -> None:
-    # MTBLS2960: the published .ibd is not the one the imzML's "ibd SHA-1" names
-    path = _write(tmp_path / "s.imzML", extra_settings=_PIXEL_SIZE)
-    ibd = tmp_path / "s.ibd"
+def _flip_last_ibd_byte(ibd: Path) -> None:
     data = bytearray(ibd.read_bytes())
     data[-1] ^= 0xFF
     ibd.write_bytes(bytes(data))
-    with pytest.raises(ValueError, match="does not belong to this .imzML"):
+
+
+def test_ibd_checksum_mismatch_alone_warns(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    # a replaced .ibd (e.g. *_recal_M2, *_fix) whose imzML header was never updated decodes fine: kept, both hashes kept
+    path = _write(tmp_path / "s.imzML", extra_settings=_PIXEL_SIZE)
+    _flip_last_ibd_byte(tmp_path / "s.ibd")
+    mismatch = imzml(path)["table"].uns["spatialdata_io"]["ibd_checksum_mismatch"]
+    assert mismatch["algorithm"] == "sha1" and mismatch["declared"] != mismatch["ibd"]
+    assert "the imzML declares" in caplog.text
+
+
+def test_ibd_checksum_mismatch_that_fails_decoding_is_refused(tmp_path: Path) -> None:
+    # MTBLS2960: the .ibd is not the one the imzML names, and spectra do not decode; 1 of 200 alone would be kept
+    path = _write_many(tmp_path / "s.imzML", 200, 1)
+    _flip_last_ibd_byte(tmp_path / "s.ibd")
+    with pytest.raises(ValueError, match="does not decode with this .imzML"):
         imzml(path)
 
 
@@ -312,9 +324,11 @@ def test_ibd_checksum_writer_quirks_are_accepted(tmp_path: Path, kind: str) -> N
 
     (tmp_path / "s.ibd").write_bytes(b"spectra")  # sha1 a1bbc6b19fb5f7015368195e...: byte 0x01 loses its zero
     value = "a1bbc6b19fb5f715368195eac56c776ba54141c" if kind == "unpadded" else "0"
-    _check_ibd_checksum(tmp_path / "s.imzML", f'<cvParam accession="IMS:1000091" value="{value}"/>')
-    with pytest.raises(ValueError, match="does not belong"):
-        _check_ibd_checksum(tmp_path / "s.imzML", '<cvParam accession="IMS:1000091" value="1a2b"/>')
+    assert _check_ibd_checksum(tmp_path / "s.imzML", f'<cvParam accession="IMS:1000091" value="{value}"/>') is None
+    assert (
+        _check_ibd_checksum(tmp_path / "s.imzML", '<cvParam accession="IMS:1000091" value="1a2b"/>')["declared"]
+        == "1a2b"
+    )
 
 
 def _write_many(path: Path, n: int, bad: int) -> Path:
