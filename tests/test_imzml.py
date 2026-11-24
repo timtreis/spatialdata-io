@@ -305,6 +305,18 @@ def test_ibd_that_does_not_match_its_imzml_is_refused(tmp_path: Path) -> None:
         imzml(path)
 
 
+@pytest.mark.parametrize("kind", ["unpadded", "placeholder"])
+def test_ibd_checksum_writer_quirks_are_accepted(tmp_path: Path, kind: str) -> None:
+    # 51 of 972 deposited imzML pad only the first digest byte; 12 declare value="0"
+    from spatialdata_io.readers.imzml import _check_ibd_checksum
+
+    (tmp_path / "s.ibd").write_bytes(b"spectra")  # sha1 a1bbc6b19fb5f7015368195e...: byte 0x01 loses its zero
+    value = "a1bbc6b19fb5f715368195eac56c776ba54141c" if kind == "unpadded" else "0"
+    _check_ibd_checksum(tmp_path / "s.imzML", f'<cvParam accession="IMS:1000091" value="{value}"/>')
+    with pytest.raises(ValueError, match="does not belong"):
+        _check_ibd_checksum(tmp_path / "s.imzML", '<cvParam accession="IMS:1000091" value="1a2b"/>')
+
+
 def _write_many(path: Path, n: int, bad: int) -> Path:
     """``n`` spectra on a row; the first ``bad`` of them have decreasing m/z (a mis-decoded .ibd)."""
     with ImzMLWriter(str(path), mode="processed") as w:

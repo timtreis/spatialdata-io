@@ -358,13 +358,18 @@ def _check_ibd_checksum(path: Path, head: str) -> None:
     """Raise when the .ibd's SHA-1 or MD5 differs from the one the imzML declares (MTBLS2960: a mismatched .ibd)."""
     for accession, algorithm in _IBD_CHECKSUMS.items():
         if m := re.search(rf'accession="{accession}"[^>]*value="([0-9a-fA-F]+)"', head):
+            declared = m[1].lower()
+            if not declared.strip("0"):  # value="0": a placeholder, no checksum (12 of 972 deposited imzML)
+                return
             digest = hashlib.new(algorithm)
             with open(_ibd_path(path), "rb") as f:
                 while chunk := f.read(1 << 24):
                     digest.update(chunk)
-            if digest.hexdigest().lower() != m[1].lower():
+            # one writer pads only the first byte (51 of 972 deposited imzML, MD5: 0DCD2BADDA658989C821C1FF58988F)
+            d = digest.digest()
+            if declared not in (digest.hexdigest(), f"{d[0]:02x}" + "".join(f"{b:x}" for b in d[1:])):
                 raise ValueError(
-                    f"{path.name}: the .ibd {algorithm} is {digest.hexdigest()}, but the imzML declares {m[1].lower()}: "
+                    f"{path.name}: the .ibd {algorithm} is {digest.hexdigest()}, but the imzML declares {declared}: "
                     "the .ibd does not belong to this .imzML."
                 )
             return
