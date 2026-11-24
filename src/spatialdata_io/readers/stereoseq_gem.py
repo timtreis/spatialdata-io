@@ -42,7 +42,8 @@ def stereoseq_gem(
     ``#key=value`` header lines (``FileFormat``, ``BinSize``, chip id, ``OffsetX``, ``OffsetY``). The output is the one
     :func:`spatialdata_io.stereoseq_gef` gives for the same inputs, with these differences:
 
-        - every table has the ``ExonCount`` sums as the layer ``"exon"`` (``X`` holds the ``MIDCount`` sums);
+        - every table has the ``ExonCount`` sums as the layer ``"exon"`` when the GEM has that column (``X`` holds the
+          ``MIDCount`` sums);
         - a cell's outline is the convex hull of its DNB squares (a GEM has no cell polygons and lists only the DNBs
           that captured reads), ``uns["spatialdata_io"]["cell_geometry"]`` says so, and its ``obs`` has ``dnbCount``
           only;
@@ -114,8 +115,14 @@ def _read_gem(path: Path, *, cells: bool) -> tuple[dict[str, str], pd.DataFrame]
                 break
             if m := _HEADER.match(line):
                 header[m[1]] = m[2]
-    dtype = {"geneID": "category", "x": np.int64, "y": np.int64, "MIDCount": np.int64, "ExonCount": np.int64}
-    df = pd.read_csv(path, sep="\t", comment="#", dtype=dtype | ({"CellID": np.int64} if cells else {}))
+    dtype = {"geneID": "category", "geneName": "category", "x": np.int64, "y": np.int64, "MIDCount": np.int64}
+    df = pd.read_csv(
+        path, sep="\t", comment="#", dtype=dtype | {"ExonCount": np.int64} | ({"CellID": np.int64} if cells else {})
+    )
+    if "geneID" not in df:  # some GEMs (sddb_5bfeslslkv) have only a geneName column; it names the features alike
+        if "geneName" not in df:
+            raise ValueError(f"{path.name} has neither a geneID nor a geneName column: {list(df.columns)}")
+        df = df.rename(columns={"geneName": "geneID"})
     if cells and "CellID" not in df:
         raise ValueError(f"{path.name} has no CellID column; pass it as `gem=`.")
     if (df["x"] < 0).any() or (df["y"] < 0).any():
@@ -140,11 +147,12 @@ def _bins(df: pd.DataFrame, bin_size: int, region: str, transform: dict) -> tupl
         return _bin_chunks(expression, gene, bin_size, chunk_rows=2**22)  # type: ignore[arg-type]
 
     keys, x_mat = matrix("MIDCount")
-    exon_keys, exon = matrix("ExonCount")  # a bin with no exon count is not in exon_keys
-    exon = coo_matrix(exon)
-    exon = csr_matrix((exon.data, (np.searchsorted(keys, exon_keys)[exon.row], exon.col)), shape=x_mat.shape)
     adata, squares = _bins_table(keys, x_mat, np.asarray(df["geneID"].cat.categories), bin_size, region, transform)
-    adata.layers["exon"] = exon
+    if "ExonCount" in df:  # absent from some GEMs (sddb_5bfeslslkv)
+        exon_keys, exon = matrix("ExonCount")  # a bin with no exon count is not in exon_keys
+        exon = coo_matrix(exon)
+        exon = csr_matrix((exon.data, (np.searchsorted(keys, exon_keys)[exon.row], exon.col)), shape=x_mat.shape)
+        adata.layers["exon"] = exon
     return adata, squares
 
 
@@ -154,7 +162,6 @@ def _cells(df: pd.DataFrame, region: str, transform: dict) -> tuple[ad.AnnData, 
     gene = df["geneID"].cat.codes.to_numpy()
     shape = (len(cell_ids), len(df["geneID"].cat.categories))
     x_mat = csr_matrix(coo_matrix((df["MIDCount"].to_numpy(), (cell, gene)), shape=shape))
-    exon = csr_matrix(coo_matrix((df["ExonCount"].to_numpy(), (cell, gene)), shape=shape))
     dnb = pd.DataFrame({"cell": cell, "x": df["x"].to_numpy(), "y": df["y"].to_numpy()}).drop_duplicates()
     dnb = dnb.sort_values("cell", kind="stable")
     # a GEM lists only the DNBs that captured reads (a median 83 per cell on zenodo:19524969 O2), so their union is
@@ -167,7 +174,8 @@ def _cells(df: pd.DataFrame, region: str, transform: dict) -> tuple[ad.AnnData, 
     obs["region"] = pd.Categorical([region] * len(cell_ids))
     obs["dnbCount"] = np.diff(bounds)
     adata = ad.AnnData(X=x_mat, obs=obs, var=pd.DataFrame(index=pd.Index(df["geneID"].cat.categories.astype(str))))
-    adata.layers["exon"] = exon
+    if "ExonCount" in df:
+        adata.layers["exon"] = csr_matrix(coo_matrix((df["ExonCount"].to_numpy(), (cell, gene)), shape=shape))
     centroid = dnb.groupby("cell")[["x", "y"]].mean().to_numpy() + 0.5
     adata.obsm["spatial"] = centroid
     gdf = GeoDataFrame(geometry=geoms, index=pd.Index(cell_ids))

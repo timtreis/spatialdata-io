@@ -70,3 +70,12 @@ def test_rejections(tmp_path: Path) -> None:
     gem = _write_gem(tmp_path / "GSM1_CHIP.tissue.gem", [("A", 1, 1, 1, 1)])
     with pytest.raises(ValueError, match="no CellID"):
         stereoseq_gem(cellbin_gem=gem)
+
+
+def test_gem_with_gene_name_column_and_no_header(tmp_path: Path) -> None:
+    # sddb_5bfeslslkv: "geneName x y MIDCount", no #header lines and no ExonCount
+    rows = [("Gnai3", 170, 8242, 1), ("Gnai3", 171, 8242, 3), ("Cd8a", 170, 8243, 2)]
+    path = tmp_path / "S.TissueCut.gem"
+    path.write_text("geneName\tx\ty\tMIDCount\n" + "".join("\t".join(map(str, r)) + "\n" for r in rows))
+    table = stereoseq_gem(path, bin_size=2)["table"]
+    assert sorted(table.var_names) == ["Cd8a", "Gnai3"] and table.X.sum() == 6
