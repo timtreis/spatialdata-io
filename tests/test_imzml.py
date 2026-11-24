@@ -334,3 +334,38 @@ def test_mz_outside_the_declared_scan_window_fails_the_decode_check(tmp_path: Pa
     path = _write(tmp_path / "w.imzML", extra_settings=_PIXEL_SIZE + window)  # two spectra start at m/z 100
     with pytest.raises(ValueError, match="outside the declared scan window 150-500"):
         imzml(path)
+
+
+def _write_tiled(path: Path, positions: list[tuple[float, float]]) -> Path:
+    """PXD038114-style export: position x/y is the truncated stage coordinate, the real one is 3DPositionX/Y."""
+    with ImzMLWriter(str(path), mode="processed") as w:
+        for x, y in positions:
+            w.addSpectrum(np.array([100.0, 200.0]), np.array([1.0, 2.0], dtype=np.float32), (int(x) + 8, int(y) + 2, 1))
+    text, out, start = path.read_text(), [], 0
+    for x, y in positions:  # one pair of userParams after each spectrum's position y
+        i = text.index('name="position y"', start)
+        j = text.index("/>", i) + 2
+        out.append(
+            text[start:j]
+            + f'<userParam name="3DPositionX" value="{x:.6f}" /><userParam name="3DPositionY" value="{y:.6f}" />'
+        )
+        start = j
+    path.write_text("".join(out) + text[start:])
+    return path
+
+
+def test_truncated_positions_are_placed_by_their_3dposition_grid(tmp_path: Path) -> None:
+    pos = [(-7.15 + 0.05 * i, -1.05 + 0.05 * j) for j in range(3) for i in range(4)]  # 12 spectra, 1 integer position
+    path = _write_tiled(tmp_path / "t.imzML", pos)
+    uns = (table := imzml(path, n_features=2)["table"]).uns["spatialdata_io"]
+    assert len(table) == 12 and uns["pitch_unknown"] and uns["pixel_size_source"] is None  # no unit: no pitch guessed
+    assert uns["positions_source"] == "3DPositionX/Y (unit not stated)" and uns["position_step"] == pytest.approx(0.05)
+    assert sorted(zip(table.obs["x"], table.obs["y"], strict=True)) == [
+        (i, j) for i in range(1, 5) for j in range(1, 4)
+    ]
+    np.testing.assert_allclose(sorted(table.obs["x_pos"]), sorted(x for x, _ in pos))
+    assert imzml(path, n_features=2, pixel_size_um=50)["table"].uns["spatialdata_io"]["pixel_size_um"] == 50
+
+    off = _write_tiled(tmp_path / "off.imzML", [*pos[:-1], (pos[-1][0] + 0.02, pos[-1][1])])
+    with pytest.raises(ValueError, match="not on one regular raster"):
+        imzml(off, n_features=2)

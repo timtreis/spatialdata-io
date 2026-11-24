@@ -117,6 +117,14 @@ def imzml(
     # continuous mode: one shared m/z array, so the spectra can be sliced straight from a memmap of the .ibd
     ibd_path = _ibd_path(path) if "IMS:1000030" in head and len(set(parser.mzOffsets)) == 1 else None
     pos3d = _positions_3d(path, len(coords))
+    # PXD038114: the converter wrote the integer position x/y as the truncated stage coordinate, so whole raster
+    # blocks share one position; each spectrum's own place is its 3DPositionX/Y (no Z), on a regular grid
+    pos2d, pos_step = None, None
+    if pos3d is None and len(np.unique(coords[:, :2], axis=0)) < len(coords):
+        pos2d = _positions_3d(path, len(coords), axes="XY")
+        if pos2d is not None:
+            coords = coords.copy()
+            coords[:, :2], pos_step = _grid(pos2d, path.name)
     if pos3d is None and (coords[:, 2] > 1).any():
         raise ValueError(f"{path.name} has {coords[:, 2].max()} z planes; only 2-D imzML is supported.")
     unplaced = np.zeros(len(coords), dtype=bool)
@@ -175,6 +183,8 @@ def imzml(
     dim, count = d.get("max dimension x"), d.get("max count of pixels x")
     dim_px = float(dim) / float(count) if dim and count else None
     px, px_source = _resolve_pixel_size(raw_px, dim_px, _header_has_unit(head), pixel_size_um)
+    if pos2d is not None:  # 3DPosition states no unit and the header is a placeholder: only a stated pitch counts
+        px, px_source = (pixel_size_um, "repository text") if pixel_size_um is not None else (None, None)
     measured = None
     if pos3d is not None:
         # registered voxel centres in µm: the spot spacing within a plane is the pixel size (MTBLS176 microbes: 400
@@ -218,6 +228,9 @@ def imzml(
     }
     if measured is not None:
         uns["measured_spacing_um"] = measured
+    if pos2d is not None:
+        uns["positions_source"] = "3DPositionX/Y (unit not stated)"
+        uns["position_step"] = pos_step
     if unplaced.any():
         uns["spectra_without_position"] = {
             "n": int(unplaced.sum()),
@@ -238,6 +251,8 @@ def imzml(
         },
         index=pd.Index([f"{x}_{y}" for x, y in xy]),
     )
+    if pos2d is not None:
+        obs["x_pos"], obs["y_pos"] = pos2d[keep, 0], pos2d[keep, 1]
     adata = ad.AnnData(X=X[keep], obs=obs, var=var)
     adata.obsm["spatial"] = xy.astype(float) - 0.5
     adata.uns["spatialdata_io"] = uns
@@ -257,18 +272,30 @@ def imzml(
     return _set_reader_metadata(SpatialData(shapes={_SHAPES: shapes}, tables=tables), "imzml")
 
 
-def _positions_3d(path: Path, n: int) -> np.ndarray | None:
-    """Per-spectrum ``3DPositionX/Y/Z`` userParams (µm) of Bruker/SCiLS 3D exports, if every spectrum has them."""
+def _positions_3d(path: Path, n: int, axes: str = "XYZ") -> np.ndarray | None:
+    """Per-spectrum ``3DPosition<axis>`` userParams of Bruker/SCiLS exports, if every spectrum has them.
+
+    ``axes="XYZ"`` (µm, 3D exports) needs a Z; ``axes="XY"`` is for files with X and Y but no Z (PXD038114).
+    """
     with open(path, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as m:
-        if m.find(b'name="3DPositionZ"') < 0:
+        if (m.find(b'name="3DPositionZ"') >= 0) != ("Z" in axes):
             return None
         cols = [
             [float(v) for v in re.findall(rb'name="3DPosition%s" value="([-0-9.eE+]+)"' % a.encode(), m)]  # type: ignore[call-overload]
-            for a in "XYZ"
+            for a in axes
         ]
     if any(len(c) != n for c in cols):
         return None
     return np.array(cols).T
+
+
+def _grid(pos: np.ndarray, name: str) -> tuple[np.ndarray, float]:
+    """1-based grid indices of 2D positions on a regular raster, and its step (nearest-neighbour spacing)."""
+    step = float(np.median(cKDTree(pos).query(pos, k=2)[0][:, 1]))
+    grid = np.rint((pos - pos.min(axis=0)) / step)
+    if np.abs(grid * step + pos.min(axis=0) - pos).max() > 0.25 * step or len(np.unique(grid, axis=0)) < len(pos):
+        raise ValueError(f"{name}: the 3DPositionX/Y positions are not on one regular raster of step {step:g}.")
+    return grid.astype(np.int64) + 1, step
 
 
 def _plane_spacing(pos: np.ndarray) -> float:
