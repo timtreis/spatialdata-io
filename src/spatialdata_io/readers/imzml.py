@@ -113,6 +113,7 @@ def imzml(
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)  # pyimzml warns about outdated ontology term names
         parser = ImzMLParser(source, ibd_file=ibd)
+    _check_ibd_length(parser, _ibd_path(path))
     coords = np.asarray(parser.coordinates)
     # continuous mode: one shared m/z array, so the spectra can be sliced straight from a memmap of the .ibd
     ibd_path = _ibd_path(path) if "IMS:1000030" in head and len(set(parser.mzOffsets)) == 1 else None
@@ -379,6 +380,23 @@ def _check_ibd_checksum(path: Path, head: str) -> dict[str, str] | None:
                 return {"algorithm": algorithm, "declared": declared, "ibd": digest.hexdigest()}
             return None
     return None
+
+
+def _check_ibd_length(parser: Any, ibd: Path) -> None:
+    """Raise when spectra point past the end of the .ibd (sddb_e5kd42j6uj: 8.2 GB deposited, 13.2 GB referenced)."""
+    size = ibd.stat().st_size
+    ends = [
+        np.asarray(off) + np.asarray(n) * np.dtype(precision).itemsize
+        for off, n, precision in (
+            (parser.mzOffsets, parser.mzLengths, parser.mzPrecision),
+            (parser.intensityOffsets, parser.intensityLengths, parser.intensityPrecision),
+        )
+    ]
+    if (past := int(((ends[0] > size) | (ends[1] > size)).sum())) > 0:
+        raise ValueError(
+            f"{ibd.name} is {size} bytes, but {past} of {len(ends[0])} spectra point past its end (up to "
+            f"{int(max(e.max() for e in ends))} bytes): the .ibd is truncated or not the one this .imzML indexes."
+        )
 
 
 def _scan_window(head: str) -> tuple[float, float] | None:

@@ -395,3 +395,12 @@ def test_truncated_positions_are_placed_by_their_3dposition_grid(tmp_path: Path)
     off = _write_tiled(tmp_path / "off.imzML", [*pos[:-1], (pos[-1][0] + 0.02, pos[-1][1])])
     with pytest.raises(ValueError, match="not on one regular raster"):
         imzml(off, n_features=2)
+
+
+def test_ibd_shorter_than_its_imzml_indexes_is_refused(tmp_path: Path) -> None:
+    # sddb_e5kd42j6uj: the deposited .ibd is 8.2 GB, the .imzML points up to 13.2 GB
+    path = _write(tmp_path / "s.imzML", extra_settings=_PIXEL_SIZE)
+    ibd = tmp_path / "s.ibd"
+    ibd.write_bytes(ibd.read_bytes()[:-100])
+    with pytest.raises(ValueError, match="point past its end"):
+        imzml(path)
