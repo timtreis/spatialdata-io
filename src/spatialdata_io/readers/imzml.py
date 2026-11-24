@@ -105,10 +105,9 @@ def imzml(
 
     source: Any = str(path)
     ibd: Any = INFER_IBD_FROM_IMZML
-    root_tag = head[head.find("<mzML") : head.find(">", head.find("<mzML"))]
-    if f'xmlns="{_MZML_NS}"' not in root_tag:
-        # pyimzml matches tags in the mzML namespace only; some exports (e.g. PXD053247) omit it, so no spectrum is found
-        source = io.BytesIO(path.read_bytes().replace(b"<mzML", f'<mzML xmlns="{_MZML_NS}"'.encode(), 1))
+    data, repairs = _repaired_header(path, head)
+    if data is not None:
+        source = io.BytesIO(data)
         ibd = open(_ibd_path(path), "rb")  # kept open: the parser reads spectra from it lazily
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", UserWarning)  # pyimzml warns about outdated ontology term names
@@ -220,6 +219,7 @@ def imzml(
         "ppm_source": ppm_source,
         "feature_space": space,
         "n_spectra_undecodable": n_bad,
+        **({"header_repaired": repairs} if repairs else {}),
         "ibd_checksum_mismatch": checksum_mismatch,
         "n_features": len(var),
         "n_pixels_empty": int((~unplaced).sum() - len(keep)),
@@ -380,6 +380,36 @@ def _check_ibd_checksum(path: Path, head: str) -> dict[str, str] | None:
                 return {"algorithm": algorithm, "declared": declared, "ibd": digest.hexdigest()}
             return None
     return None
+
+
+# one exporter (sddb_z6nri5cdn6 and 4 siblings) writes value="" twice on the m/z array cvParam: invalid XML
+_DUP_EMPTY_VALUE = re.compile(rb'(<cvParam\b[^>]*?) value=""([^>]*? value=""[^>]*/>)')
+
+
+def _repaired_header(path: Path, head: str) -> tuple[bytes | None, list[str]]:
+    """The .imzML bytes with known exporter defects repaired in memory (``None`` if there are none), and what was done.
+
+    Only these exact patterns are repaired; any other malformed XML still fails in the parser.
+    """
+    root_tag = head[head.find("<mzML") : head.find(">", head.find("<mzML"))]
+    # pyimzml matches tags in the mzML namespace only; some exports (e.g. PXD053247) omit it, so no spectrum is found
+    no_ns = f'xmlns="{_MZML_NS}"' not in root_tag
+    dup = _DUP_EMPTY_VALUE.search(head.encode()) is not None
+    # pyimzml reads instrument parameters from instrumentConfigurationList and fails on a file without one
+    no_instrument = "<instrumentConfigurationList" not in head and "<run" in head
+    if not (no_ns or dup or no_instrument):
+        return None, []
+    data, repairs = path.read_bytes(), []
+    if no_ns:
+        data = data.replace(b"<mzML", f'<mzML xmlns="{_MZML_NS}"'.encode(), 1)
+        repairs.append("mzML namespace added to the root element")
+    if dup:
+        data, n = _DUP_EMPTY_VALUE.subn(rb"\1\2", data)
+        repairs.append(f'a duplicated value="" removed from {n} cvParam(s)')
+    if no_instrument:
+        data = data.replace(b"<run ", b'<instrumentConfigurationList count="0"/>\n<run ', 1)
+        repairs.append("an empty instrumentConfigurationList added (the file has none)")
+    return data, repairs
 
 
 def _check_ibd_length(parser: Any, ibd: Path) -> None:

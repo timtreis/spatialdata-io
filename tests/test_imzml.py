@@ -404,3 +404,27 @@ def test_ibd_shorter_than_its_imzml_indexes_is_refused(tmp_path: Path) -> None:
     ibd.write_bytes(ibd.read_bytes()[:-100])
     with pytest.raises(ValueError, match="point past its end"):
         imzml(path)
+
+
+def test_exporter_header_defects_are_repaired(tmp_path: Path) -> None:
+    # sddb_z6nri5cdn6 and siblings: value="" written twice on the m/z array cvParam, no instrumentConfigurationList
+    import re
+
+    path = _write(tmp_path / "s.imzML", extra_settings=_PIXEL_SIZE)
+    text = path.read_text().replace('unitName="m/z"/>', 'unitName="m/z" value="" value=""/>', 1)
+    text = re.sub(r"<instrumentConfigurationList.*?</instrumentConfigurationList>", "", text, count=1, flags=re.S)
+    path.write_text(text)
+    uns = imzml(path)["table"].uns["spatialdata_io"]
+    assert uns["header_repaired"] == [
+        'a duplicated value="" removed from 1 cvParam(s)',
+        "an empty instrumentConfigurationList added (the file has none)",
+    ]
+
+
+def test_other_malformed_xml_is_not_repaired(tmp_path: Path) -> None:
+    from xml.etree.ElementTree import ParseError
+
+    path = _write(tmp_path / "s.imzML", extra_settings=_PIXEL_SIZE)
+    path.write_text(path.read_text().replace('unitName="m/z"/>', 'unitName="m/z" name="x"/>', 1))
+    with pytest.raises(ParseError, match="duplicate attribute"):
+        imzml(path)
