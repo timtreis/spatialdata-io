@@ -134,3 +134,12 @@ def test_px_per_um_refuses_a_non_visium_array() -> None:
     rows, cols = np.meshgrid(np.arange(4), np.arange(4), indexing="ij")  # a square grid, e.g. sddb_24dexki6yf
     with pytest.raises(ValueError, match="not on a Visium v1/v2 array"):
         _px_per_um(np.stack([cols.ravel(), rows.ravel()], axis=1).astype(float), np.random.rand(16, 2))
+
+
+def test_ndpi_fullres_image_is_read_with_tifffile(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    # E-MTAB-13024 ships the full-res H&E as Hamamatsu .ndpi; dask_image cannot open it. tifffile parses .ndpi by its
+    # extension (64-bit offsets), so a plain TIFF cannot stand in: check the routing.
+    from spatialdata_io.readers.visium import _read_image
+
+    monkeypatch.setattr(tifffile, "imread", lambda f: np.zeros((8, 6, 3), dtype=np.uint8))
+    assert _read_image(tmp_path / "slide.ndpi", {}).shape == (3, 8, 6)

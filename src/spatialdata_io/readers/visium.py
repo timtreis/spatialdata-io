@@ -422,7 +422,11 @@ def _read_image(image_file: Path, imread_kwargs: dict[str, Any]) -> Any:
         from PIL import Image as ImagePIL
 
         ImagePIL.MAX_IMAGE_PIXELS = imread_kwargs.pop("MAX_IMAGE_PIXELS")
-    if image_file.suffix != ".btf":
+    if image_file.suffix.lower() == ".ndpi":  # Hamamatsu (E-MTAB-13024): a TIFF variant, full resolution is series 0
+        import tifffile
+
+        im = tifffile.imread(image_file)
+    elif image_file.suffix != ".btf":
         im = imread(image_file, **imread_kwargs)
     else:
         # dask_image doesn't recognize .btf automatically
