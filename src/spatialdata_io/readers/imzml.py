@@ -350,7 +350,9 @@ def _sdata_3d(
 
 
 _MAX_UNDECODABLE = 0.01  # share of spectra that may fail the decode check before the file is refused
-_WINDOW_MARGIN = 1e-3  # relative slack on the declared scan window
+# relative slack on the declared scan window: recorded m/z overshoot the nominal window by up to 1.0% (o35nkobijd
+# 99-606 for 100-600; iahn64pxwm 1003 for 1000); a mis-decoded .ibd lands orders of magnitude out (tbbpppqd6c 3e38)
+_WINDOW_MARGIN = 0.02
 # largest m/z decrease within a spectrum that is still order jitter: PXD070149's recalibrated spectra reach 4.4e-6 of
 # the m/z, its mis-decoded ones exceed 1e-2
 _MZ_DROP_TOLERANCE = 1e-4

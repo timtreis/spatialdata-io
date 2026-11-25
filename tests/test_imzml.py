@@ -463,3 +463,14 @@ def test_lone_ibd_with_another_name_is_paired(tmp_path: Path) -> None:
     (tmp_path / "t.imzML").write_bytes(path.read_bytes())
     with pytest.raises(FileNotFoundError, match="No .ibd"):
         imzml(path)
+
+
+def test_one_percent_past_the_scan_window_is_kept(tmp_path: Path) -> None:
+    # o35nkobijd records m/z 99-606 for a declared 100-600: here 100-450 for a declared 101-445.5
+    hi = max(max(mz) for mz, _ in _SPECTRA.values())
+    window = (
+        '<cvParam cvRef="MS" accession="MS:1000501" name="scan window lower limit" value="101.0"/>'
+        f'<cvParam cvRef="MS" accession="MS:1000500" name="scan window upper limit" value="{hi / 1.01}"/>'
+    )
+    path = _write(tmp_path / "w.imzML", extra_settings=_PIXEL_SIZE + window)
+    assert imzml(path)["table"].uns["spatialdata_io"]["n_spectra_undecodable"] == 0
