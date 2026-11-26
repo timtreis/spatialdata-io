@@ -474,3 +474,17 @@ def test_parquet_wins_over_legacy_hdf5(tmp_path: Path) -> None:
     shutil.copy(LEGACY_FIXTURE / "cell_boundaries" / "feature_data_0.hdf5", region / "cell_boundaries")
     polygons = next(iter(merscope(region, transcripts=False, mosaic_images=False).shapes.values()))
     assert sorted(polygons.index) == sorted(CELL_IDS)
+
+
+@pytest.mark.parametrize("name", ["cell_by_gene.csv", "detected_transcripts.csv"])
+def test_file_cut_mid_row_is_refused(tmp_path: Path, name: str) -> None:
+    # GSM8082299: cell_by_gene stops at 419,119 of 1,603,401 cells, its last row at 121 of 551 fields
+    region = _write_dataset(tmp_path)
+    f = region / name
+    lines = f.read_text().splitlines()
+    f.write_text("\n".join([*lines[:-2], ",".join(lines[-2].split(",")[:3])]))
+    match = r"truncated: .*last row has 3 of \d+ fields"
+    if name == "cell_by_gene.csv":
+        match = rf"truncated: {len(CELL_IDS) - 1} rows vs {len(CELL_IDS)} cells in cell_metadata.csv, last row has 3"
+    with pytest.raises(ValueError, match=match):
+        merscope(region, mosaic_images=False)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import csv
 import importlib
 import re
 import warnings
@@ -363,6 +364,7 @@ def _dask_image_load_merscope(
 
 def _get_points(transcript_path: Path, transformations: dict[str, BaseTransformation]) -> dd.DataFrame:
     # fov can be empty in later rows (GSE255892), which breaks dask's int64 inference from the first block.
+    _check_not_truncated(transcript_path)
     transcript_df = dd.read_csv(transcript_path, dtype={"fov": "Int64"})
     # Make `gene` a categorical with *known* categories before parsing. Passing an object-dtype column
     # to `PointsModel.parse` leaves the dask categories "unknown": they then get inferred from a single
@@ -472,6 +474,22 @@ def _strip_uniform_prefix(ids: pd.Index) -> pd.Index | None:
     return pd.Index(parts[2]).rename(ids.name)
 
 
+def _last_row_fields(path: Path) -> tuple[int, int]:
+    """Fields in the header and in the last non-empty line of a CSV; a file cut mid-row has fewer in the last."""
+    with open(path, "rb") as f:
+        head = f.readline()
+        f.seek(max(0, f.seek(0, 2) - (1 << 16)))
+        tail = f.read().rstrip(b"\r\n").rsplit(b"\n", 1)[-1]
+    return tuple(len(next(csv.reader([b.decode("utf-8", "replace")]))) for b in (head, tail))  # type: ignore[return-value]
+
+
+def _check_not_truncated(path: Path, what: str = "") -> None:
+    """Raise when the last row of ``path`` has fewer fields than its header (GSM8082299: an upload cut mid-row)."""
+    n_head, n_last = _last_row_fields(path)
+    if n_last < n_head:
+        raise ValueError(f"{path.name} truncated: {what}last row has {n_last} of {n_head} fields")
+
+
 def _read_csv_str_index(path: Path) -> pd.DataFrame:
     """Read a cell table with its first column as a str index, whatever its header.
 
@@ -491,6 +509,7 @@ def _counts_from_transcripts(transcript_path: Path, cells: pd.Index) -> pd.DataF
     The transcripts are read in chunks; unassigned ones (``cell_id`` -1) are dropped, and metadata cells without
     transcripts get an all-zero row. Transcripts of cells missing from the metadata are dropped with a warning.
     """
+    _check_not_truncated(transcript_path)
     counts: pd.Series | None = None
     n_total = 0
     reader = pd.read_csv(
@@ -530,6 +549,7 @@ def _get_table(
     obs = _read_csv_str_index(obs_path)
     if count_path.exists() or transcript_path is None:
         data = _read_csv_str_index(count_path)
+        _check_not_truncated(count_path, f"{len(data):,} rows vs {len(obs):,} cells in {obs_path.name}, ")
     else:
         # GSE327192: no cell_by_gene, but every transcript carries the cell it was assigned to.
         data = _counts_from_transcripts(transcript_path, obs.index)
