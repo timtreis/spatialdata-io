@@ -488,3 +488,16 @@ def test_file_cut_mid_row_is_refused(tmp_path: Path, name: str) -> None:
         match = rf"truncated: {len(CELL_IDS) - 1} rows vs {len(CELL_IDS)} cells in cell_metadata.csv, last row has 3"
     with pytest.raises(ValueError, match=match):
         merscope(region, mosaic_images=False)
+
+
+def test_gzipped_table_cut_mid_row_is_refused(tmp_path: Path) -> None:
+    import gzip
+
+    from spatialdata_io.readers.merscope import _check_not_truncated
+
+    f = tmp_path / "t.csv"
+    f.write_bytes(gzip.compress(b"a,b,c\n1,2,3\n4,5"))
+    with pytest.raises(ValueError, match="last row has 2 of 3 fields"):
+        _check_not_truncated(f)
+    f.write_bytes(gzip.compress(b"a,b,c\n1,2,3\n"))
+    _check_not_truncated(f)

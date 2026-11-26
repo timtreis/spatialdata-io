@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import gzip
 import importlib
 import re
 import warnings
@@ -477,9 +478,20 @@ def _strip_uniform_prefix(ids: pd.Index) -> pd.Index | None:
 def _last_row_fields(path: Path) -> tuple[int, int]:
     """Fields in the header and in the last non-empty line of a CSV; a file cut mid-row has fewer in the last."""
     with open(path, "rb") as f:
-        head = f.readline()
-        f.seek(max(0, f.seek(0, 2) - (1 << 16)))
-        tail = f.read().rstrip(b"\r\n").rsplit(b"\n", 1)[-1]
+        gz = f.read(2) == b"\x1f\x8b"
+    if gz:  # a gzipped table has no random access: stream it to its last line
+        with gzip.open(path, "rb") as f:
+            head = f.readline()
+            tail = head
+            for line in f:
+                if line.strip():
+                    tail = line
+    else:
+        with open(path, "rb") as f:
+            head = f.readline()
+            f.seek(max(0, f.seek(0, 2) - (1 << 16)))
+            tail = f.read().rstrip(b"\r\n").rsplit(b"\n", 1)[-1]
+    head, tail = head.rstrip(b"\r\n"), tail.rstrip(b"\r\n")
     return tuple(len(next(csv.reader([b.decode("utf-8", "replace")]))) for b in (head, tail))  # type: ignore[return-value]
 
 
